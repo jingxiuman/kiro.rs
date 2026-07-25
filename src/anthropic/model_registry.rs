@@ -399,7 +399,11 @@ impl ModelRegistry {
                 .iter()
                 .find(|r| r.match_kind == MatchKind::Exact && r.exposed_id == base)
             {
-                if !row.expose_thinking_variant {
+                if !row.enabled {
+                    // 禁用信号优先级高于「变体未开启」：「配了但禁用」与
+                    // 「没配」是不同的排查方向，不能被 pending 兜底逻辑掩盖。
+                    return Resolution::Rejected(RejectReason::Disabled);
+                } else if !row.expose_thinking_variant {
                     // 该行关闭了 thinking 变体 → 先记下待定拒绝，继续往下找兜底
                     pending_thinking_rejection = true;
                 } else {
@@ -415,8 +419,11 @@ impl ModelRegistry {
             .iter()
             .find(|r| r.match_kind == MatchKind::Exact && r.upstream_id == normalized)
         {
-            // 请求名带 thinking 但该行关闭了变体 → 先记下待定拒绝，继续往下找兜底
-            if lower.ends_with("-thinking") && !row.expose_thinking_variant {
+            if lower.ends_with("-thinking") && !row.enabled {
+                // 禁用信号优先级高于「变体未开启」，见第 3 步同一处理。
+                return Resolution::Rejected(RejectReason::Disabled);
+            } else if lower.ends_with("-thinking") && !row.expose_thinking_variant {
+                // 请求名带 thinking 但该行关闭了变体 → 先记下待定拒绝，继续往下找兜底
                 pending_thinking_rejection = true;
             } else {
                 return Self::hit(row, row.upstream_id.clone());
@@ -599,6 +606,43 @@ impl ModelRegistry {
         Ok(Self { rows, aliases: file.aliases })
     }
 }
+
+use std::sync::{Arc, LazyLock};
+
+use parking_lot::RwLock;
+
+/// 进程当前的注册表实例。**这里只是一个 holder，不含业务逻辑** ——
+/// 逻辑本体是 `ModelRegistry`，它可以脱离全局单独构造与单测。
+static REGISTRY: LazyLock<RwLock<Arc<ModelRegistry>>> =
+    LazyLock::new(|| RwLock::new(Arc::new(ModelRegistry::builtin())));
+
+/// 未收录模型是否放行透传。默认 false（保留「模型名写错」的快速失败信号）。
+static ALLOW_PASSTHROUGH: LazyLock<RwLock<bool>> = LazyLock::new(|| RwLock::new(false));
+
+/// 取当前注册表快照。读侧只做 Arc::clone，无锁竞争。
+pub fn current_registry() -> Arc<ModelRegistry> {
+    REGISTRY.read().clone()
+}
+
+/// 热替换注册表。由启动流程与同步任务在落盘成功后调用。
+pub fn install_registry(registry: ModelRegistry) {
+    *REGISTRY.write() = Arc::new(registry);
+}
+
+pub fn set_allow_passthrough(allow: bool) {
+    *ALLOW_PASSTHROUGH.write() = allow;
+}
+
+pub fn allow_passthrough() -> bool {
+    *ALLOW_PASSTHROUGH.read()
+}
+
+/// 测试专用串行锁：所有会调用 `install_registry()` 的测试必须先取此锁，
+/// 否则并行测试互相覆盖全局状态导致随机失败。用
+/// `unwrap_or_else(|e| e.into_inner())` 取锁，避免一个 panic 的测试
+/// 毒化锁、连累后续测试全部失败。
+#[cfg(test)]
+pub(crate) static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -1042,5 +1086,49 @@ mod tests {
         assert!(!ids.contains(&"claude-opus-4-8-thinking".to_string()));
         assert!(ids.contains(&"claude-sonnet-5".to_string()), "deprecated 应保留在列表");
         assert!(!ids.contains(&"gpt-5".to_string()), "prefix 行不应出现在列表");
+    }
+
+    #[test]
+    fn install_and_read_global_registry() {
+        // 注意：全局状态测试，取串行锁避免与其他 install_registry 测试打架。
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut r = ModelRegistry::builtin();
+        r.rows_mut().push({
+            let mut row = builtin_rows()
+                .into_iter()
+                .find(|x| x.upstream_id == "claude-opus-4.8")
+                .unwrap();
+            row.upstream_id = "claude-opus-5".to_string();
+            row.exposed_id = "claude-opus-5".to_string();
+            row.display_name = "Claude Opus 5".to_string();
+            row.sort_order = 55;
+            row.origin = ModelOrigin::Synced;
+            row
+        });
+        install_registry(r);
+        let current = current_registry();
+        assert!(current.rows().iter().any(|x| x.upstream_id == "claude-opus-5"));
+
+        // 复原，避免污染其他测试
+        install_registry(ModelRegistry::builtin());
+    }
+
+    /// 一行同时 enabled=false 且 expose_thinking_variant=false 时，
+    /// xxx-thinking 请求应报 Disabled 而非 Unknown ——
+    /// 「配了但禁用」与「没配」是不同的排查方向。
+    #[test]
+    fn disabled_row_reports_disabled_even_when_thinking_variant_off() {
+        let mut r = ModelRegistry::builtin();
+        for row in r.rows_mut() {
+            if row.exposed_id == "claude-opus-4-8" {
+                row.enabled = false;
+                row.expose_thinking_variant = false;
+            }
+        }
+        assert!(matches!(
+            r.resolve("claude-opus-4-8-thinking", false),
+            Resolution::Rejected(RejectReason::Disabled)
+        ));
     }
 }

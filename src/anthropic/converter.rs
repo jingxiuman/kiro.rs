@@ -193,75 +193,35 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
+/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID。
+///
+/// 改造后查 `ModelRegistry`（内置默认 ⊕ models.json 覆盖），不再硬编码。
+/// 签名保持不变，既有调用点与测试无需改动。
+/// 注意：无法表达「命中但被禁用」——需要区分时用
+/// `model_registry::current_registry().resolve(...)`。
 pub fn map_model(model: &str) -> Option<String> {
-    let model_lower = model.to_lowercase();
-
-    if model_lower.contains("fable") {
-        // Fable 5：与 Mythos 5 同底座；目前仅 5 代
-        Some("claude-fable-5".to_string())
-    } else if model_lower.contains("sonnet") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-sonnet-4.8".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
-        } else if model_lower.contains("sonnet-5")
-            || model_lower.contains("sonnet5")
-            || model_lower.contains("sonnet.5")
-        {
-            // 精确匹配 5 代，避免命中 legacy claude-3-5-sonnet
-            Some("claude-sonnet-5".to_string())
-        } else {
-            None
+    use super::model_registry::{allow_passthrough, current_registry, Resolution};
+    match current_registry().resolve(model, allow_passthrough()) {
+        Resolution::Mapped { upstream_id, .. } | Resolution::Passthrough { upstream_id, .. } => {
+            Some(upstream_id)
         }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-opus-4.8".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else {
-            None
-        }
-    } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else if model_lower.starts_with("gpt-5") {
-        // GPT-5.x models served by the Kiro backend (e.g. gpt-5.6-sol / terra / luna).
-        // Kiro advertises and accepts these ids verbatim, so pass them through unchanged.
-        // Scoped to gpt-5* so legacy ids like "gpt-4" stay unsupported.
-        Some(model_lower)
-    } else {
-        None
+        Resolution::Rejected(_) => None,
     }
 }
 
-/// 根据模型名称返回对应的上下文窗口大小
+/// 根据模型名称返回输入上下文窗口大小。
 ///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 / 4.8 同 1M
+/// 改造后查 `ModelRegistry`。**这是输入窗口，与 `/v1/models` 的
+/// `max_tokens`（输出上限）是两个不同的量。**
+///
+/// 保留此函数是为了兼容既有测试；请求主链路应使用
+/// `ConversionResult.context_window`（单请求内只取一次快照，见 spec §3.3）。
 pub fn get_context_window_size(model: &str) -> i32 {
-    match map_model(model) {
-        // GPT-5.6 family on Kiro ships a 272K context window.
-        Some(mapped) if mapped.starts_with("gpt") => 272_000,
-        Some(mapped)
-            if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-sonnet-4.8"
-                || mapped == "claude-sonnet-5"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8"
-                || mapped == "claude-fable-5" =>
-        {
-            1_000_000
-        }
-        _ => 200_000,
+    use super::model_registry::{allow_passthrough, current_registry, Resolution};
+    match current_registry().resolve(model, allow_passthrough()) {
+        Resolution::Mapped { context_window, .. }
+        | Resolution::Passthrough { context_window, .. } => context_window,
+        Resolution::Rejected(_) => 200_000,
     }
 }
 
@@ -1920,6 +1880,18 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+    }
+
+    /// 改造后 map_model 必须继续通过全部既有用例（查 registry 而非硬编码）
+    #[test]
+    fn map_model_still_matches_registry() {
+        assert_eq!(map_model("claude-opus-4-8"), Some("claude-opus-4.8".to_string()));
+        assert_eq!(map_model("gpt-5.9-nova"), Some("gpt-5.9-nova".to_string()));
+        assert_eq!(map_model("gpt-4"), None);
+        assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
+        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
+        assert_eq!(get_context_window_size("claude-haiku-4-5-20251001"), 200_000);
+        assert_eq!(get_context_window_size("完全未知的模型"), 200_000);
     }
 
     fn minimal_request_with_output_config(model: &str) -> MessagesRequest {
