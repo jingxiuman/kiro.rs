@@ -1,0 +1,20 @@
+docs/superpowers/specs/2026-07-25-model-registry-design.md
+  s_ac04534933677d::t_aef32381f3eebc 97-110
+  s_ac04534933677d::t_6a72005a095b7a 1-96,111-335
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "767cd5c2aa64fa1df7a85ecbb50c763aae966d07",
+  "prompts": {},
+  "sessions": {
+    "s_ac04534933677d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "406a6388-eb5d-470d-a7b4-e094c57e8508",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
