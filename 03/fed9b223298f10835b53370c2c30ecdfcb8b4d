@@ -1,0 +1,32 @@
+src/model/config.rs
+  s_ac04534933677d::t_e18b56aeed6957 182-199
+  s_ac04534933677d::t_c2a6741dd22d4c 386-413
+  s_ac04534933677d::t_fb65987f4b0d5f 317-320
+  s_ac04534933677d::t_9a5e35d369db1e 277-280
+config.example.json
+  s_ac04534933677d::t_b30619dc6a89de 13-17
+src/admin/service.rs
+  s_ac04534933677d::t_91f7b0628acde9 506,520-521
+  s_ac04534933677d::t_1a64e66f5bda87 194-198
+  s_ac04534933677d::t_8227887a0796bc 33-36
+  s_ac04534933677d::t_e6eba5b9f7b991 149-170
+  s_ac04534933677d::t_3d673d4e5f0939 1286-1337
+src/admin/types.rs
+  s_ac04534933677d::t_c05d303e1434b9 474-490
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "03fed9b223298f10835b53370c2c30ecdfcb8b4d",
+  "prompts": {},
+  "sessions": {
+    "s_ac04534933677d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "406a6388-eb5d-470d-a7b4-e094c57e8508",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
