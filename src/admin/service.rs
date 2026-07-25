@@ -30,9 +30,10 @@ use super::types::{
     LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
     QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-    StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
-    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    SetLogGovernanceConfigRequest, SetModelSyncSettingsRequest, SetUpdateConfigRequest,
+    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
+    StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
+    UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -145,6 +146,28 @@ impl RuntimeUpdateConfig {
     }
 }
 
+/// 模型同步的运行时配置。不放进不可变的 Config clone
+/// （MultiTokenManager 持有的是 clone，见 token_manager.rs 中 `config:` 字段），
+/// 否则 PATCH 无法热生效。
+#[derive(Debug, Clone)]
+pub struct ModelSyncSettings {
+    pub enabled: bool,
+    pub time: String,
+    pub probe_credential_id: Option<u64>,
+    pub allow_passthrough: bool,
+}
+
+impl ModelSyncSettings {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            enabled: config.model_sync_enabled,
+            time: config.model_sync_time.clone(),
+            probe_credential_id: config.model_sync_probe_credential_id,
+            allow_passthrough: config.allow_unknown_model_passthrough,
+        }
+    }
+}
+
 /// Admin 服务
 ///
 /// 封装所有 Admin API 的业务逻辑
@@ -168,6 +191,11 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// 模型同步运行时配置（可热改）
+    model_sync: parking_lot::RwLock<ModelSyncSettings>,
+    /// config.json 写锁。既有的 `update_config_file` 是无保护的
+    /// load-modify-save，本锁用于串行化本任务新增的写路径，避免并发丢失更新。
+    config_write_lock: tokio::sync::Mutex<()>,
 }
 
 /// Social 登录会话状态
@@ -475,6 +503,7 @@ impl AdminService {
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
+        let model_sync = ModelSyncSettings::from_config(token_manager.config());
 
         let svc = Self {
             token_manager,
@@ -488,6 +517,8 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            model_sync: parking_lot::RwLock::new(model_sync),
+            config_write_lock: tokio::sync::Mutex::new(()),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -1250,6 +1281,58 @@ impl AdminService {
             }
             Err(e) => tracing::warn!("读取配置文件失败（跳过持久化）: {}", e),
         }
+    }
+
+    /// 获取模型同步运行时配置
+    pub fn model_sync_settings(&self) -> ModelSyncSettings {
+        self.model_sync.read().clone()
+    }
+
+    /// 更新模型同步运行时配置（字段缺省表示不修改），持久化到 config.json 并热生效。
+    pub async fn set_model_sync_settings(
+        &self,
+        req: SetModelSyncSettingsRequest,
+    ) -> Result<ModelSyncSettings, AdminServiceError> {
+        // 校验时间格式，复用既有解析器
+        if let Some(time) = req.time.as_deref() {
+            parse_auto_apply_time(time)?;
+        }
+
+        // 串行化 config.json 的 load-modify-save，避免并发写丢失更新
+        let _guard = self.config_write_lock.lock().await;
+
+        let mut next = self.model_sync_settings();
+        if let Some(v) = req.enabled {
+            next.enabled = v;
+        }
+        if let Some(v) = req.time.clone() {
+            next.time = v;
+        }
+        if req.probe_credential_id_set {
+            next.probe_credential_id = req.probe_credential_id;
+        }
+        if let Some(v) = req.allow_passthrough {
+            next.allow_passthrough = v;
+        }
+
+        // 持久化：从磁盘加载最新后再写，避免覆盖其他字段
+        let base = self.token_manager.config();
+        let path = base.config_path().ok_or_else(|| {
+            AdminServiceError::InternalError("配置文件路径未知，无法保存配置".to_string())
+        })?;
+        let mut config = Config::load(path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+        config.model_sync_enabled = next.enabled;
+        config.model_sync_time = next.time.clone();
+        config.model_sync_probe_credential_id = next.probe_credential_id;
+        config.allow_unknown_model_passthrough = next.allow_passthrough;
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        *self.model_sync.write() = next.clone();
+        crate::anthropic::model_registry::set_allow_passthrough(next.allow_passthrough);
+        Ok(next)
     }
 
     /// 获取全局代理 URL

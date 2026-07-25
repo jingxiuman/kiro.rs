@@ -179,6 +179,24 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 是否启用「每日自动同步上游模型」。**默认 false** —— 保证不配置任何东西时
+    /// 行为与改造前完全一致（零行为回归）。
+    #[serde(default)]
+    pub model_sync_enabled: bool,
+
+    /// 每日同步触发时间（`HH:MM`，本地 24 小时制）。
+    #[serde(default = "default_model_sync_time")]
+    pub model_sync_time: String,
+
+    /// 探针凭据 id。设置且可用时，该轮同步为「权威轮次」，可判定模型消失。
+    /// 未设置或不可用时回退为采样 3 个凭据的「非权威轮次」，只做新增/更新。
+    #[serde(default)]
+    pub model_sync_probe_credential_id: Option<u64>,
+
+    /// 未收录模型是否放行透传。**默认 false** —— 保留「模型名写错」的快速失败信号。
+    #[serde(default)]
+    pub allow_unknown_model_passthrough: bool,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -256,6 +274,10 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
+fn default_model_sync_time() -> String {
+    "04:00".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -292,6 +314,10 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
+            model_sync_enabled: false,
+            model_sync_time: default_model_sync_time(),
+            model_sync_probe_credential_id: None,
+            allow_unknown_model_passthrough: false,
             config_path: None,
         }
     }
@@ -355,5 +381,33 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod model_sync_config_tests {
+    use super::*;
+
+    /// 四个新字段必须全部可缺省，且 modelSyncEnabled 默认 false
+    /// （否则破坏「零行为回归」）
+    #[test]
+    fn model_sync_fields_default_off() {
+        let cfg: Config = serde_json::from_str(r#"{"apiKey":"sk-x"}"#).unwrap();
+        assert!(!cfg.model_sync_enabled, "自动同步必须默认关闭");
+        assert_eq!(cfg.model_sync_time, "04:00");
+        assert_eq!(cfg.model_sync_probe_credential_id, None);
+        assert!(!cfg.allow_unknown_model_passthrough, "透传必须默认关闭");
+    }
+
+    #[test]
+    fn model_sync_fields_roundtrip_camel_case() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"modelSyncEnabled":true,"modelSyncTime":"3:5","modelSyncProbeCredentialId":7,"allowUnknownModelPassthrough":true}"#,
+        )
+        .unwrap();
+        assert!(cfg.model_sync_enabled);
+        assert_eq!(cfg.model_sync_time, "3:5");
+        assert_eq!(cfg.model_sync_probe_credential_id, Some(7));
+        assert!(cfg.allow_unknown_model_passthrough);
     }
 }
