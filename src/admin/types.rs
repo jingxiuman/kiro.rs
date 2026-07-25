@@ -471,6 +471,23 @@ pub struct SetLogGovernanceConfigRequest {
     pub usage_log_retention_days: Option<u32>,
 }
 
+/// 更新模型同步运行时配置（字段缺省表示不修改）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetModelSyncSettingsRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub time: Option<String>,
+    #[serde(default)]
+    pub probe_credential_id: Option<u64>,
+    /// 请求体中是否出现了 probeCredentialId 键（区分「不改」与「置空」）
+    #[serde(default, rename = "probeCredentialIdSet")]
+    pub probe_credential_id_set: bool,
+    #[serde(default)]
+    pub allow_passthrough: Option<bool>,
+}
+
 // ============ 代理池 ============
 
 /// 代理池条目

@@ -10,5 +10,9 @@
   "updateAutoApplyTime": "03:00",
   "traceEnabled": true,
   "traceRetentionDays": 7,
-  "usageLogRetentionDays": 31
+  "usageLogRetentionDays": 31,
+  "modelSyncEnabled": false,
+  "modelSyncTime": "04:00",
+  "modelSyncProbeCredentialId": null,
+  "allowUnknownModelPassthrough": false
 }
