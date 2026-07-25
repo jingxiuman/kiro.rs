@@ -190,6 +190,7 @@ src/anthropic/websearch_loop.rs:200 web-search 循环
 | `exposeThinkingVariant` | 是否额外暴露 `{exposedId}-thinking`，映射到同一 `upstreamId` |
 | `enabled` | `false` → 拒绝请求 **且从 `/v1/models` 移除** |
 | `listed` | 是否出现在 `/v1/models`。缺省 `true`；`matchKind == "prefix"` 的行**强制 `false`**（仅用于解析，不是一个真实模型）|
+| `matchSubstrings` | 额外的子串匹配关键字，缺省空。**用于复现旧 `map_model` 的「家族通吃」语义**：旧代码 `contains("haiku")` / `contains("fable")` 不看版本号就映射，`contains("sonnet.5")` / `contains("sonnet5")` 也命中 5 代。内置默认只给三行填值——`claude-fable-5`: `["fable"]`、`claude-haiku-4.5`: `["haiku"]`、`claude-sonnet-5`: `["sonnet-5","sonnet5","sonnet.5"]`。**不得给 sonnet/opus 4.x 行填家族关键字**：旧代码对它们要求版本匹配，填了会让 `claude-3-5-sonnet` 被误判（旧行为是 `None`）|
 | `status` | `active` \| `deprecated`（上游消失但保留，仍可用、仍在列表） |
 | `origin` | `builtin` \| `synced` \| `manual` |
 | `pinned` | 已人工编辑、同步时逐字段跳过的字段名 |
@@ -269,9 +270,13 @@ enum Resolution {
 3. `{exposedId}-thinking` 命中 **且该行 `exposeThinkingVariant == true`**
 4. 规范化后与 **`upstreamId`** 精确命中
    > 规范化的产物形态恰好就是上游 id 的形态（点号版本段），所以这一步对 `upstreamId` 匹配、而非 `exposedId`。这是必需的：`claude-opus-4-5`（不带日期后缀）今天能用（`map_model` 走 `contains("4-5")`），但表里的 `exposedId` 是 `claude-opus-4-5-20251101`；只有规范化到 `claude-opus-4.5` 再匹配 `upstreamId` 才能保住它。
-5. `matchKind == "prefix"` 的行按 `exposedId` 做前缀匹配，最长前缀优先；`upstream_id` = **请求名原样**（规范化前）
-6. `allowUnknownModelPassthrough == true` → `Passthrough`（规范化后名字，窗口 200K）
-7. 否则 `Rejected(Unknown)`
+5. `matchSubstrings` 命中（请求名小写后包含其中任一子串）→ 取该行
+6. `matchKind == "prefix"` 的行按 `exposedId` 做前缀匹配，最长前缀优先；`upstream_id` = **请求名原样**（规范化前、仅小写）
+7. `allowUnknownModelPassthrough == true` → `Passthrough`（规范化后名字，窗口 200K）
+8. 否则 `Rejected(Unknown)`
+
+**「thinking 变体被关闭」的拒绝必须延后到第 6 步之后再生效。** 即：第 3/4 步发现请求名带 `-thinking` 而命中行 `exposeThinkingVariant == false` 时，**记下这个待定拒绝但继续往下走**；只有第 5、6 步都没命中，才返回 `Rejected(Unknown)`。
+> 否则 `gpt-5.6-sol-thinking` 会在第 4 步被 gpt 精确行的 `exposeThinkingVariant: false` 拦掉，走不到第 6 步的 prefix 透传——而旧代码对任何 `gpt-5` 开头的名字一律原样透传（`converter.rs:234` 的 `starts_with("gpt-5") => Some(model_lower)`，不做 `-thinking` 剥离）。`claude-opus-4-8-thinking` 在变体关闭时仍然正确返回 `Unknown`，因为它既无 `matchSubstrings` 也无 prefix 行可命中。
 
 补充规则：
 

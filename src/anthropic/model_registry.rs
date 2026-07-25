@@ -92,6 +92,12 @@ pub struct ModelRow {
     pub missing_sync_rounds: u32,
     #[serde(default)]
     pub last_seen_at: Option<String>,
+    /// 额外的子串匹配关键字，用于复现旧 map_model 的「家族通吃」语义。
+    /// 内置默认只给三行填值；**不得给 sonnet/opus 4.x 行填家族关键字**——
+    /// 旧代码对它们要求版本匹配，填了会让 claude-3-5-sonnet 被误判
+    /// （旧行为是 None）。
+    #[serde(default)]
+    pub match_substrings: Vec<String>,
 }
 
 /// 手动别名。生命周期与 models 不同：models 会被同步覆盖，aliases 只属于人工。
@@ -130,6 +136,7 @@ pub fn builtin_rows() -> Vec<ModelRow> {
         pinned: Vec::new(),
         missing_sync_rounds: 0,
         last_seen_at: None,
+        match_substrings: Vec::new(),
     };
     let claude = |upstream: &str,
                   exposed: &str,
@@ -155,6 +162,14 @@ pub fn builtin_rows() -> Vec<ModelRow> {
         pinned: Vec::new(),
         missing_sync_rounds: 0,
         last_seen_at: None,
+        match_substrings: match upstream {
+            "claude-fable-5" => vec!["fable".to_string()],
+            "claude-haiku-4.5" => vec!["haiku".to_string()],
+            "claude-sonnet-5" => {
+                vec!["sonnet-5".to_string(), "sonnet5".to_string(), "sonnet.5".to_string()]
+            }
+            _ => Vec::new(),
+        },
     };
 
     vec![
@@ -178,6 +193,7 @@ pub fn builtin_rows() -> Vec<ModelRow> {
             pinned: Vec::new(),
             missing_sync_rounds: 0,
             last_seen_at: None,
+            match_substrings: Vec::new(),
         },
         // ---- 顺序与改造前 available_models() 完全一致 ----
         gpt("gpt-5.6-sol", "GPT-5.6 Sol", 10),
@@ -299,9 +315,17 @@ impl ModelRegistry {
     }
 
     /// 解析请求中的模型名。顺序：alias → exposedId → exposedId-thinking →
-    /// 规范化后匹配 upstreamId → prefix 行 → 透传 → 拒绝。
+    /// 规范化后匹配 upstreamId → match_substrings 家族匹配 → prefix 行 →
+    /// 透传 → 拒绝。
+    ///
+    /// 「thinking 变体被关闭」的拒绝会被延后：第 3/4 步命中但变体关闭时，
+    /// 先记下待定拒绝、继续往下走，只有第 5/6 步也未命中才真正拒绝——
+    /// 这样 `gpt-5.6-sol-thinking` 这类请求能落到 prefix 透传（旧代码对
+    /// gpt-5* 不剥 -thinking，原样透传）。`enabled == false` 的
+    /// `Rejected(Disabled)` 不受影响，命中即返回。
     pub fn resolve(&self, requested: &str, allow_passthrough: bool) -> Resolution {
         let lower = requested.trim().to_ascii_lowercase();
+        let mut pending_thinking_rejection = false;
 
         // 1. alias 精确命中
         if let Some(alias) = self.aliases.iter().find(|a| a.from.to_ascii_lowercase() == lower) {
@@ -329,10 +353,11 @@ impl ModelRegistry {
                 .find(|r| r.match_kind == MatchKind::Exact && r.exposed_id == base)
             {
                 if !row.expose_thinking_variant {
-                    // 该行关闭了 thinking 变体 → 视为不存在这个模型名
-                    return Resolution::Rejected(RejectReason::Unknown);
+                    // 该行关闭了 thinking 变体 → 先记下待定拒绝，继续往下找兜底
+                    pending_thinking_rejection = true;
+                } else {
+                    return Self::hit(row, row.upstream_id.clone());
                 }
-                return Self::hit(row, row.upstream_id.clone());
             }
         }
 
@@ -343,14 +368,25 @@ impl ModelRegistry {
             .iter()
             .find(|r| r.match_kind == MatchKind::Exact && r.upstream_id == normalized)
         {
-            // 请求名带 thinking 但该行关闭了变体 → 拒绝
+            // 请求名带 thinking 但该行关闭了变体 → 先记下待定拒绝，继续往下找兜底
             if lower.ends_with("-thinking") && !row.expose_thinking_variant {
-                return Resolution::Rejected(RejectReason::Unknown);
+                pending_thinking_rejection = true;
+            } else {
+                return Self::hit(row, row.upstream_id.clone());
             }
+        }
+
+        // 5. match_substrings 家族匹配：复现旧 map_model 的 contains("haiku") /
+        //    contains("fable") / sonnet 5 代三种拼法，不看版本号。
+        if let Some(row) = self
+            .rows
+            .iter()
+            .find(|r| r.match_kind == MatchKind::Exact && r.match_substrings.iter().any(|s| lower.contains(s.as_str())))
+        {
             return Self::hit(row, row.upstream_id.clone());
         }
 
-        // 5. prefix 行，最长前缀优先；上游 id = 小写请求名原样
+        // 6. prefix 行，最长前缀优先；上游 id = 小写请求名原样
         if let Some(row) = self
             .rows
             .iter()
@@ -360,7 +396,12 @@ impl ModelRegistry {
             return Self::hit(row, lower.clone());
         }
 
-        // 6. 未收录透传
+        // 第 3/4 步的待定拒绝：第 5/6 步都没能提供兜底，真正拒绝
+        if pending_thinking_rejection {
+            return Resolution::Rejected(RejectReason::Unknown);
+        }
+
+        // 7. 未收录透传
         if allow_passthrough {
             return Resolution::Passthrough {
                 upstream_id: normalized,
@@ -576,6 +617,56 @@ mod tests {
         assert!(matches!(
             r.resolve("opus", false),
             Resolution::Rejected(RejectReason::Disabled)
+        ));
+    }
+
+    /// 家族通吃：旧 map_model 的 contains("haiku") / contains("fable")
+    /// 不看版本号，以及 sonnet 5 代的三种拼法。
+    /// 对应 converter.rs 现存测试 test_map_model_haiku 与 test_map_model_sonnet_5。
+    #[test]
+    fn family_substring_matching_reproduces_legacy_behavior() {
+        let r = ModelRegistry::builtin();
+        assert_eq!(mapped(&r, "claude-sonnet.5").0, "claude-sonnet-5");
+        assert_eq!(mapped(&r, "claude-sonnet5").0, "claude-sonnet-5");
+        assert_eq!(mapped(&r, "claude-haiku-4-20250514").0, "claude-haiku-4.5");
+        assert_eq!(mapped(&r, "claude-fable-5-preview").0, "claude-fable-5");
+    }
+
+    /// 家族关键字不得让 legacy claude-3-5-sonnet 被误判（旧行为是 None）
+    #[test]
+    fn family_matching_does_not_break_legacy_sonnet_reverse_case() {
+        let r = ModelRegistry::builtin();
+        assert!(matches!(
+            r.resolve("claude-3-5-sonnet", false),
+            Resolution::Rejected(RejectReason::Unknown)
+        ));
+        assert!(matches!(
+            r.resolve("claude-3-5-sonnet-20241022", false),
+            Resolution::Rejected(RejectReason::Unknown)
+        ));
+    }
+
+    /// gpt-5 开头的名字一律原样透传，thinking 后缀也不例外
+    /// （旧代码 converter.rs:234 不剥 -thinking）
+    #[test]
+    fn gpt5_thinking_suffix_still_passes_through() {
+        let r = ModelRegistry::builtin();
+        assert_eq!(mapped(&r, "gpt-5.6-sol-thinking").0, "gpt-5.6-sol-thinking");
+        assert_eq!(mapped(&r, "gpt-5.9-nova-thinking").0, "gpt-5.9-nova-thinking");
+    }
+
+    /// 变体关闭时，没有 substring/prefix 兜底的模型仍应被拒
+    #[test]
+    fn thinking_disabled_still_rejects_when_no_fallback() {
+        let mut r = ModelRegistry::builtin();
+        for row in r.rows_mut() {
+            if row.exposed_id == "claude-opus-4-8" {
+                row.expose_thinking_variant = false;
+            }
+        }
+        assert!(matches!(
+            r.resolve("claude-opus-4-8-thinking", false),
+            Resolution::Rejected(RejectReason::Unknown)
         ));
     }
 }
