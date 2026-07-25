@@ -443,12 +443,19 @@ pub struct ConversionResult {
     /// Additional model request fields (including `output_config.effort`), translated from the
     /// `output_config` field of the client's Anthropic request. Not sent when empty.
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
+    /// 本次请求的输入上下文窗口。**在请求入口解析一次并向下传递**，
+    /// 响应处理阶段不再回头查全局注册表——否则一次热重载可能导致
+    /// 「用旧表映射、用新表计量」（spec §3.3）。
+    pub context_window: i32,
 }
 
 /// 转换错误
 #[derive(Debug)]
 pub enum ConversionError {
     UnsupportedModel(String),
+    /// 模型在表中存在但被人工禁用。与 UnsupportedModel 区分：
+    /// 「我配了它但不生效」和「我没配它」是不同的排查方向。
+    ModelDisabled(String),
     EmptyMessages,
     /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
     UnsupportedToolMapping(String),
@@ -458,6 +465,7 @@ impl std::fmt::Display for ConversionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
+            ConversionError::ModelDisabled(model) => write!(f, "模型已禁用: {}", model),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
             ConversionError::UnsupportedToolMapping(reason) => {
                 write!(f, "工具映射不支持: {}", reason)
@@ -551,9 +559,26 @@ pub fn convert_request_with_mode(
     req: &MessagesRequest,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<ConversionResult, ConversionError> {
-    // 1. 映射模型
-    let model_id = map_model(&req.model)
-        .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+    // 1. 解析模型：映射 + 窗口一次取齐（单请求内只取一次注册表快照，
+    // 避免响应处理阶段回头查表导致「用旧表映射、用新表计量」）
+    use super::model_registry::{allow_passthrough, current_registry, RejectReason, Resolution};
+    let (model_id, context_window) =
+        match current_registry().resolve(&req.model, allow_passthrough()) {
+            Resolution::Mapped {
+                upstream_id,
+                context_window,
+            }
+            | Resolution::Passthrough {
+                upstream_id,
+                context_window,
+            } => (upstream_id, context_window),
+            Resolution::Rejected(RejectReason::Disabled) => {
+                return Err(ConversionError::ModelDisabled(req.model.clone()));
+            }
+            Resolution::Rejected(RejectReason::Unknown) => {
+                return Err(ConversionError::UnsupportedModel(req.model.clone()));
+            }
+        };
 
     // 2. 检查消息列表
     if req.messages.is_empty() {
@@ -691,6 +716,7 @@ pub fn convert_request_with_mode(
         tool_name_map,
         known_tool_names,
         additional_model_request_fields,
+        context_window,
     })
 }
 
@@ -3378,5 +3404,58 @@ mod tests {
             Some("file content"),
             "text-only tool_result content should be preserved as-is"
         );
+    }
+
+    use crate::anthropic::model_registry::{install_registry, ModelRegistry};
+
+    fn minimal_request(model: &str) -> MessagesRequest {
+        let mut req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": model,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        req.model = model.to_string();
+        req
+    }
+
+    /// 被禁用的模型必须报 ModelDisabled，而不是 UnsupportedModel
+    #[test]
+    fn disabled_model_yields_model_disabled_error() {
+        let _guard = crate::anthropic::model_registry::REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut r = ModelRegistry::builtin();
+        for row in r.rows_mut() {
+            if row.exposed_id == "claude-opus-4-6" {
+                row.enabled = false;
+            }
+        }
+        install_registry(r);
+
+        let err = convert_request(&minimal_request("claude-opus-4-6")).unwrap_err();
+        assert!(
+            matches!(err, ConversionError::ModelDisabled(ref m) if m == "claude-opus-4-6"),
+            "期望 ModelDisabled，实际 {:?}",
+            err
+        );
+        assert_eq!(err.to_string(), "模型已禁用: claude-opus-4-6");
+
+        install_registry(ModelRegistry::builtin());
+    }
+
+    /// 转换结果必须携带窗口，供响应处理阶段使用（避免热重载导致映射/计量不一致）
+    #[test]
+    fn conversion_result_carries_context_window() {
+        let _guard = crate::anthropic::model_registry::REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let result = convert_request(&minimal_request("claude-opus-4-8")).unwrap();
+        assert_eq!(result.context_window, 1_000_000);
+
+        let result = convert_request(&minimal_request("claude-haiku-4-5-20251001")).unwrap();
+        assert_eq!(result.context_window, 200_000);
     }
 }

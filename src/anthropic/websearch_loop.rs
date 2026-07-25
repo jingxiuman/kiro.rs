@@ -26,7 +26,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
+use super::converter::{ConversionError, convert_request_with_mode};
 use crate::model::config::ToolCompatibilityMode;
 use super::handlers::{UsageRecordHook, map_provider_error};
 use super::stream::{CompletedToolUse, SseEvent};
@@ -137,8 +137,10 @@ fn empty_tool_result_disposition(
 /// Buffer-decode one round of the upstream streaming response
 async fn decode_round(
     response: reqwest::Response,
-    model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
+    // 请求入口随 ConversionResult 传入的输入上下文窗口，单请求内只取一次快照，
+    // 避免响应处理阶段回头查全局注册表（热重载可能导致「用旧表映射、用新表计量」）。
+    context_window: i32,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
     let mut decoder = EventStreamDecoder::new();
@@ -197,7 +199,8 @@ async fn decode_round(
                     entry.1.push_str(&tu.input);
                 }
                 Event::ContextUsage(cu) => {
-                    let window = get_context_window_size(model);
+                    // 窗口值由请求入口随 ConversionResult 传入，不再回头查全局注册表
+                    let window = context_window;
                     let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
                     context_input_tokens = Some(actual);
                     if cu.context_usage_percentage >= 100.0 {
@@ -267,6 +270,9 @@ async fn run_round(
                 ConversionError::UnsupportedModel(m) => {
                     ("invalid_request_error", format!("unsupported model: {}", m))
                 }
+                ConversionError::ModelDisabled(m) => {
+                    ("invalid_request_error", format!("model disabled: {}", m))
+                }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "message list is empty".to_string())
                 }
@@ -306,7 +312,7 @@ async fn run_round(
     };
     let credential_id = call_result.credential_id;
     let mut outcome =
-        decode_round(call_result.response, &payload.model, &conversion.tool_name_map).await;
+        decode_round(call_result.response, &conversion.tool_name_map, conversion.context_window).await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
     // shared `<invoke>` text-leak fault tolerance with a correct tool-table guard.
     outcome.known_tool_names = conversion.known_tool_names;
