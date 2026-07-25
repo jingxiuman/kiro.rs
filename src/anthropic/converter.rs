@@ -567,11 +567,14 @@ pub fn convert_request_with_mode(
             Resolution::Mapped {
                 upstream_id,
                 context_window,
-            }
-            | Resolution::Passthrough {
+            } => (upstream_id, context_window),
+            Resolution::Passthrough {
                 upstream_id,
                 context_window,
-            } => (upstream_id, context_window),
+            } => {
+                super::model_registry::note_passthrough_model(&req.model);
+                (upstream_id, context_window)
+            }
             Resolution::Rejected(RejectReason::Disabled) => {
                 return Err(ConversionError::ModelDisabled(req.model.clone()));
             }
