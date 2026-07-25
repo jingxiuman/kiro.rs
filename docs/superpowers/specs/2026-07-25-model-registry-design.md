@@ -189,6 +189,7 @@ src/anthropic/websearch_loop.rs:200 web-search 循环
 | `ownedBy` / `modelType` / `created` / `sortOrder` | 构造 `Model` 所需字段（`anthropic/types.rs:43` 要求 `object`/`created`/`owned_by`/`display_name`/`type`/`max_tokens`）；`sortOrder` 保持列表顺序稳定，替代当前硬编码 `Vec` 的隐式顺序 |
 | `exposeThinkingVariant` | 是否额外暴露 `{exposedId}-thinking`，映射到同一 `upstreamId` |
 | `enabled` | `false` → 拒绝请求 **且从 `/v1/models` 移除** |
+| `listed` | 是否出现在 `/v1/models`。缺省 `true`；`matchKind == "prefix"` 的行**强制 `false`**（仅用于解析，不是一个真实模型）|
 | `status` | `active` \| `deprecated`（上游消失但保留，仍可用、仍在列表） |
 | `origin` | `builtin` \| `synced` \| `manual` |
 | `pinned` | 已人工编辑、同步时逐字段跳过的字段名 |
@@ -266,7 +267,8 @@ enum Resolution {
 1. `aliases.from` 精确命中 → 取其 `to` 指向的行
 2. `exposedId` 精确命中
 3. `{exposedId}-thinking` 命中 **且该行 `exposeThinkingVariant == true`**
-4. 规范化后与 `exposedId` 精确命中
+4. 规范化后与 **`upstreamId`** 精确命中
+   > 规范化的产物形态恰好就是上游 id 的形态（点号版本段），所以这一步对 `upstreamId` 匹配、而非 `exposedId`。这是必需的：`claude-opus-4-5`（不带日期后缀）今天能用（`map_model` 走 `contains("4-5")`），但表里的 `exposedId` 是 `claude-opus-4-5-20251101`；只有规范化到 `claude-opus-4.5` 再匹配 `upstreamId` 才能保住它。
 5. `matchKind == "prefix"` 的行按 `exposedId` 做前缀匹配，最长前缀优先；`upstream_id` = **请求名原样**（规范化前）
 6. `allowUnknownModelPassthrough == true` → `Passthrough`（规范化后名字，窗口 200K）
 7. 否则 `Rejected(Unknown)`
@@ -276,7 +278,8 @@ enum Resolution {
 - 命中行 `enabled == false` → `Rejected(Disabled)`（含经 alias 命中）
 - **请求名带 `-thinking`、但命中行 `exposeThinkingVariant == false` → `Rejected(Unknown)`**
   > v1 缺此规则：第 2 步条件性识别 `-thinking`，但规范化又无条件剥掉它，导致关掉 thinking 变体的模型仍能被 `xxx-thinking` 命中。
-- **`prefix` 行是 `gpt-5*` 通配的落点。** 内置默认含一行 `{ upstreamId: "gpt-5", matchKind: "prefix", exposedId: "gpt-5", contextWindow: 272000 }`，复现 `converter.rs:234` 现有的 `starts_with("gpt-5")` 原样透传语义。
+- **`prefix` 行是 `gpt-5*` 通配的落点。** 内置默认含一行 `{ upstreamId: "gpt-5", matchKind: "prefix", exposedId: "gpt-5", contextWindow: 272000, listed: false }`，复现 `converter.rs:234` 现有的 `starts_with("gpt-5")` 原样透传语义（返回值为**小写后的请求名原样**，与现有 `Some(model_lower)` 一致）。
+  该行 `listed: false`，否则 `/v1/models` 会多出一个并不存在的 `gpt-5` 条目——而三个真实的 `gpt-5.6-sol` / `-terra` / `-luna` 仍以 `matchKind: "exact"` 行存在于列表中（`handlers.rs:388-412`）。
   > v1 只有精确/规范化匹配 + 默认关闭的 passthrough，**无法复现现有 `gpt-5*` 通配**，是行为回归。
 
 ## 6. 同步流程
