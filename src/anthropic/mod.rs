@@ -27,6 +27,7 @@ mod handlers;
 mod middleware;
 pub mod model_registry;
 pub mod model_registry_store;
+pub mod model_sync;
 mod openai;
 mod responses;
 pub mod cache_metering;
