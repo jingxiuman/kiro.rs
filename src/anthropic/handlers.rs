@@ -491,6 +491,9 @@ pub async fn post_messages(
                 ConversionError::UnsupportedModel(model) => {
                     ("invalid_request_error", format!("模型不支持: {}", model))
                 }
+                ConversionError::ModelDisabled(model) => {
+                    ("invalid_request_error", format!("模型已禁用: {}", model))
+                }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
@@ -549,6 +552,7 @@ pub async fn post_messages(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    let context_window = conversion_result.context_window;
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
@@ -582,6 +586,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            context_window,
         )
         .await
     } else {
@@ -607,6 +612,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            context_window,
         )
         .await
     }
@@ -625,6 +631,8 @@ async fn handle_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    // 请求入口随 ConversionResult 传入的输入上下文窗口，见 handle_non_stream_request 同名参数注释。
+    context_window: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
@@ -642,6 +650,7 @@ async fn handle_stream_request(
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
     ctx.cache_usage = cache_usage;
+    ctx.context_window = context_window;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -827,8 +836,6 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
     }
 }
 
-use super::converter::get_context_window_size;
-
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -844,6 +851,9 @@ async fn handle_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    // 请求入口随 ConversionResult 传入的输入上下文窗口，单请求内只取一次快照，
+    // 避免响应处理阶段回头查全局注册表（热重载可能导致「用旧表映射、用新表计量」）。
+    context_window: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
@@ -945,7 +955,8 @@ async fn handle_non_stream_request(
                         }
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = get_context_window_size(model);
+                            // 窗口值由请求入口随 ConversionResult 传入，不再回头查全局注册表
+                            let window_size = context_window;
                             let actual_input_tokens =
                                 (context_usage.context_usage_percentage * (window_size as f64)
                                     / 100.0) as i32;
@@ -1282,6 +1293,9 @@ pub async fn post_messages_cc(
                 ConversionError::UnsupportedModel(model) => {
                     ("invalid_request_error", format!("模型不支持: {}", model))
                 }
+                ConversionError::ModelDisabled(model) => {
+                    ("invalid_request_error", format!("模型已禁用: {}", model))
+                }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
@@ -1340,6 +1354,7 @@ pub async fn post_messages_cc(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    let context_window = conversion_result.context_window;
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
@@ -1372,6 +1387,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            context_window,
         )
         .await
     } else {
@@ -1397,6 +1413,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            context_window,
         )
         .await
     }
@@ -1418,6 +1435,8 @@ async fn handle_stream_request_buffered(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    // 请求入口随 ConversionResult 传入的输入上下文窗口，见 handle_non_stream_request 同名参数注释。
+    context_window: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
@@ -1440,6 +1459,7 @@ async fn handle_stream_request_buffered(
         known_tool_names,
     );
     ctx.set_cache_usage(cache_usage);
+    ctx.set_context_window(context_window);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);

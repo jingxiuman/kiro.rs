@@ -1338,6 +1338,11 @@ pub struct StreamContext {
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
+    /// 本次请求的输入上下文窗口。由请求入口的 `ConversionResult.context_window`
+    /// 传入，响应处理阶段不再回头查全局注册表（避免热重载导致「用旧表映射、
+    /// 用新表计量」，见 spec §3.3）。构造时默认走 `get_context_window_size` 兜底，
+    /// 调用方应在构造后用权威值覆盖。
+    pub context_window: i32,
     /// 输出 tokens 累计
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
@@ -1421,12 +1426,16 @@ impl StreamContext {
         tool_name_map: HashMap<String, String>,
         known_tool_names: std::collections::HashSet<String>,
     ) -> Self {
+        let model = model.into();
+        // 兜底默认值：调用方应在构造后用 ConversionResult.context_window 覆盖。
+        let context_window = get_context_window_size(&model);
         Self {
             state_manager: SseStateManager::new(),
-            model: model.into(),
+            model,
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
             context_input_tokens: None,
+            context_window,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
@@ -1522,7 +1531,8 @@ impl StreamContext {
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
-                let window_size = get_context_window_size(&self.model);
+                // 窗口值由请求入口随 ConversionResult 传入，不再回头查全局注册表
+                let window_size = self.context_window;
                 let actual_input_tokens =
                     (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
@@ -2525,6 +2535,11 @@ impl BufferedStreamContext {
     /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
     pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
         self.inner.cache_usage = cache_usage;
+    }
+
+    /// 用请求入口解析出的权威窗口值覆盖构造时的兜底默认值。
+    pub fn set_context_window(&mut self, context_window: i32) {
+        self.inner.context_window = context_window;
     }
 
     /// 处理 Kiro 事件并缓冲结果
