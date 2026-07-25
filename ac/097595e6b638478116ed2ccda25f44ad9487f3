@@ -1,0 +1,26 @@
+.superpowers/sdd/task-6-fix-report.md
+  s_ac04534933677d::t_29e1399c5ae716 1-116
+src/anthropic/model_registry.rs
+  s_ac04534933677d::t_a9801bab593988 422-434,452,462-489,528,533
+  s_ac04534933677d::t_daefdd6c938916 515-525
+  s_ac04534933677d::t_f2e66d6dc8f34d 365-366,368-376
+  s_ac04534933677d::t_3d174befdcfbca 1254
+  s_ac04534933677d::t_85cd3b8ce0a16d 493-513
+  s_ac04534933677d::t_ef2d97aa620388 1209-1252
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "ac097595e6b638478116ed2ccda25f44ad9487f3",
+  "prompts": {},
+  "sessions": {
+    "s_ac04534933677d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "406a6388-eb5d-470d-a7b4-e094c57e8508",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
