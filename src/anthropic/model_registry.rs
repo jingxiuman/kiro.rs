@@ -7,6 +7,7 @@
 
 use super::types::Model;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 /// 匹配方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +272,51 @@ pub fn normalize_model_name(requested: &str) -> String {
     s
 }
 
+/// `models.json` 的 schema 版本。加载时必须精确等于此值。
+/// 不做自动迁移：未来版本靠「只增字段」保持前向兼容。
+pub const REGISTRY_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncState {
+    #[serde(default)]
+    pub last_sync_at: Option<String>,
+    /// 本轮 fetch 的起始时间，用于乱序丢弃（见 model_sync）。
+    #[serde(default)]
+    pub last_fetch_started_at: Option<String>,
+    /// 数据来源标记，如 `probe:3` 或 `sample:1,4,7`。
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRegistryFile {
+    pub version: u32,
+    #[serde(default)]
+    pub sync_state: SyncState,
+    #[serde(default)]
+    pub models: Vec<ModelRow>,
+    #[serde(default)]
+    pub aliases: Vec<ModelAlias>,
+    /// 凭据 id（字符串形式，JSON key 限制）→ 该凭据可用的 upstream_id 列表。
+    /// 同步时顺带记录（零额外请求），供调度层过滤。
+    #[serde(default)]
+    pub credential_support: HashMap<String, Vec<String>>,
+}
+
+impl Default for ModelRegistryFile {
+    fn default() -> Self {
+        Self {
+            version: REGISTRY_SCHEMA_VERSION,
+            sync_state: SyncState::default(),
+            models: Vec::new(),
+            aliases: Vec::new(),
+            credential_support: HashMap::new(),
+        }
+    }
+}
+
 /// 注册表。构造后不可变；热重载靠整体替换 Arc。
 #[derive(Debug, Clone)]
 pub struct ModelRegistry {
@@ -454,6 +500,85 @@ impl ModelRegistry {
             }
         }
         out
+    }
+}
+
+impl ModelRegistry {
+    /// 从覆盖层文件构造。任一校验失败即整体拒绝（调用方退回内置默认 + degraded）。
+    ///
+    /// 校验顺序见 spec §4.5。唯一性校验不可省：重复 exposedId、alias 与
+    /// exposedId 撞名都会让解析结果依赖遍历顺序。
+    pub fn from_file(file: ModelRegistryFile) -> Result<Self, String> {
+        if file.version != REGISTRY_SCHEMA_VERSION {
+            return Err(format!(
+                "不支持的 models.json schema 版本: {}（期望 {}）",
+                file.version, REGISTRY_SCHEMA_VERSION
+            ));
+        }
+
+        let mut rows = file.models;
+
+        // prefix 行强制 listed=false —— 它不是一个真实模型，
+        // 若出现在 /v1/models 会多出一个不存在的条目。
+        for row in rows.iter_mut() {
+            if row.match_kind == MatchKind::Prefix {
+                row.listed = false;
+                if row.expose_thinking_variant {
+                    return Err(format!(
+                        "prefix 行不得开启 thinking 变体: {}",
+                        row.upstream_id
+                    ));
+                }
+            }
+            if row.context_window <= 0 {
+                return Err(format!(
+                    "contextWindow 必须为正数: {} = {}",
+                    row.upstream_id, row.context_window
+                ));
+            }
+            if row.max_output_tokens <= 0 {
+                return Err(format!(
+                    "maxOutputTokens 必须为正数: {} = {}",
+                    row.upstream_id, row.max_output_tokens
+                ));
+            }
+        }
+
+        // upstream_id 唯一
+        let mut seen_upstream: HashSet<&str> = HashSet::new();
+        for row in &rows {
+            if !seen_upstream.insert(row.upstream_id.as_str()) {
+                return Err(format!("重复的 upstreamId: {}", row.upstream_id));
+            }
+        }
+
+        // 全部对外名唯一：exposed_id + 派生 thinking 名 + alias.from
+        let mut seen_names: HashSet<String> = HashSet::new();
+        for row in &rows {
+            if !seen_names.insert(row.exposed_id.to_ascii_lowercase()) {
+                return Err(format!("重复的对外模型名: {}", row.exposed_id));
+            }
+            if row.expose_thinking_variant {
+                let name = format!("{}-thinking", row.exposed_id).to_ascii_lowercase();
+                if !seen_names.insert(name.clone()) {
+                    return Err(format!("重复的对外模型名: {}", name));
+                }
+            }
+        }
+        for alias in &file.aliases {
+            let from = alias.from.to_ascii_lowercase();
+            if !seen_names.insert(from.clone()) {
+                return Err(format!("别名与已有对外模型名冲突或重复: {}", alias.from));
+            }
+            if !rows.iter().any(|r| r.upstream_id == alias.to) {
+                return Err(format!("别名指向不存在的 upstreamId: {}", alias.to));
+            }
+            if file.aliases.iter().any(|a| a.from == alias.to) {
+                return Err(format!("别名不得指向另一个别名: {} -> {}", alias.from, alias.to));
+            }
+        }
+
+        Ok(Self { rows, aliases: file.aliases })
     }
 }
 
@@ -747,6 +872,119 @@ mod tests {
             .clone();
         assert_eq!(sol.max_tokens, row.max_output_tokens);
         assert_ne!(sol.max_tokens, row.context_window, "把输入窗口错报成输出上限了");
+    }
+
+    fn file_with(models: Vec<ModelRow>, aliases: Vec<ModelAlias>) -> ModelRegistryFile {
+        ModelRegistryFile {
+            version: REGISTRY_SCHEMA_VERSION,
+            sync_state: SyncState::default(),
+            models,
+            aliases,
+            credential_support: Default::default(),
+        }
+    }
+
+    fn sample_row(upstream: &str, exposed: &str) -> ModelRow {
+        let mut row = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        row.upstream_id = upstream.to_string();
+        row.exposed_id = exposed.to_string();
+        row.origin = ModelOrigin::Manual;
+        row
+    }
+
+    #[test]
+    fn rejects_unsupported_schema_version() {
+        let mut file = file_with(builtin_rows(), vec![]);
+        file.version = 2;
+        assert!(ModelRegistry::from_file(file).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_upstream_id() {
+        let file = file_with(
+            vec![sample_row("claude-x", "claude-x-a"), sample_row("claude-x", "claude-x-b")],
+            vec![],
+        );
+        let err = ModelRegistry::from_file(file).unwrap_err();
+        assert!(err.contains("upstreamId"), "错误信息应指出重复的 upstreamId: {}", err);
+    }
+
+    #[test]
+    fn rejects_duplicate_exposed_name_including_thinking_variant() {
+        // a 的 thinking 变体名与 b 的 exposedId 撞名
+        let mut a = sample_row("claude-a", "claude-x");
+        a.expose_thinking_variant = true;
+        let mut b = sample_row("claude-b", "claude-x-thinking");
+        b.expose_thinking_variant = false;
+        let err = ModelRegistry::from_file(file_with(vec![a, b], vec![])).unwrap_err();
+        assert!(err.contains("claude-x-thinking"), "应报出撞名: {}", err);
+    }
+
+    #[test]
+    fn rejects_alias_conflicts_and_dangling() {
+        // dangling
+        let err = ModelRegistry::from_file(file_with(
+            vec![sample_row("claude-a", "claude-a")],
+            vec![ModelAlias { from: "x".into(), to: "claude-missing".into() }],
+        ))
+        .unwrap_err();
+        assert!(err.contains("claude-missing"), "应报出 dangling alias: {}", err);
+
+        // alias.from 与 exposedId 撞名
+        let err = ModelRegistry::from_file(file_with(
+            vec![sample_row("claude-a", "claude-a")],
+            vec![ModelAlias { from: "claude-a".into(), to: "claude-a".into() }],
+        ))
+        .unwrap_err();
+        assert!(err.contains("claude-a"));
+
+        // 重复 alias.from
+        let err = ModelRegistry::from_file(file_with(
+            vec![sample_row("claude-a", "claude-a")],
+            vec![
+                ModelAlias { from: "x".into(), to: "claude-a".into() },
+                ModelAlias { from: "x".into(), to: "claude-a".into() },
+            ],
+        ))
+        .unwrap_err();
+        assert!(err.contains('x'));
+    }
+
+    #[test]
+    fn rejects_out_of_range_windows() {
+        let mut row = sample_row("claude-a", "claude-a");
+        row.context_window = 0;
+        assert!(ModelRegistry::from_file(file_with(vec![row], vec![])).is_err());
+
+        let mut row = sample_row("claude-b", "claude-b");
+        row.max_output_tokens = -1;
+        assert!(ModelRegistry::from_file(file_with(vec![row], vec![])).is_err());
+    }
+
+    #[test]
+    fn rejects_prefix_row_with_thinking_variant() {
+        let mut row = sample_row("gpt-6", "gpt-6");
+        row.match_kind = MatchKind::Prefix;
+        row.expose_thinking_variant = true;
+        assert!(ModelRegistry::from_file(file_with(vec![row], vec![])).is_err());
+    }
+
+    #[test]
+    fn accepts_valid_file_and_forces_prefix_unlisted() {
+        let mut row = sample_row("gpt-6", "gpt-6");
+        row.match_kind = MatchKind::Prefix;
+        row.expose_thinking_variant = false;
+        row.listed = true; // 故意写 true，加载时应被强制为 false
+        let registry = ModelRegistry::from_file(file_with(vec![row], vec![])).unwrap();
+        let added = registry
+            .rows()
+            .iter()
+            .find(|r| r.upstream_id == "gpt-6")
+            .expect("覆盖层里新增的 gpt-6 行应存在");
+        assert!(!added.listed, "prefix 行的 listed 必须被强制为 false");
     }
 
     /// listed=false / enabled=false 不出现在列表；deprecated 仍在列表
