@@ -1,0 +1,21 @@
+src/anthropic/model_registry.rs
+  s_ac04534933677d::t_723d03e7562c61 415-457
+  s_ac04534933677d::t_26257cae0c19dc 8
+  s_ac04534933677d::t_4e1819a7089571 716-769
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "36583c584b7cc93e24322d94377033c61faedae5",
+  "prompts": {},
+  "sessions": {
+    "s_ac04534933677d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "406a6388-eb5d-470d-a7b4-e094c57e8508",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
