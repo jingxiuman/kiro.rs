@@ -1,0 +1,27 @@
+docs/superpowers/specs/2026-07-25-model-registry-design.md
+  s_ac04534933677d::t_c4124232090957 193
+  s_ac04534933677d::t_850d589b3b4a27 273-279
+src/anthropic/model_registry.rs
+  s_ac04534933677d::t_fb4c996610af9f 196
+  s_ac04534933677d::t_bca45eff64bf34 318-325,328,356-359,371,373-375,377-385,389,399-404
+  s_ac04534933677d::t_35feeb6018e6f2 622-671
+  s_ac04534933677d::t_0386abedf774d5 139,166,168-172
+  s_ac04534933677d::t_26f8a13cee00cf 95-100
+  s_ac04534933677d::t_1268005535dc09 165,167
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "da88aafeff20e78efe8a94eba65cbebcb2612484",
+  "prompts": {},
+  "sessions": {
+    "s_ac04534933677d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "406a6388-eb5d-470d-a7b4-e094c57e8508",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
