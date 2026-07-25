@@ -10,6 +10,20 @@
 
 **Spec:** `docs/superpowers/specs/2026-07-25-model-registry-design.md`（v2）。本计划与该 spec 一一对应；spec 的 §13 记录了 v1→v2 的 28 项修订原因，实现时如遇疑问先读 spec。
 
+## 执行期修订（Task 2 评审后追加）
+
+代码评审在 Task 2 抓出两处本计划遗漏的行为回归，spec 已相应修订（见 spec §4.3 `matchSubstrings` 与 §5.3）。**后续任务以下述为准**：
+
+1. **`ModelRow` 多一个字段** `match_substrings: Vec<String>`（`#[serde(default)]`）。内置默认只给三行填值：`claude-fable-5` → `["fable"]`、`claude-haiku-4.5` → `["haiku"]`、`claude-sonnet-5` → `["sonnet-5","sonnet5","sonnet.5"]`；其余全部为空。这是为了复现旧 `map_model` 的「家族通吃」语义 —— 旧代码 `contains("haiku")` / `contains("fable")` 不看版本号就映射，且 sonnet 5 代接受三种拼法。**不得给 sonnet/opus 4.x 行填家族关键字**，否则 `claude-3-5-sonnet` 会被误判（旧行为是 `None`）。
+   > 漏掉它会让 `converter.rs:1855`（`claude-sonnet.5`）与 `converter.rs:1873`（`claude-haiku-4-20250514`）两个现存测试在 Task 6 之后必然失败。
+
+2. **`resolve()` 顺序为 8 步**：alias → `exposed_id` 精确 → `{exposed_id}-thinking`(变体开启) → 规范化匹配 `upstream_id` → **`match_substrings` 命中** → prefix 最长前缀 → passthrough → Unknown。
+
+3. **「thinking 变体被关闭」的拒绝延后生效**：第 3/4 步命中但变体关闭时记下待定拒绝并继续往下，只有第 5、6 步都没命中才返回 `Unknown`。`Rejected(Disabled)`（`enabled == false`）不受延后影响，命中即返回。
+   > 否则 `gpt-5.6-sol-thinking` 会被 gpt 精确行拦掉，走不到 prefix 透传，而旧代码对任何 `gpt-5` 开头的名字一律原样透传（`converter.rs:234`，不剥 `-thinking`）。
+
+4. **环境事实**：本仓库是 bin-only crate，无 lib target。计划各任务里写的 `cargo test --lib` 一律改用 `cargo test --bin kiro-rs`。全量基线：改造前 523 passed。
+
 ## Global Constraints
 
 - **不引入任何新 crate。** 仅使用现有依赖：`parking_lot`、`chrono`、`serde`、`serde_json`、`tokio`、`anyhow`、`thiserror`、`tracing`。
