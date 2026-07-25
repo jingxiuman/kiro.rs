@@ -3417,6 +3417,47 @@ impl Drop for MultiTokenManager {
     }
 }
 
+/// 供模型注册表同步服务（`anthropic::model_sync`）拉取上游模型列表。
+///
+/// 复用既有 `get_available_models_for`（内部处理 token 刷新与并发网络请求），
+/// 只做返回类型转换，使同步逻辑可以脱离真实网络在单测中注入假实现。
+impl crate::anthropic::model_sync::ModelListFetcher for MultiTokenManager {
+    fn fetch(
+        &self,
+        credential_id: u64,
+    ) -> crate::anthropic::model_sync::BoxFuture<'_, Result<Vec<crate::anthropic::model_sync::UpstreamModel>, String>>
+    {
+        Box::pin(async move {
+            let resp = self
+                .get_available_models_for(credential_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(resp
+                .models
+                .into_iter()
+                .map(|m| crate::anthropic::model_sync::UpstreamModel {
+                    model_id: m.model_id,
+                    model_name: m.model_name,
+                    max_input_tokens: m.token_limits.and_then(|t| t.max_input_tokens),
+                })
+                .collect())
+        })
+    }
+
+    /// 启用（未禁用）的凭据 id，升序。
+    fn candidate_credential_ids(&self) -> Vec<u64> {
+        let entries = self.entries.lock();
+        let mut ids: Vec<u64> = entries.iter().filter(|e| !e.disabled).map(|e| e.id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn is_credential_usable(&self, credential_id: u64) -> bool {
+        let entries = self.entries.lock();
+        entries.iter().any(|e| e.id == credential_id && !e.disabled)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
