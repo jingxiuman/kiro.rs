@@ -233,6 +233,36 @@ pub enum Resolution {
 /// 透传时的窗口回退值。
 pub const PASSTHROUGH_CONTEXT_WINDOW: i32 = 200_000;
 
+/// passthrough 命中时的 warn 去重集合容量上限。
+/// `MessagesRequest.model` 由客户端控制，无界集合可被打爆内存。
+const PASSTHROUGH_WARN_CACHE_CAP: usize = 64;
+
+static PASSTHROUGH_WARN_CACHE: LazyLock<RwLock<Vec<String>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+
+/// 记录一次 passthrough 命中；同名模型只 warn 一次，集合满则整体清空重来
+/// （等价于粗粒度节流，避免无界增长）。
+pub fn note_passthrough_model(model: &str) {
+    let mut cache = PASSTHROUGH_WARN_CACHE.write();
+    if cache.iter().any(|m| m == model) {
+        return;
+    }
+    if cache.len() >= PASSTHROUGH_WARN_CACHE_CAP {
+        cache.clear();
+    }
+    cache.push(model.to_string());
+    tracing::warn!(
+        "模型 {} 未在映射表中，走透传，窗口按 {} 估算",
+        model,
+        PASSTHROUGH_CONTEXT_WINDOW
+    );
+}
+
+#[cfg(test)]
+pub fn passthrough_warn_cache_len() -> usize {
+    PASSTHROUGH_WARN_CACHE.read().len()
+}
+
 /// 规范化模型名。产物形态恰好是上游 id 的形态（点号版本段），
 /// 因此解析的第 4 步用它去匹配 upstream_id。
 ///
@@ -1240,6 +1270,30 @@ mod tests {
         assert_eq!(mapped(&r, "gpt-5.6-sol-20250929"), ("gpt-5.6-sol-20250929".to_string(), 272_000));
         assert_eq!(mapped(&r, "gpt-5.6-sol").0, "gpt-5.6-sol");
         assert_eq!(mapped(&r, "gpt-5.6-sol-thinking").0, "gpt-5.6-sol-thinking");
+    }
+
+    /// passthrough 去重集合是进程级全局状态，与 REGISTRY 共用测试串行锁，
+    /// 避免与其他改全局状态的测试随机打架。
+    #[test]
+    fn passthrough_warn_dedup_is_bounded() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 客户端可控的 model 字段意味着无界去重集合可被打爆内存
+        for i in 0..200 {
+            note_passthrough_model(&format!("unknown-model-{}", i));
+        }
+        assert!(passthrough_warn_cache_len() <= 64, "去重集合必须有上限");
+    }
+
+    #[test]
+    fn passthrough_warn_dedups_same_model() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = passthrough_warn_cache_len();
+        note_passthrough_model("some-unique-model-for-dedup-test");
+        let after_first = passthrough_warn_cache_len();
+        note_passthrough_model("some-unique-model-for-dedup-test");
+        let after_second = passthrough_warn_cache_len();
+        assert_eq!(after_first, before + 1, "首次应记入");
+        assert_eq!(after_second, after_first, "重复不应再记入");
     }
 
     /// 精确匹配优先级必须高于宽松匹配
