@@ -362,11 +362,18 @@ impl ModelRegistry {
     }
 
     /// 解析请求中的模型名。顺序：alias → exposedId → exposedId-thinking →
-    /// 规范化后匹配 upstreamId → match_substrings 家族匹配 → prefix 行 →
-    /// 透传 → 拒绝。
+    /// prefix 行 → 规范化后匹配 upstreamId → match_substrings 家族匹配 →
+    /// 家族+版本宽松匹配 → 透传 → 拒绝。
     ///
-    /// 「thinking 变体被关闭」的拒绝会被延后：第 3/4 步命中但变体关闭时，
-    /// 先记下待定拒绝、继续往下走，只有第 5/6 步也未命中才真正拒绝——
+    /// prefix 匹配被放在「规范化匹配 upstreamId」**之前**：规范化会剥掉日期
+    /// 后缀（如 `-20250929`），但 `gpt-5.6-sol-20250929` 这类 gpt-5* 请求
+    /// 必须原样透传、日期不能丢（旧代码对 gpt-5* 不做任何规范化，直接
+    /// contains 判断）。若规范化先跑，日期就已经被剥掉，prefix 步骤命中时
+    /// 上游 id 就不再是原始请求名了。claude 系没有 prefix 行，不受此调整
+    /// 影响。
+    ///
+    /// 「thinking 变体被关闭」的拒绝会被延后：第 3/5 步命中但变体关闭时，
+    /// 先记下待定拒绝、继续往下走，只有后续步骤也未命中才真正拒绝——
     /// 这样 `gpt-5.6-sol-thinking` 这类请求能落到 prefix 透传（旧代码对
     /// gpt-5* 不剥 -thinking，原样透传）。`enabled == false` 的
     /// `Rejected(Disabled)` 不受影响，命中即返回。
@@ -412,7 +419,19 @@ impl ModelRegistry {
             }
         }
 
-        // 4. 规范化后匹配 upstream_id
+        // 4. prefix 行，最长前缀优先；上游 id = 小写请求名原样。
+        //    必须在规范化匹配之前：规范化会剥掉日期后缀，而 gpt-5* 这类
+        //    prefix 命中要求「原样透传」，日期不能丢。
+        if let Some(row) = self
+            .rows
+            .iter()
+            .filter(|r| r.match_kind == MatchKind::Prefix && lower.starts_with(&r.exposed_id))
+            .max_by_key(|r| r.exposed_id.len())
+        {
+            return Self::hit(row, lower.clone());
+        }
+
+        // 5. 规范化后匹配 upstream_id
         let normalized = normalize_model_name(&lower);
         if let Some(row) = self
             .rows
@@ -430,7 +449,7 @@ impl ModelRegistry {
             }
         }
 
-        // 5. match_substrings 家族匹配：复现旧 map_model 的 contains("haiku") /
+        // 6. match_substrings 家族匹配：复现旧 map_model 的 contains("haiku") /
         //    contains("fable") / sonnet 5 代三种拼法，不看版本号。
         if let Some(row) = self
             .rows
@@ -440,22 +459,78 @@ impl ModelRegistry {
             return Self::hit(row, row.upstream_id.clone());
         }
 
-        // 6. prefix 行，最长前缀优先；上游 id = 小写请求名原样
+        // 7. 家族 + 版本宽松匹配：复现旧 map_model 对 sonnet/opus 4.x 系列的
+        //    `contains(家族) && contains(版本)` 语义，用于容忍
+        //    Bedrock/Vertex 风格前缀（`anthropic.claude-opus-4-8`）、
+        //    `-latest` / `-preview` / `@日期` 等后缀、以及不带 `claude-`
+        //    前缀的简写（`opus-4.8`）。
+        //
+        //    匹配规则完全从 upstream_id 派生，不新增数据字段：
+        //    - 仅对 upstream_id 以 "claude-" 开头、且最后一段形如
+        //      `<数字>.<数字>` 的行启用（如 claude-opus-4.8 的 "4.8"）。
+        //      **刻意排除**无点号的版本段（如 claude-sonnet-5 的
+        //      "5"、claude-fable-5 的 "5"）——旧代码对 sonnet/opus 4.x
+        //      要求同时命中版本号，若把无点号的单段数字也当作版本，
+        //      `contains("sonnet") && contains("5")` 会让
+        //      `claude-3-5-sonnet` 被误判为 sonnet 5 代（旧行为是
+        //      None）。这些行的宽松别名已由上面的 match_substrings 单独
+        //      覆盖，不需要也不应该走这条通用规则。
+        //    - 家族关键字 = upstream_id 按 "-" 切分的第 2 段
+        //      （claude-opus-4.8 → "opus"）。
+        //    - 版本形态两种：点号版（"4.8"）与连字符版（"4-8"），命中
+        //      其一即可，因为规范化前的原始请求可能用任一形态书写。
+        //    - 命中条件：请求名同时包含家族关键字与其中一种版本形态。
+        //    - 多行都命中时按 sort_order 升序取第一个。
+        //
+        //    已知的可接受差异：旧代码 opus 分支的判断顺序是
+        //    4-8 → 4-7 → 4-5 → 4-6（4-5 排在 4-6 之前，像笔误但是既有
+        //    事实），这里按 sort_order 即 4.8 → 4.7 → 4.6 → 4.5。仅当输入
+        //    同时包含两个不同版本号（如 `claude-opus-4-5-4-6` 这种病态
+        //    输入）时结果才会不同，可接受。
         if let Some(row) = self
             .rows
             .iter()
-            .filter(|r| r.match_kind == MatchKind::Prefix && lower.starts_with(&r.exposed_id))
-            .max_by_key(|r| r.exposed_id.len())
+            .filter(|r| r.match_kind == MatchKind::Exact)
+            .filter(|r| {
+                let Some(rest) = r.upstream_id.strip_prefix("claude-") else { return false };
+                let segments: Vec<&str> = rest.split('-').collect();
+                if segments.len() < 2 {
+                    return false;
+                }
+                let family = segments[0];
+                let version_dot = *segments.last().unwrap();
+                let Some((major, minor)) = version_dot.split_once('.') else { return false };
+                if major.is_empty()
+                    || minor.is_empty()
+                    || !major.bytes().all(|b| b.is_ascii_digit())
+                    || !minor.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return false;
+                }
+                let version_hyphen = format!("{}-{}", major, minor);
+                lower.contains(family) && (lower.contains(version_dot) || lower.contains(&version_hyphen))
+            })
+            .min_by_key(|r| r.sort_order)
         {
-            return Self::hit(row, lower.clone());
+            // 请求名带 -thinking 后缀时，宽松匹配到的行同样要过 thinking
+            // 变体门禁——否则第 3 步已经记下的「变体关闭」待定拒绝会被
+            // 这里悄悄绕过（宽松匹配不看 -thinking，会把
+            // `claude-opus-4-8-thinking` 当成普通请求命中）。
+            if lower.ends_with("-thinking") && !row.enabled {
+                return Resolution::Rejected(RejectReason::Disabled);
+            } else if lower.ends_with("-thinking") && !row.expose_thinking_variant {
+                pending_thinking_rejection = true;
+            } else {
+                return Self::hit(row, row.upstream_id.clone());
+            }
         }
 
-        // 第 3/4 步的待定拒绝：第 5/6 步都没能提供兜底，真正拒绝
+        // 第 3/5 步的待定拒绝：后续步骤都没能提供兜底，真正拒绝
         if pending_thinking_rejection {
             return Resolution::Rejected(RejectReason::Unknown);
         }
 
-        // 7. 未收录透传
+        // 8. 未收录透传
         if allow_passthrough {
             return Resolution::Passthrough {
                 upstream_id: normalized,
@@ -1131,4 +1206,49 @@ mod tests {
             Resolution::Rejected(RejectReason::Disabled)
         ));
     }
+
+    /// Bedrock / Vertex 风格的模型 id 必须继续可用 ——
+    /// 旧 map_model 的 contains() 作用于整串，天然容忍前后噪音。
+    #[test]
+    fn family_version_loose_match_tolerates_prefixes_and_suffixes() {
+        let r = ModelRegistry::builtin();
+        assert_eq!(mapped(&r, "anthropic.claude-opus-4-8"), ("claude-opus-4.8".to_string(), 1_000_000));
+        assert_eq!(mapped(&r, "us.anthropic.claude-sonnet-4-6").0, "claude-sonnet-4.6");
+        assert_eq!(mapped(&r, "anthropic.claude-sonnet-4-5-20250929-v1:0").0, "claude-sonnet-4.5");
+        assert_eq!(mapped(&r, "claude-opus-4-8-latest").0, "claude-opus-4.8");
+        assert_eq!(mapped(&r, "claude-opus-4-8@20260101").0, "claude-opus-4.8");
+        assert_eq!(mapped(&r, "opus-4.8").0, "claude-opus-4.8");
+        assert_eq!(mapped(&r, "sonnet-4.6").0, "claude-sonnet-4.6");
+    }
+
+    /// 宽松匹配不得让 legacy claude-3-5-sonnet 被误判（旧行为是 None）
+    #[test]
+    fn loose_match_still_rejects_legacy_three_five_sonnet() {
+        let r = ModelRegistry::builtin();
+        for input in ["claude-3-5-sonnet", "claude-3-5-sonnet-20241022", "anthropic.claude-3-5-sonnet"] {
+            assert!(
+                matches!(r.resolve(input, false), Resolution::Rejected(RejectReason::Unknown)),
+                "{} 不应被宽松匹配命中", input
+            );
+        }
+    }
+
+    /// gpt-5* 必须原样透传，日期后缀不得被剥离
+    #[test]
+    fn gpt5_passthrough_preserves_date_suffix() {
+        let r = ModelRegistry::builtin();
+        assert_eq!(mapped(&r, "gpt-5.6-sol-20250929"), ("gpt-5.6-sol-20250929".to_string(), 272_000));
+        assert_eq!(mapped(&r, "gpt-5.6-sol").0, "gpt-5.6-sol");
+        assert_eq!(mapped(&r, "gpt-5.6-sol-thinking").0, "gpt-5.6-sol-thinking");
+    }
+
+    /// 精确匹配优先级必须高于宽松匹配
+    #[test]
+    fn exact_match_wins_over_loose_match() {
+        let r = ModelRegistry::builtin();
+        // claude-opus-4-6 同时能被精确命中和被宽松匹配命中，必须走精确
+        assert_eq!(mapped(&r, "claude-opus-4-6").0, "claude-opus-4.6");
+        assert_eq!(mapped(&r, "claude-opus-4-5-20251101").0, "claude-opus-4.5");
+    }
 }
+
