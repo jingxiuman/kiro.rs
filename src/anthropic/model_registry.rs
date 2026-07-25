@@ -399,7 +399,11 @@ impl ModelRegistry {
                 .iter()
                 .find(|r| r.match_kind == MatchKind::Exact && r.exposed_id == base)
             {
-                if !row.expose_thinking_variant {
+                if !row.enabled {
+                    // 禁用信号优先级高于「变体未开启」：「配了但禁用」与
+                    // 「没配」是不同的排查方向，不能被 pending 兜底逻辑掩盖。
+                    return Resolution::Rejected(RejectReason::Disabled);
+                } else if !row.expose_thinking_variant {
                     // 该行关闭了 thinking 变体 → 先记下待定拒绝，继续往下找兜底
                     pending_thinking_rejection = true;
                 } else {
@@ -415,8 +419,11 @@ impl ModelRegistry {
             .iter()
             .find(|r| r.match_kind == MatchKind::Exact && r.upstream_id == normalized)
         {
-            // 请求名带 thinking 但该行关闭了变体 → 先记下待定拒绝，继续往下找兜底
-            if lower.ends_with("-thinking") && !row.expose_thinking_variant {
+            if lower.ends_with("-thinking") && !row.enabled {
+                // 禁用信号优先级高于「变体未开启」，见第 3 步同一处理。
+                return Resolution::Rejected(RejectReason::Disabled);
+            } else if lower.ends_with("-thinking") && !row.expose_thinking_variant {
+                // 请求名带 thinking 但该行关闭了变体 → 先记下待定拒绝，继续往下找兜底
                 pending_thinking_rejection = true;
             } else {
                 return Self::hit(row, row.upstream_id.clone());
@@ -1105,5 +1112,23 @@ mod tests {
 
         // 复原，避免污染其他测试
         install_registry(ModelRegistry::builtin());
+    }
+
+    /// 一行同时 enabled=false 且 expose_thinking_variant=false 时，
+    /// xxx-thinking 请求应报 Disabled 而非 Unknown ——
+    /// 「配了但禁用」与「没配」是不同的排查方向。
+    #[test]
+    fn disabled_row_reports_disabled_even_when_thinking_variant_off() {
+        let mut r = ModelRegistry::builtin();
+        for row in r.rows_mut() {
+            if row.exposed_id == "claude-opus-4-8" {
+                row.enabled = false;
+                row.expose_thinking_variant = false;
+            }
+        }
+        assert!(matches!(
+            r.resolve("claude-opus-4-8-thinking", false),
+            Resolution::Rejected(RejectReason::Disabled)
+        ));
     }
 }
