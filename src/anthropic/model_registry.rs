@@ -5,6 +5,7 @@
 //! lastSeenAt）属于 model_sync；文件读写属于 model_registry_store。
 //! 这样模型解析逻辑完全确定性，可直接复用 converter 现有测试作为回归基线。
 
+use super::types::Model;
 use serde::{Deserialize, Serialize};
 
 /// 匹配方式。
@@ -411,6 +412,49 @@ impl ModelRegistry {
 
         Resolution::Rejected(RejectReason::Unknown)
     }
+
+    /// 构造 /v1/models 列表。
+    ///
+    /// 可见性规则：
+    /// - `listed == false`（含全部 prefix 行）→ 不出现
+    /// - `enabled == false` → 不出现（人工主动下线，不该再被发现）
+    /// - `status == Deprecated` → **仍然出现**（上游消失但不打断在用客户端；
+    ///   否则客户端模型列表突然缺项，比报错更难排查）
+    ///
+    /// `Model.max_tokens` 取 `max_output_tokens`，**不是** `context_window`。
+    pub fn exposed_models(&self) -> Vec<Model> {
+        let mut rows: Vec<&ModelRow> = self
+            .rows
+            .iter()
+            .filter(|r| r.listed && r.enabled && r.match_kind == MatchKind::Exact)
+            .collect();
+        rows.sort_by_key(|r| r.sort_order);
+
+        let mut out = Vec::with_capacity(rows.len() * 2);
+        for row in rows {
+            out.push(Model {
+                id: row.exposed_id.clone(),
+                object: "model".to_string(),
+                created: row.created,
+                owned_by: row.owned_by.clone(),
+                display_name: row.display_name.clone(),
+                model_type: row.model_type.clone(),
+                max_tokens: row.max_output_tokens,
+            });
+            if row.expose_thinking_variant {
+                out.push(Model {
+                    id: format!("{}-thinking", row.exposed_id),
+                    object: "model".to_string(),
+                    created: row.created,
+                    owned_by: row.owned_by.clone(),
+                    display_name: format!("{} (Thinking)", row.display_name),
+                    model_type: row.model_type.clone(),
+                    max_tokens: row.max_output_tokens,
+                });
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -668,5 +712,59 @@ mod tests {
             r.resolve("claude-opus-4-8-thinking", false),
             Resolution::Rejected(RejectReason::Unknown)
         ));
+    }
+
+    /// /v1/models 必须与改造前逐字段一致（零行为回归的核心断言）
+    #[test]
+    fn exposed_models_matches_pre_change_output() {
+        let models = ModelRegistry::builtin().exposed_models();
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, CURRENT_EXPOSED_IDS, "/v1/models 列表内容或顺序发生变化");
+
+        let sol = models.iter().find(|m| m.id == "gpt-5.6-sol").unwrap();
+        assert_eq!(sol.object, "model");
+        assert_eq!(sol.created, 1782000000);
+        assert_eq!(sol.owned_by, "openai");
+        assert_eq!(sol.display_name, "GPT-5.6 Sol");
+        assert_eq!(sol.model_type, "chat");
+        // max_tokens 是「输出上限」，不是输入窗口
+        assert_eq!(sol.max_tokens, 64_000);
+
+        let thinking = models.iter().find(|m| m.id == "claude-opus-4-8-thinking").unwrap();
+        assert_eq!(thinking.display_name, "Claude Opus 4.8 (Thinking)");
+    }
+
+    /// max_tokens 必须取 max_output_tokens，绝不能取 context_window
+    #[test]
+    fn max_tokens_is_output_not_input_window() {
+        let models = ModelRegistry::builtin().exposed_models();
+        let sol = models.iter().find(|m| m.id == "gpt-5.6-sol").unwrap();
+        let row = ModelRegistry::builtin()
+            .rows()
+            .iter()
+            .find(|r| r.exposed_id == "gpt-5.6-sol")
+            .unwrap()
+            .clone();
+        assert_eq!(sol.max_tokens, row.max_output_tokens);
+        assert_ne!(sol.max_tokens, row.context_window, "把输入窗口错报成输出上限了");
+    }
+
+    /// listed=false / enabled=false 不出现在列表；deprecated 仍在列表
+    #[test]
+    fn listing_visibility_rules() {
+        let mut r = ModelRegistry::builtin();
+        for row in r.rows_mut() {
+            if row.exposed_id == "claude-opus-4-8" {
+                row.enabled = false;
+            }
+            if row.exposed_id == "claude-sonnet-5" {
+                row.status = ModelStatus::Deprecated;
+            }
+        }
+        let ids: Vec<String> = r.exposed_models().into_iter().map(|m| m.id).collect();
+        assert!(!ids.contains(&"claude-opus-4-8".to_string()), "enabled=false 应从列表移除");
+        assert!(!ids.contains(&"claude-opus-4-8-thinking".to_string()));
+        assert!(ids.contains(&"claude-sonnet-5".to_string()), "deprecated 应保留在列表");
+        assert!(!ids.contains(&"gpt-5".to_string()), "prefix 行不应出现在列表");
     }
 }
