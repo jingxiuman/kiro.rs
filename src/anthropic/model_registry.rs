@@ -516,7 +516,25 @@ impl ModelRegistry {
             ));
         }
 
-        let mut rows = file.models;
+        // 文件内 upstream_id 唯一（必须在叠加前检查：叠加是「同 id 覆盖」，
+        // 会把文件内的重复行悄悄合并成一行，导致下面的唯一性检查失效）。
+        let mut seen_incoming_upstream: HashSet<&str> = HashSet::new();
+        for row in &file.models {
+            if !seen_incoming_upstream.insert(row.upstream_id.as_str()) {
+                return Err(format!("重复的 upstreamId: {}", row.upstream_id));
+            }
+        }
+
+        // 覆盖层叠加在内置默认之上（spec §4.6）：
+        // 同 upstream_id 用文件中的行替换，其余内置行保留。
+        // 这保证「文件里只写一行覆写」不会让其他模型消失。
+        let mut rows = builtin_rows();
+        for incoming in file.models {
+            match rows.iter_mut().find(|r| r.upstream_id == incoming.upstream_id) {
+                Some(existing) => *existing = incoming,
+                None => rows.push(incoming),
+            }
+        }
 
         // prefix 行强制 listed=false —— 它不是一个真实模型，
         // 若出现在 /v1/models 会多出一个不存在的条目。
@@ -752,6 +770,26 @@ mod tests {
             r.resolve("claude-opus-4-8", false),
             Resolution::Rejected(RejectReason::Disabled)
         ));
+    }
+
+    #[test]
+    fn overlay_merges_onto_builtin_not_replaces() {
+        // 覆盖层只写一行，内置默认的其余行必须保留
+        let mut row = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        row.context_window = 800_000;
+        row.pinned = vec!["contextWindow".to_string()];
+
+        let registry = ModelRegistry::from_file(file_with(vec![row], vec![])).unwrap();
+
+        // 被覆盖的行取覆盖值
+        let opus = registry.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+        assert_eq!(opus.context_window, 800_000);
+        // 未被覆盖的内置行仍在
+        assert!(registry.rows().iter().any(|r| r.upstream_id == "claude-fable-5"));
+        assert!(registry.rows().iter().any(|r| r.match_kind == MatchKind::Prefix));
     }
 
     /// passthrough 开关
