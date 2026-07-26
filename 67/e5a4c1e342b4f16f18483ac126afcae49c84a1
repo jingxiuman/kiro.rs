@@ -1,0 +1,63 @@
+README.md
+  s_ac04534933677d::t_9a018204174062 628-634
+  s_ac04534933677d::t_501e2a03babb25 124,552,635,873
+src/admin/service.rs
+  s_ac04534933677d::t_6ed7b9ad6d7926 3688
+src/anthropic/websearch.rs
+  s_ac04534933677d::t_501e2a03babb25 551-552
+src/anthropic/stream.rs
+  s_ac04534933677d::t_501e2a03babb25 10,1276,1297-1309,1318,1395,1397-1400,1474,1573-1581,2499,4735-4783,4785-4821,4823-4837
+  s_ac04534933677d::t_7f4320db89f945 4784,4822
+src/anthropic/model_registry.rs
+  s_ac04534933677d::t_91259ccef65a65 148
+  s_ac04534933677d::t_cecd5445420883 103-108
+  s_ac04534933677d::t_3a9536844c383e 182
+  s_ac04534933677d::t_363097dfaf2d3e 207
+src/anthropic/openai.rs
+  s_ac04534933677d::t_501e2a03babb25 408-413,503-514,524-526,569,628,638-657,667-787
+  s_ac04534933677d::t_167e43a6fe7b3c 788
+Cargo.toml
+  s_ac04534933677d::t_501e2a03babb25 3
+src/anthropic/handlers.rs
+  s_ac04534933677d::t_501e2a03babb25 929-932,995,997-1004,1077-1089,1098
+CHANGELOG.md
+  s_ac04534933677d::t_501e2a03babb25 7-28
+src/anthropic/model_sync.rs
+  s_ac04534933677d::t_44ab3ec323fd7e 539
+src/model/config.rs
+  s_ac04534933677d::t_7904ef019a8ecd 237,239-242
+  s_ac04534933677d::t_501e2a03babb25 33-69,238,243-245,367
+src/model/custom_models_import.rs
+  s_ac04534933677d::t_36f1741b5caac6 1-235
+admin-ui/package.json
+  s_ac04534933677d::t_501e2a03babb25 3
+src/anthropic/responses.rs
+  s_ac04534933677d::t_501e2a03babb25 861,868-877,1189-1191,1701-1743
+src/anthropic/websearch_loop.rs
+  s_ac04534933677d::t_501e2a03babb25 23,64,66-69,161,215-218,254,622,645-649,798-805,814,842,844-856,865,880,882,904,982-988,992,1056,1244,1817-1921
+  s_ac04534933677d::t_9f5a0a7a9c8096 1816
+src/main.rs
+  s_ac04534933677d::t_d66abcc069e099 290-342
+src/kiro/model/events/metering.rs
+  s_ac04534933677d::t_501e2a03babb25 4-6,8-9,22-27,50-51,59-68
+src/model/mod.rs
+  s_ac04534933677d::t_4e1b9f8405a616 5
+Cargo.lock
+  s_ac04534933677d::t_77744d6fd0e252 1050
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "67e5a4c1e342b4f16f18483ac126afcae49c84a1",
+  "prompts": {},
+  "sessions": {
+    "s_ac04534933677d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "406a6388-eb5d-470d-a7b4-e094c57e8508",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
