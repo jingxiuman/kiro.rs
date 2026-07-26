@@ -214,6 +214,80 @@ pub fn builtin_rows() -> Vec<ModelRow> {
     ]
 }
 
+/// 同步服务（`merge_synced_row`）会写入的字段，用 pinned 数组里的 camelCase 名字。
+/// **这个集合必须与 `merge_synced_row` 保持一致**：它既是「同步会覆盖哪些字段」，
+/// 也是「加载时哪些字段可以由覆盖层提供上游值」的定义。
+const SYNC_MANAGED_FIELDS: &[&str] = &[
+    "displayName",
+    "contextWindow",
+    "maxOutputTokens",
+    "exposedId",
+    "exposeThinkingVariant",
+];
+
+/// 把覆盖层的行叠加到同 id 的内置行上（spec §4.7）。
+///
+/// **一句话规则：用户 pin 的字段、以及同步不管的用户开关，取覆盖层；同步管辖的
+/// 5 个字段只在这一行确实被同步写过时取覆盖层；其余一律回落到代码里的内置定义。**
+/// 对应优先级：用户 pinned > 同步写入 > 代码内置默认。
+///
+/// 为什么不能整行替换：用户只 PATCH 了 `contextWindow`，整行就冻结成编辑那一刻的
+/// 快照，后续版本在代码里改该模型的 `displayName` 对这个部署静默失效；而
+/// `modelSyncEnabled` 默认 false，没有任何东西会来刷新覆盖层，冻结是常态。
+///
+/// 为什么也不能「只应用 pinned 字段」：`merge_synced_row` 写入的那 5 个字段在用户
+/// 没手动改过时**不在 pinned 里**，只认 pinned 会把上游同步来的值全部盖回内置默认，
+/// 自动同步等于白跑。所以需要 `sync_touched` 这个第二信号。
+///
+/// **已知限制（窗口期）**：`sync_touched` 是行级而非字段级的。同步已开启的部署里，
+/// `modelMeta[id].lastSeenAt` 一旦写下就不会被 PATCH 清除（PATCH 只动白名单字段），
+/// 于是「用户 PATCH 了内置行之后、下一轮同步之前」这段时间里，该行 4 个非 pinned
+/// 的同步管辖字段取的是**编辑那一刻的内置定义快照**，而不是新版代码的定义。只有
+/// 「编辑之后、下轮同步之前恰好发生版本升级」才会看出差异，且下一轮同步就会把它们
+/// 刷成上游值，窗口 ≤ 一个同步周期。做到字段级需要在 ModelRow 上逐字段记录「谁写的」，
+/// 那是序列化格式变更，代价远大于收益。
+fn overlay_onto_builtin(builtin: &ModelRow, overlay: ModelRow, sync_touched: bool) -> ModelRow {
+    let mut out = builtin.clone();
+
+    // 1) 用户专属字段：同步流程完全不碰它们（`merge_synced_row` 里没有），
+    //    只可能来自人工编辑，因此覆盖层始终胜出。
+    out.enabled = overlay.enabled;
+    out.sort_order = overlay.sort_order;
+    out.match_kind = overlay.match_kind;
+    // origin 决定 UI 上的来源徽章，必须反映「这一行被人动过/被同步写过」。
+    out.origin = overlay.origin;
+    out.pinned = overlay.pinned;
+
+    // 2) 同步元数据：老格式内联在行上（新格式在 syncState.modelMeta，
+    //    调用方随后还会再叠加一次并以它为准）。
+    out.missing_sync_rounds = overlay.missing_sync_rounds;
+    out.status = overlay.status;
+    out.last_seen_at = overlay.last_seen_at;
+
+    // 3) 同步管辖的 5 个字段：pinned（用户的值）或同步写过（上游的值）才取覆盖层，
+    //    否则回落到内置定义——这正是「代码改了内置定义，已有部署跟着变」的实现点。
+    let pinned = |name: &str| out.pinned.iter().any(|p| p == name);
+    for field in SYNC_MANAGED_FIELDS {
+        if !(pinned(field) || sync_touched) {
+            continue;
+        }
+        match *field {
+            "displayName" => out.display_name = overlay.display_name.clone(),
+            "contextWindow" => out.context_window = overlay.context_window,
+            "maxOutputTokens" => out.max_output_tokens = overlay.max_output_tokens,
+            "exposedId" => out.exposed_id = overlay.exposed_id.clone(),
+            "exposeThinkingVariant" => {
+                out.expose_thinking_variant = overlay.expose_thinking_variant
+            }
+            _ => {}
+        }
+    }
+
+    // 4) 其余字段（ownedBy / modelType / created / listed / matchSubstrings）
+    //    既不可 PATCH 也不被同步写入，永远以代码定义为准。
+    out
+}
+
 /// 拒绝原因。「配了但禁用」与「没配」是不同的排查方向，必须区分。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
@@ -677,13 +751,26 @@ impl ModelRegistry {
             }
         }
 
-        // 覆盖层叠加在内置默认之上（spec §4.6）：
-        // 同 upstream_id 用文件中的行替换，其余内置行保留。
-        // 这保证「文件里只写一行覆写」不会让其他模型消失。
+        // 覆盖层叠加在内置默认之上（spec §4.6 + §4.7）：
+        // 同 upstream_id 的行**逐字段**合并（见 overlay_onto_builtin），其余内置行保留。
+        // 这保证「文件里只写一行覆写」不会让其他模型消失，也不会把那一行冻结成快照。
         let mut rows = builtin;
         for incoming in file.models {
+            // 「同步是否写过这一行」的判据：同步每见到一个上游模型，都会写一条
+            // syncState.modelMeta（含 lastSeenAt），同时对覆盖层里的同 id 行跑
+            // merge_synced_row。老格式里这三个字段内联在行上，因此两处都算数。
+            let sync_touched = file
+                .sync_state
+                .model_meta
+                .get(&incoming.upstream_id)
+                .map(|m| m.last_seen_at.is_some())
+                .unwrap_or(false)
+                || incoming.last_seen_at.is_some();
+
             match rows.iter_mut().find(|r| r.upstream_id == incoming.upstream_id) {
-                Some(existing) => *existing = incoming,
+                // 此处 existing 必定来自内置集：文件内 upstreamId 唯一性已在上面校验过，
+                // 不可能匹配到本循环刚 push 进去的覆盖层行。
+                Some(existing) => *existing = overlay_onto_builtin(existing, incoming, sync_touched),
                 None => rows.push(incoming),
             }
         }
@@ -1377,8 +1464,16 @@ mod tests {
     ///
     /// 上半段模拟新版本改了 `builtin_rows()`（窗口/显示名不同），文件里只有同步
     /// 元数据 —— 解析结果必须用新定义。
-    /// 下半段是对照组：把内置行整行快照进 `models`（就是被废弃的旧做法），
-    /// 新定义立刻被冻结失效。两段合起来说明为什么元数据不能写进 models 数组。
+    ///
+    /// 下半段是对照组，**它守护的东西搬过家**：原先它断言「整行快照会冻结新定义」，
+    /// 用来论证同步不得把内置行写进 `models`。§4.7 落地后加载不再整行替换，冻结
+    /// 现象已被消除，那条断言等于把刚移除的 bug 钉成期望值。
+    /// - N1 的结构性不变量（同步不得把内置行写进 `models`）现由
+    ///   `model_sync::tests::authoritative_sync_never_snapshots_builtin_rows_into_overlay`
+    ///   单独守护 —— 保护没丢，只是搬家了。
+    /// - 本处改为守护 §4.7 的字段级语义的**两个方向**：即使覆盖层里躺着一份整行
+    ///   陈旧快照，未 pin 的字段也跟随新代码定义；而 pin 过的字段仍然留存快照里的
+    ///   值。两条一起才说明「pinned 是唯一的保护单位」。
     #[test]
     fn changed_builtin_definition_wins_over_stale_file() {
         let mut new_builtin = builtin_rows();
@@ -1401,22 +1496,31 @@ mod tests {
         assert_eq!(row.display_name, "Claude Opus 4.8（新版代码定义）");
         assert_eq!(row.missing_sync_rounds, 1, "同步元数据仍要叠加上去");
 
-        // 对照：旧做法把内置行整行写进 models（origin 仍是 builtin），
-        // 新定义被那一刻的快照冻结。
-        let stale_snapshot = builtin_rows()
+        // 对照：覆盖层里躺着一份内置行的整行陈旧快照（老格式残留 / 曾经的写法），
+        // 且其中一个字段被 pin 过。两个方向必须同时成立。
+        let mut stale_snapshot = builtin_rows()
             .into_iter()
             .find(|r| r.upstream_id == "claude-opus-4.8")
-            .unwrap(); // context_window = 1_000_000
-        let frozen = ModelRegistry::from_file_with_builtin(
+            .unwrap(); // context_window = 1_000_000（旧定义）
+        stale_snapshot.pinned = vec!["maxOutputTokens".to_string()];
+        stale_snapshot.max_output_tokens = 12_345;
+
+        let merged = ModelRegistry::from_file_with_builtin(
             new_builtin,
             file_with(vec![stale_snapshot], vec![]),
         )
         .unwrap();
-        let frozen_row =
-            frozen.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+        let merged_row =
+            merged.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+        // 方向 1（§4.7 的核心保证）：未 pin 的字段不被整行快照冻结，跟随新代码定义。
         assert_eq!(
-            frozen_row.context_window, 1_000_000,
-            "整行快照会冻结定义——这正是同步不得把内置行写进 models 的原因"
+            merged_row.context_window, 333_000,
+            "未 pin 的字段必须跟随新的内置定义，整行快照不得冻结它（§4.7）"
+        );
+        // 方向 2（pinned 的存在理由）：pin 过的字段留存覆盖层的值，新代码盖不掉。
+        assert_eq!(
+            merged_row.max_output_tokens, 12_345,
+            "pin 过的字段是用户的值，不得被新的内置定义盖掉"
         );
     }
 
@@ -1449,6 +1553,170 @@ mod tests {
         let row = r.rows().iter().find(|x| x.upstream_id == "claude-opus-4.8").unwrap();
         assert_eq!(row.missing_sync_rounds, 0, "modelMeta 应覆盖行内联的老字段");
         assert_eq!(row.status, ModelStatus::Active);
+    }
+
+    // ---- §4.7 覆盖层按 pinned 字段级应用 ----
+
+    /// 造一版「新代码」的内置集：改掉 claude-opus-4.8 的窗口与显示名。
+    fn next_version_builtin() -> Vec<ModelRow> {
+        let mut rows = builtin_rows();
+        for r in rows.iter_mut() {
+            if r.upstream_id == "claude-opus-4.8" {
+                r.context_window = 333_000;
+                r.display_name = "Claude Opus 4.8（新版代码定义）".to_string();
+                r.max_output_tokens = 99_000;
+            }
+        }
+        rows
+    }
+
+    /// 模拟 admin PATCH 的产物：内置行下沉成 manual 覆盖行，被编辑字段进 pinned。
+    fn patched_overlay_row(window: i32) -> ModelRow {
+        let mut row = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        row.origin = ModelOrigin::Manual;
+        row.context_window = window;
+        row.pinned = vec!["contextWindow".to_string()];
+        row
+    }
+
+    /// B1：用户 PATCH 了 contextWindow，之后新版代码改了 displayName / maxOutputTokens
+    /// → 用户的窗口留住，其余跟随新代码。**整行冻结的反面**。
+    #[test]
+    fn b1_pinned_field_kept_other_fields_follow_new_builtin() {
+        let file = file_with(vec![patched_overlay_row(800_000)], vec![]);
+        let registry = ModelRegistry::from_file_with_builtin(next_version_builtin(), file).unwrap();
+        let row = registry.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+
+        assert_eq!(row.context_window, 800_000, "pinned 字段必须是用户的值");
+        assert_eq!(
+            row.display_name, "Claude Opus 4.8（新版代码定义）",
+            "未 pin 且同步没写过的字段必须跟随新版代码，不能被编辑时的快照冻结"
+        );
+        assert_eq!(row.max_output_tokens, 99_000, "同上");
+        assert_eq!(row.origin, ModelOrigin::Manual, "来源徽章仍应显示人工编辑过");
+    }
+
+    /// B2：同步写过这一行、用户未 pin contextWindow → 上游的值仍然生效，
+    /// **不被内置默认盖回去**。这条是 B1 的对立面：只认 pinned 会把同步打死。
+    #[test]
+    fn b2_synced_values_survive_when_not_pinned() {
+        // 覆盖层行：用户只 pin 了 displayName，contextWindow 是同步写进来的上游值
+        let mut row = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        row.origin = ModelOrigin::Manual;
+        row.display_name = "用户改的名字".to_string();
+        row.pinned = vec!["displayName".to_string()];
+        row.context_window = 777_000; // 上游值
+        row.last_seen_at = Some("2026-07-25T04:00:00Z".to_string()); // 同步写过的凭证
+
+        let file = file_with(vec![row], vec![]);
+        let registry = ModelRegistry::from_file_with_builtin(next_version_builtin(), file).unwrap();
+        let out = registry.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+
+        assert_eq!(out.context_window, 777_000, "同步写入的值不得被内置默认盖回去");
+        assert_eq!(out.display_name, "用户改的名字", "pinned 字段仍是用户的值");
+    }
+
+    /// B2 变体：同步痕迹记在 syncState.modelMeta（新格式）而不是行上，同样算数
+    #[test]
+    fn b2_sync_touch_signal_can_come_from_model_meta() {
+        let mut row = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        row.origin = ModelOrigin::Synced;
+        row.context_window = 777_000;
+        row.last_seen_at = None;
+
+        let mut file = file_with(vec![row], vec![]);
+        file.sync_state.model_meta.insert(
+            "claude-opus-4.8".to_string(),
+            SyncMeta {
+                missing_sync_rounds: 0,
+                status: ModelStatus::Active,
+                last_seen_at: Some("2026-07-25T04:00:00Z".to_string()),
+            },
+        );
+        let registry = ModelRegistry::from_file_with_builtin(next_version_builtin(), file).unwrap();
+        let out = registry.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+        assert_eq!(out.context_window, 777_000);
+    }
+
+    /// B3：用户 pin 了 contextWindow，同步也写过这一行且给了不同的值 → 用户胜出
+    #[test]
+    fn b3_pinned_beats_synced_value() {
+        let mut row = patched_overlay_row(800_000);
+        // 同步写过这一行（上游 1_000_000），但 contextWindow 在 pinned 里，
+        // merge_synced_row 不会改它；加载时也必须继续用用户的值。
+        row.last_seen_at = Some("2026-07-25T04:00:00Z".to_string());
+        row.display_name = "上游名字".to_string();
+
+        let file = file_with(vec![row], vec![]);
+        let registry = ModelRegistry::from_file_with_builtin(next_version_builtin(), file).unwrap();
+        let out = registry.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+
+        assert_eq!(out.context_window, 800_000, "pinned > 同步");
+        assert_eq!(out.display_name, "上游名字", "未 pin 的字段用同步写入的值");
+    }
+
+    /// B4：纯 manual 行、upstreamId 不在内置集里 → 无回退基准，所有字段照常生效
+    #[test]
+    fn b4_manual_row_outside_builtin_applies_fully() {
+        let mut row = sample_row("claude-manual-x", "claude-manual-x");
+        row.origin = ModelOrigin::Manual;
+        row.display_name = "手工模型".to_string();
+        row.context_window = 123_000;
+        row.max_output_tokens = 4_096;
+        row.pinned = Vec::new();
+        row.last_seen_at = None;
+
+        let registry = ModelRegistry::from_file(file_with(vec![row], vec![])).unwrap();
+        let out = registry.rows().iter().find(|r| r.upstream_id == "claude-manual-x").unwrap();
+        assert_eq!(out.display_name, "手工模型");
+        assert_eq!(out.context_window, 123_000);
+        assert_eq!(out.max_output_tokens, 4_096);
+    }
+
+    /// B5：synced 行、upstreamId 不在内置集里 → 所有字段照常生效
+    #[test]
+    fn b5_synced_row_outside_builtin_applies_fully() {
+        let mut row = sample_row("claude-brand-new", "claude-brand-new");
+        row.origin = ModelOrigin::Synced;
+        row.display_name = "上游新模型".to_string();
+        row.context_window = 512_000;
+        row.pinned = Vec::new();
+
+        let registry = ModelRegistry::from_file(file_with(vec![row], vec![])).unwrap();
+        let out = registry.rows().iter().find(|r| r.upstream_id == "claude-brand-new").unwrap();
+        assert_eq!(out.display_name, "上游新模型");
+        assert_eq!(out.context_window, 512_000);
+    }
+
+    /// 用户专属开关（enabled / sortOrder / matchKind）不进 pinned，也不被同步写入，
+    /// 必须无条件取覆盖层——否则 UI 上「禁用某个内置模型」一刷新就失效。
+    #[test]
+    fn user_only_switches_always_win_without_pin() {
+        let mut row = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        row.origin = ModelOrigin::Manual;
+        row.enabled = false;
+        row.sort_order = 5;
+        row.pinned = Vec::new();
+        row.last_seen_at = None;
+
+        let registry = ModelRegistry::from_file_with_builtin(next_version_builtin(), file_with(vec![row], vec![])).unwrap();
+        let out = registry.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+        assert!(!out.enabled, "禁用状态必须留住");
+        assert_eq!(out.sort_order, 5);
+        // 同时验证同步管辖字段仍回落到新代码定义
+        assert_eq!(out.context_window, 333_000);
     }
 
     /// 精确匹配优先级必须高于宽松匹配

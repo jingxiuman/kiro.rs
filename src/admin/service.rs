@@ -3523,6 +3523,12 @@ fn patch_model_in_file(
             row.origin = ModelOrigin::Manual;
             // 同步元数据的权威源是 syncState.modelMeta，覆盖层不该带着它的副本，
             // 否则文件里会出现两份互相打架的 status/missingSyncRounds。
+            //
+            // 注意这里清掉行上的 last_seen_at **并不能**清掉 modelMeta 里的那份：
+            // 加载器（overlay_onto_builtin）判定「同步是否写过这一行」时两处都算数，
+            // 而 PATCH 不该去动同步元数据。因此在同步已开启的部署里，本行 4 个非
+            // pinned 的同步管辖字段会取「编辑这一刻的内置定义」，直到下一轮同步把
+            // 它们刷成上游值（窗口 ≤ 一个同步周期）。已知限制，见 overlay_onto_builtin。
             row.status = ModelStatus::Active;
             row.missing_sync_rounds = 0;
             row.last_seen_at = None;
