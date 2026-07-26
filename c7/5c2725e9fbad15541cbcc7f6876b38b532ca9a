@@ -1,0 +1,35 @@
+src/anthropic/model_sync.rs
+  s_ac04534933677d::t_017f4ff99d80fc 19
+  s_ac04534933677d::t_accac2a5de1f14 474-478
+  s_ac04534933677d::t_bd564599f5d868 519-520
+  s_ac04534933677d::t_245d0337da9e55 621-622
+  s_ac04534933677d::t_e89c6e23cbd5bb 664-665,673-845
+  s_ac04534933677d::t_790aea7937341f 598-610
+  s_ac04534933677d::t_2f20f7db3435eb 544-545
+  s_ac04534933677d::t_489dcce37474b9 501-502
+  s_ac04534933677d::t_131e219ac7ce05 105-117,123-125,129,131,136-146,170,175-230,241-244
+  s_ac04534933677d::t_c5e739d9750f56 587-588
+  s_ac04534933677d::t_d1d17e6ad29c0c 560-561
+  s_ac04534933677d::t_3a0e302958766e 644-645
+  s_ac04534933677d::t_a4a9874331708f 260-272,274-280,284-298,331-334,338-355,360,362,366-377,379,383-384
+.superpowers/sdd/task-9-fix-report.md
+  s_ac04534933677d::t_f9b085c1cb8030 1-194
+src/kiro/token_manager.rs
+  s_ac04534933677d::t_75ef7e2bc5014a 3455-3461,3464-3471
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "c75c2725e9fbad15541cbcc7f6876b38b532ca9a",
+  "prompts": {},
+  "sessions": {
+    "s_ac04534933677d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "406a6388-eb5d-470d-a7b4-e094c57e8508",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
