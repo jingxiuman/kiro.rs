@@ -239,6 +239,32 @@ src/anthropic/websearch_loop.rs:200 web-search 循环
 - 文件损坏或校验失败 → 退回内置默认 + `degraded = true`
 - `origin: "builtin"` 的行永不被同步删除，也不可经 API 删除
 
+### 4.7 覆盖层的应用粒度（决策：按 pinned 字段级）
+
+`models.json` 的覆盖层在**存储上**仍是整行，但**加载时不得整行替换**。
+
+问题：`from_file` 原先的叠加是 `*existing = incoming`，于是用户只 PATCH 一个字段（如 `contextWindow`），整行就被冻结成编辑那一刻的快照 —— 后续版本在代码里修改该模型的 `displayName` / `maxOutputTokens` 对该部署静默失效。由于 `modelSyncEnabled` 默认 `false`，**默认配置下没有任何东西会刷新覆盖层，整行冻结是常态而非边界情况**。
+
+这与 §4.6 的 N1（同步元数据污染覆盖层）是同一类错误的两条路径：N1 走同步写入，本条走手动编辑。
+
+**决策：`pinned` 即「用户要保护哪些字段」的权威记录 —— 同步服务已经尊重它，加载器也必须尊重它。**
+
+优先级：**用户 pinned > 同步写入 > 代码内置默认**。
+
+> **陷阱（实现前必读）**：规则若简单写成「只应用 pinned 字段」，会把自动同步整个打死。`merge_synced_row` 写入的 5 个字段（`displayName` / `contextWindow` / `maxOutputTokens` / `exposedId` / `exposeThinkingVariant`）在用户没手动改过时**不在 `pinned` 里**，按「只应用 pinned」会被内置默认盖回去，上游数据全部丢失。
+
+**必须满足的行为**（每条都要有可执行断言，具体规则由实现者设计）：
+
+| # | 场景 | 期望 |
+|---|---|---|
+| B1 | 用户 PATCH 内置模型的 `contextWindow`，之后新版代码改了该模型的 `displayName` | `contextWindow` 用用户的值，`displayName` **跟随新代码** |
+| B2 | 同步开启、上游返回该模型、用户未 pin `contextWindow` | 上游的 `contextWindow` **仍然生效**，不被内置默认盖回去 |
+| B3 | 用户已 pin `contextWindow`，同步开启且上游给了不同值 | **用户的值胜出**（既有行为，不得回归） |
+| B4 | 纯 `Manual` 行，`upstreamId` 不在 `builtinRows()` 里 | 所有字段照常生效（无回退基准） |
+| B5 | `Synced` 行，`upstreamId` 不在 `builtinRows()` 里 | 所有字段照常生效 |
+
+实现者选定的规则必须能用一句话说清，并写进代码注释。
+
 ## 5. 模型解析
 
 ### 5.1 返回类型
