@@ -1,0 +1,29 @@
+src/anthropic/model_registry.rs
+  s_ac04534933677d::t_f44fcd482c3d14 217-227
+admin-ui/src/types/api.ts
+  s_ac04534933677d::t_b5809867dc7420 637-643
+src/admin/service.rs
+  s_ac04534933677d::t_647fe81d50ade5 3664-3666
+  s_ac04534933677d::t_74e3261d05e9f7 3751-3752,3763-3771
+  s_ac04534933677d::t_5ac772c59b4612 3923-3963
+src/admin/types.rs
+  s_ac04534933677d::t_08ffe819636579 536-552,556
+admin-ui/src/components/model-mapping-dialog.tsx
+  s_ac04534933677d::t_9eee9646ed95f0 281
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "b84f80c301be2a73f6ae35ec7a9392af5da438ed",
+  "prompts": {},
+  "sessions": {
+    "s_ac04534933677d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "406a6388-eb5d-470d-a7b4-e094c57e8508",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
