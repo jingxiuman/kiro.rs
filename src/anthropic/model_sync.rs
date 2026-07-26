@@ -76,7 +76,7 @@ pub struct ModelSyncService {
 /// 按 provider 前缀派生对外名。
 /// claude-* 点号转连字符；其他（含 gpt-5*）**原样保留** ——
 /// handlers.rs 里刻意暴露带点号的 gpt-5.6-sol。
-fn derive_exposed_id(upstream_id: &str) -> String {
+pub(crate) fn derive_exposed_id(upstream_id: &str) -> String {
     if upstream_id.starts_with("claude-") {
         upstream_id.replace('.', "-")
     } else {
@@ -84,7 +84,7 @@ fn derive_exposed_id(upstream_id: &str) -> String {
     }
 }
 
-fn derive_thinking_variant(upstream_id: &str) -> bool {
+pub(crate) fn derive_thinking_variant(upstream_id: &str) -> bool {
     upstream_id.starts_with("claude-")
 }
 

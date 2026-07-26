@@ -488,6 +488,99 @@ pub struct SetModelSyncSettingsRequest {
     pub allow_passthrough: Option<bool>,
 }
 
+// ============ 模型注册表 ============
+
+/// `PATCH /models/{upstreamId}` 请求体。**只列可写字段。**
+///
+/// `upstreamId` / `origin` / `status` / `missingSyncRounds` / `lastSeenAt` /
+/// `created` 为只读——尤其 `origin` 必须只读，否则可把 builtin 改成 manual
+/// 绕过删除保护。
+///
+/// `extra` 捕获所有白名单之外的键：serde 默认会**静默丢弃**未知字段，
+/// 那样用户改了 `origin` 却看到 200，以为改成功了。这里收集下来在
+/// `apply_model_patch` 里明确报错。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchModelRequest {
+    pub exposed_id: Option<String>,
+    pub display_name: Option<String>,
+    pub context_window: Option<i32>,
+    pub max_output_tokens: Option<i32>,
+    pub expose_thinking_variant: Option<bool>,
+    pub enabled: Option<bool>,
+    pub sort_order: Option<i32>,
+    pub match_kind: Option<crate::anthropic::model_registry::MatchKind>,
+    /// 解除锁定的字段名，使其回归自动同步
+    #[serde(default)]
+    pub unpin: Vec<String>,
+    /// 白名单之外的键，一律拒绝。见结构体文档。
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// `POST /models` 请求体。只有 `upstreamId` 必填，其余按 §4.4 派生或取保守默认值。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateModelRequest {
+    pub upstream_id: String,
+    pub exposed_id: Option<String>,
+    pub display_name: Option<String>,
+    pub context_window: Option<i32>,
+    pub max_output_tokens: Option<i32>,
+    pub expose_thinking_variant: Option<bool>,
+    pub enabled: Option<bool>,
+    pub sort_order: Option<i32>,
+    pub match_kind: Option<crate::anthropic::model_registry::MatchKind>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRegistryResponse {
+    pub models: Vec<crate::anthropic::model_registry::ModelRow>,
+    pub aliases: Vec<crate::anthropic::model_registry::ModelAlias>,
+    pub sync_state: crate::anthropic::model_registry::SyncState,
+    pub settings: ModelSyncSettingsResponse,
+    pub degraded: bool,
+    pub degraded_reason: Option<String>,
+    /// 已记录可用模型的凭据数 / 启用凭据总数，用于 UI 提示覆盖率
+    pub credential_support_covered: usize,
+    pub credential_total: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSyncSettingsResponse {
+    pub enabled: bool,
+    pub time: String,
+    pub probe_credential_id: Option<u64>,
+    pub allow_passthrough: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncSummaryResponse {
+    pub round: String,
+    pub added: usize,
+    pub updated: usize,
+    pub deprecated: usize,
+    pub trusted: bool,
+    pub source: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertAliasRequest {
+    pub from: String,
+    pub to: String,
+}
+
+/// `DELETE /models/aliases` 请求体。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteAliasRequest {
+    pub from: String,
+}
+
 // ============ 代理池 ============
 
 /// 代理池条目

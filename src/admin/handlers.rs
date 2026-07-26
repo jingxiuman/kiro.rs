@@ -1585,3 +1585,105 @@ pub async fn delete_group(
     )))
     .into_response()
 }
+
+// ============ 模型注册表 ============
+//
+// 鉴权与错误转换沿用既有端点的写法：路由挂在 create_admin_router 的
+// authenticated 分支下（admin_auth_middleware），错误一律 `e.into_http_response()`。
+
+/// GET /api/admin/models
+/// 全表 + aliases + syncState + settings + degraded + credentialSupport 覆盖率
+pub async fn get_model_registry(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.model_registry() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_http_response(),
+    }
+}
+
+/// POST /api/admin/models/sync
+/// 手动同步，返回 diff 摘要（新增 / 更新 / 标记 deprecated / 轮次类型）
+pub async fn sync_models(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.sync_models().await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_http_response(),
+    }
+}
+
+/// POST /api/admin/models
+/// 手动新增一行（origin = manual）
+pub async fn create_model(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::CreateModelRequest>,
+) -> impl IntoResponse {
+    match state.service.create_model(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_http_response(),
+    }
+}
+
+/// PATCH /api/admin/models/{upstreamId}
+/// 编辑白名单字段；被编辑字段自动进 pinned；`unpin` 让字段回归自动同步
+pub async fn patch_model(
+    State(state): State<AdminState>,
+    Path(upstream_id): Path<String>,
+    Json(payload): Json<super::types::PatchModelRequest>,
+) -> impl IntoResponse {
+    match state.service.patch_model(&upstream_id, payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_http_response(),
+    }
+}
+
+/// DELETE /api/admin/models/{upstreamId}
+/// 仅允许 origin != builtin
+pub async fn delete_model(
+    State(state): State<AdminState>,
+    Path(upstream_id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.delete_model(&upstream_id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_http_response(),
+    }
+}
+
+/// POST /api/admin/models/aliases
+/// 新增或覆盖一条别名
+pub async fn upsert_alias(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::UpsertAliasRequest>,
+) -> impl IntoResponse {
+    match state.service.upsert_alias(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_http_response(),
+    }
+}
+
+/// DELETE /api/admin/models/aliases
+/// 删除一条别名（请求体 `{"from": "opus"}`）
+pub async fn delete_alias(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::DeleteAliasRequest>,
+) -> impl IntoResponse {
+    match state.service.delete_alias(&payload.from).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_http_response(),
+    }
+}
+
+/// PATCH /api/admin/models/settings
+/// 四个同步开关（写运行时 holder + config.json，热生效）
+pub async fn set_model_sync_settings(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::SetModelSyncSettingsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_model_sync_settings(payload).await {
+        Ok(settings) => Json(super::types::ModelSyncSettingsResponse {
+            enabled: settings.enabled,
+            time: settings.time,
+            probe_credential_id: settings.probe_credential_id,
+            allow_passthrough: settings.allow_passthrough,
+        })
+        .into_response(),
+        Err(e) => e.into_http_response(),
+    }
+}
