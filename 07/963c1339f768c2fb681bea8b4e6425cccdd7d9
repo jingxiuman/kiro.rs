@@ -1,0 +1,46 @@
+src/kiro/token_manager.rs
+  s_ac04534933677d::t_17b456b0fec714 3496-3497,3500-3505,3513-3515,3519-3536
+  s_ac04534933677d::t_ba2526d874d79b 4871-4921
+  s_ac04534933677d::t_849c732fb04c12 3537-3538
+src/anthropic/model_sync.rs
+  s_ac04534933677d::t_0975ccbe576223 475-476,482-490,496
+  s_ac04534933677d::t_3f9315791ef550 703-704
+  s_ac04534933677d::t_c5e61a5e633b03 680-691,694,696-697
+  s_ac04534933677d::t_b903ca0d8db2e3 301-306
+  s_ac04534933677d::t_ecf96f29ce4e6c 522-547
+  s_ac04534933677d::t_588cd165d8da1c 349-355,357-361,364-374,379-437
+  s_ac04534933677d::t_9136aa94106318 802-813
+  s_ac04534933677d::t_5be267815517b6 219-223,225
+  s_ac04534933677d::t_993452e35920a9 950-1164
+  s_ac04534933677d::t_c775c5b6ede54d 19-21
+src/anthropic/model_registry.rs
+  s_ac04534933677d::t_1796a384f6cbbb 652-662
+  s_ac04534933677d::t_91260a968598e3 682,690-701
+  s_ac04534933677d::t_72e52a01ca1037 309-333,345-347
+  s_ac04534933677d::t_22f9df98042ad9 702-703,1353-1452
+  s_125aceb32b263e::t_fbd5fa55f9e84d 704
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "07963c1339f768c2fb681bea8b4e6425cccdd7d9",
+  "prompts": {},
+  "sessions": {
+    "s_125aceb32b263e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f9bda-03e4-7812-95f6-cbec8ee59ff5",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    },
+    "s_ac04534933677d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "406a6388-eb5d-470d-a7b4-e094c57e8508",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
