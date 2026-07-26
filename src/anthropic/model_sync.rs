@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
-use super::model_registry::{MatchKind, ModelOrigin, ModelRegistry, ModelRow, ModelStatus};
+use super::model_registry::{
+    MatchKind, ModelOrigin, ModelRegistry, ModelRow, ModelStatus, SyncMeta,
+};
 use super::model_registry_store::{merge_synced_row, ModelRegistryStore};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -214,7 +216,13 @@ impl ModelSyncService {
                  回退为采样轮次（advisory，仅新增/更新，不判定消失），请检查探针凭据状态",
                 credential_ids
             );
+            // N4：把刚失败的探针从降级候选里剔除。它本轮已经失败过一次，重复选它
+            // 既白占一个 SAMPLE_SIZE 名额（挤掉一个真能返回数据的凭据），又多发一次
+            // 注定失败的上游请求。探针凭据本身仍在 candidate_credential_ids 里，
+            // 所以必须显式排除。
+            let failed_probe_ids = credential_ids.clone();
             let mut ids = self.fetcher.candidate_credential_ids();
+            ids.retain(|id| !failed_probe_ids.contains(id));
             ids.sort_unstable();
             ids.truncate(SAMPLE_SIZE);
             round = RoundKind::Advisory;
@@ -290,8 +298,12 @@ impl ModelSyncService {
                 //   - 消失判定只遍历覆盖层的行，内置模型永远不在遍历范围内，于是永远不会
                 //     累计 missing_sync_rounds、永远标不上 deprecated——恰恰是最该被标记的
                 //     「上游已不再返回的老内置模型」被这个基线错误放过了（I1）。
-                // 对首次被同步命中/判定消失的内置行，按需在 file.models 里补写一份覆盖，
-                // 用来承载 missing_sync_rounds / status 这两个此前只属于覆盖层的字段。
+                //
+                // N1 修复：**绝不为内置行在 file.models 里补写覆盖行。** 同步元数据
+                // （missing_sync_rounds / status / last_seen_at）一律写进
+                // file.sync_state.model_meta，与 models 数组解耦。详见 SyncMeta 的文档：
+                // from_file 的叠加是整行替换，补写=冻结快照，代码里改内置定义会对已有
+                // 部署完全失效。
                 let effective = ModelRegistry::from_file(file.clone())
                     .map_err(|e| format!("计算有效模型行集失败: {}", e))?;
 
@@ -334,55 +346,96 @@ impl ModelSyncService {
                             merge_synced_row(&mut file.models[idx], &incoming);
                             updated += 1;
                         }
+                        // 覆盖层里没有这一行，但它已存在于有效行集 → 是个内置行。
+                        // **不补写覆盖行**：内置行的字段本来就该由代码定义，同步只需要
+                        // 记一条元数据（下面统一写 model_meta）。记账上算 updated 而非
+                        // added——它本来就存在，不是新模型。
+                        None if effective.rows().iter().any(|r| &r.upstream_id == upstream_id) => {
+                            updated += 1;
+                        }
                         None => {
-                            // 覆盖层里没有这一行，但可能是内置行（还没被同步命中过）——
-                            // 按有效行集判断，不能算“新增”，也要把内置行的其余字段带过来，
-                            // 再叠加本轮同步结果，作为覆盖层的首份记录。
-                            match effective.rows().iter().find(|r| &r.upstream_id == upstream_id) {
-                                Some(builtin_row) => {
-                                    let mut row = builtin_row.clone();
-                                    merge_synced_row(&mut row, &incoming);
-                                    file.models.push(row);
-                                    updated += 1;
-                                }
-                                None => {
-                                    let mut row = incoming;
-                                    max_sort += 10;
-                                    row.sort_order = max_sort;
-                                    file.models.push(row);
-                                    added += 1;
-                                }
-                            }
+                            let mut row = incoming;
+                            max_sort += 10;
+                            row.sort_order = max_sort;
+                            file.models.push(row);
+                            added += 1;
                         }
                     }
+
+                    // 同步元数据统一落在 sync_state.model_meta：本轮见到 → 计数清零、
+                    // 刷新 last_seen_at、若此前是 deprecated 则复活为 active。
+                    file.sync_state.model_meta.insert(
+                        upstream_id.clone(),
+                        SyncMeta {
+                            missing_sync_rounds: 0,
+                            status: ModelStatus::Active,
+                            last_seen_at: Some(seen_at.clone()),
+                        },
+                    );
                 }
 
                 // 消失判定：仅权威轮次。遍历有效行集（内置 ∪ 覆盖层），而非仅覆盖层。
                 if round == RoundKind::Authoritative {
-                    for row in effective.rows() {
-                        if union.contains_key(&row.upstream_id) {
-                            continue;
-                        }
-                        let idx = match file.models.iter().position(|r| r.upstream_id == row.upstream_id) {
-                            Some(idx) => idx,
-                            None => {
-                                // 内置行首次出现消失：补写覆盖层记录以承载 missing_sync_rounds。
-                                file.models.push(row.clone());
-                                file.models.len() - 1
+                    // N2：prefix 行是 handlers 侧的家族通配符伪行（如 gpt-5），
+                    // 上游返回的 modelId 永远不可能等于它（它不代表一个真实上游模型，
+                    // 只是「gpt-5* 一律放行」的解析规则载体）。留在判定里的话，
+                    // 它必然在第 2 个权威轮次被标 Deprecated——确定性的、每次部署
+                    // 都会发生的误报。
+                    let judged: Vec<&ModelRow> = effective
+                        .rows()
+                        .iter()
+                        .filter(|r| r.match_kind != MatchKind::Prefix)
+                        .collect();
+                    let missing: Vec<&ModelRow> = judged
+                        .iter()
+                        .copied()
+                        .filter(|r| !union.contains_key(&r.upstream_id))
+                        .collect();
+
+                    // N3：单轮标记比例护栏。与「不可信轮次」（规则 1）同级，但防的是
+                    // 另一条路径：规则 1 防网络抖动导致的空/失败返回，这里防**探针本身
+                    // 不具代表性**——spec §6.2 假设探针是最高订阅等级的凭据，但代码里
+                    // 没有任何东西保证或校验这一点。把一个低等级凭据设成探针，它能
+                    // 「成功返回非空列表」从而通过规则 1，却只覆盖上游模型集的一小部分，
+                    // 于是第 2 个权威轮次就能把整表刷成 deprecated。
+                    // 处理方式：只跳过消失判定，本轮的新增/更新照常写入（数据本身没错，
+                    // 错的是「把它当成完整快照」）。日志用 error 级别——这是需要人介入
+                    // 修改探针配置的问题，不是可以忽略的抖动。
+                    let unrepresentative = missing.len() * 2 > judged.len();
+                    if unrepresentative {
+                        tracing::error!(
+                            "本轮权威同步的探针可能不具代表性：有效行集 {} 行中有 {} 行未被上游返回\
+                             （超过 50%）。已跳过本轮消失判定（新增/更新照常）。\
+                             请确认 modelSyncProbeCredentialId 指向的是最高订阅等级的凭据。",
+                            judged.len(),
+                            missing.len()
+                        );
+                    } else {
+                        for row in missing {
+                            // 元数据的起点取有效行集上的当前值（from_file 已把
+                            // model_meta 叠加上去；老格式的行内联字段也在这里体现），
+                            // 因此老文件不需要迁移就能接着累计。
+                            let meta = file
+                                .sync_state
+                                .model_meta
+                                .entry(row.upstream_id.clone())
+                                .or_insert_with(|| SyncMeta {
+                                    missing_sync_rounds: row.missing_sync_rounds,
+                                    status: row.status,
+                                    last_seen_at: row.last_seen_at.clone(),
+                                });
+                            meta.missing_sync_rounds += 1;
+                            if meta.missing_sync_rounds >= MISSING_ROUNDS_THRESHOLD
+                                && meta.status == ModelStatus::Active
+                            {
+                                meta.status = ModelStatus::Deprecated;
+                                deprecated += 1;
+                                tracing::warn!(
+                                    "模型 {} 连续 {} 轮权威同步未出现于上游，标记为 deprecated（保留可用）",
+                                    row.upstream_id,
+                                    meta.missing_sync_rounds
+                                );
                             }
-                        };
-                        let overlay = &mut file.models[idx];
-                        overlay.missing_sync_rounds += 1;
-                        if overlay.missing_sync_rounds >= MISSING_ROUNDS_THRESHOLD
-                            && overlay.status == ModelStatus::Active
-                        {
-                            overlay.status = ModelStatus::Deprecated;
-                            deprecated += 1;
-                            tracing::warn!(
-                                "模型 {} 连续 {} 轮权威同步未出现于上游，标记为 deprecated（保留可用）",
-                                overlay.upstream_id,
-                                overlay.missing_sync_rounds
-                            );
                         }
                     }
                 }
@@ -419,17 +472,28 @@ mod tests {
         /// 凭据 id → 该凭据返回的模型（或错误）
         responses: StdMutex<HashMap<u64, Result<Vec<UpstreamModel>, String>>>,
         usable: Vec<u64>,
+        /// 按调用先后记录的 fetch 凭据 id 序列（N4：断言降级采样不重复拉失败探针）
+        calls: StdMutex<Vec<u64>>,
     }
 
     impl FakeFetcher {
         fn new(responses: Vec<(u64, Result<Vec<UpstreamModel>, String>)>) -> Self {
             let usable = responses.iter().map(|(id, _)| *id).collect();
-            Self { responses: StdMutex::new(responses.into_iter().collect()), usable }
+            Self {
+                responses: StdMutex::new(responses.into_iter().collect()),
+                usable,
+                calls: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<u64> {
+            self.calls.lock().unwrap().clone()
         }
     }
 
     impl ModelListFetcher for FakeFetcher {
         fn fetch(&self, id: u64) -> BoxFuture<'_, Result<Vec<UpstreamModel>, String>> {
+            self.calls.lock().unwrap().push(id);
             let r = self
                 .responses
                 .lock()
@@ -453,6 +517,32 @@ mod tests {
             model_name: Some(id.to_uppercase()),
             max_input_tokens: window,
         }
+    }
+
+    /// 一个「有代表性」的探针会返回的模型集：全部内置的 exact 行。
+    /// prefix 伪行（gpt-5）不是真实上游模型，上游永远不会返回它。
+    ///
+    /// N3 的比例护栏要求探针返回的模型覆盖有效行集的一半以上，所以凡是想真正
+    /// 触发消失判定的测试，都必须从这个集合出发去掉待测的那一个，而不能只返回
+    /// 一两个模型——只返回一两个恰恰是护栏要拦的「探针不具代表性」。
+    fn builtin_upstream_models() -> Vec<UpstreamModel> {
+        crate::anthropic::model_registry::builtin_rows()
+            .into_iter()
+            .filter(|r| r.match_kind != MatchKind::Prefix)
+            .map(|r| UpstreamModel {
+                model_id: r.upstream_id.clone(),
+                model_name: Some(r.display_name.clone()),
+                max_input_tokens: Some(i64::from(r.context_window)),
+            })
+            .collect()
+    }
+
+    /// 全部内置 exact 模型，去掉指定的若干个（模拟「上游不再返回它们」）。
+    fn builtin_upstream_models_without(excluded: &[&str]) -> Vec<UpstreamModel> {
+        builtin_upstream_models()
+            .into_iter()
+            .filter(|m| !excluded.contains(&m.model_id.as_str()))
+            .collect()
     }
 
     fn tmp_store(name: &str) -> Arc<ModelRegistryStore> {
@@ -587,27 +677,31 @@ mod tests {
         let _registry_guard =
             crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("deprecate");
-        let full = Arc::new(FakeFetcher::new(vec![(
-            3,
-            Ok(vec![upstream("claude-a", Some(200_000)), upstream("claude-b", Some(200_000))]),
-        )]));
+        // 注意（N3 护栏导致的必要调整）：探针必须「有代表性」，否则单轮缺失比例超过
+        // 有效行集的 50%，消失判定会被整轮跳过（那是 N3 要拦的探针配置错误场景，
+        // 由 unrepresentative_probe_skips_disappearance_check 专门覆盖）。
+        // 因此这里让探针返回全部内置模型 + claude-a/claude-b，第二轮只去掉 claude-b ——
+        // 本测试真正关心的「连续 2 轮未见才标记」语义完全不变，只是把 fixture 从
+        // 「只返回 2 个模型的病态探针」换成了正常探针。
+        let with_extras = |extras: Vec<UpstreamModel>| {
+            let mut models = builtin_upstream_models();
+            models.extend(extras);
+            Arc::new(FakeFetcher::new(vec![(3, Ok(models))]))
+        };
+        let full = with_extras(vec![upstream("claude-a", Some(200_000)), upstream("claude-b", Some(200_000))]);
         ModelSyncService::new(store.clone(), full).sync_once(Some(3), now()).await.unwrap();
 
-        let shrunk = || Arc::new(FakeFetcher::new(vec![(3, Ok(vec![upstream("claude-a", Some(200_000))]))]));
+        let shrunk = || with_extras(vec![upstream("claude-a", Some(200_000))]);
 
-        // 注意（I1 修复导致的必要调整）：消失判定基线从「仅覆盖层」改为「内置 ∪ 覆盖层」
-        // 有效行集后，本测试用的探针每轮都只返回 claude-a/claude-b，14 个内置模型也会在
-        // 每个权威轮里一起被判定「未见」，从而按自己的节奏累计/跨过阈值——这正是 I1 要修的
-        // 行为（见下面 authoritative_round_deprecates_missing_builtin_model 的专门断言）。
-        // 因此这里不再断言跨内置模型的 `summary.deprecated` 总数，只断言这条测试真正关心
-        // 的 claude-b 自身的 missing_sync_rounds / status 转换（“第一轮只累计，不标记”）。
-        let _s1 = ModelSyncService::new(store.clone(), shrunk()).sync_once(Some(3), now()).await.unwrap();
+        let s1 = ModelSyncService::new(store.clone(), shrunk()).sync_once(Some(3), now()).await.unwrap();
+        assert_eq!(s1.deprecated, 0, "第一轮只累计，不标记任何模型");
         let after_s1 = store.load();
         let b1 = after_s1.registry.rows().iter().find(|r| r.upstream_id == "claude-b").unwrap();
         assert_eq!(b1.missing_sync_rounds, 1, "claude-b 第一轮只累计一次");
         assert_eq!(b1.status, ModelStatus::Active, "第一轮只累计，不标记");
 
-        let _s2 = ModelSyncService::new(store.clone(), shrunk()).sync_once(Some(3), now()).await.unwrap();
+        let s2 = ModelSyncService::new(store.clone(), shrunk()).sync_once(Some(3), now()).await.unwrap();
+        assert_eq!(s2.deprecated, 1, "第二轮达阈值，且只应标记 claude-b 一个");
 
         let out = store.load();
         let b = out.registry.rows().iter().find(|r| r.upstream_id == "claude-b").unwrap();
@@ -705,8 +799,18 @@ mod tests {
         let _registry_guard =
             crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("i1-builtin-deprecate");
-        // 每一轮上游都只返回 1 个模型（且不是任何内置 upstream_id）。
-        let fetcher = || Arc::new(FakeFetcher::new(vec![(3, Ok(vec![upstream("claude-only-one", Some(200_000))]))]));
+        // 上游返回除 claude-opus-4.8 以外的全部内置模型，外加一个真正的新模型。
+        //
+        // 注意（N3 护栏导致的必要调整）：本测试原先让探针每轮只返回 1 个模型，
+        // 现在那属于「探针不具代表性」（缺失比例 > 50%），消失判定会被整轮跳过。
+        // 换成「只少一个内置模型」后，本测试关心的两点语义丝毫未变：
+        //   1) 内置模型（只存在于 builtin_rows、不在 file.models 里）也要参与消失判定；
+        //   2) 首轮 added 不得把内置模型算成新增。
+        let fetcher = || {
+            let mut models = builtin_upstream_models_without(&["claude-opus-4.8"]);
+            models.push(upstream("claude-only-one", Some(200_000)));
+            Arc::new(FakeFetcher::new(vec![(3, Ok(models))]))
+        };
 
         let s1 = ModelSyncService::new(store.clone(), fetcher()).sync_once(Some(3), now()).await.unwrap();
         // 首轮：claude-only-one 是真正新增的一行；14 个内置模型不应被计入 added
@@ -842,5 +946,220 @@ mod tests {
 
         let out = store.load();
         assert!(out.registry.rows().iter().any(|r| r.upstream_id == "claude-via-sample"));
+    }
+
+    /// N1：权威同步轮次**不得**把内置行逐字段快照进 models 数组。
+    /// 同步元数据（missingSyncRounds / status / lastSeenAt）应落在
+    /// syncState.modelMeta 下，与覆盖层解耦。
+    #[tokio::test]
+    async fn authoritative_sync_never_snapshots_builtin_rows_into_overlay() {
+        use crate::anthropic::model_registry::{builtin_rows, ModelOrigin};
+        let _registry_guard =
+            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("n1-no-builtin-snapshot");
+
+        // 探针有代表性（返回几乎全部内置模型），但少了 claude-opus-4.8 ——
+        // 它会走消失判定，正是旧实现会为它补写快照行的那条路径。
+        let fetcher = || {
+            let mut models = builtin_upstream_models_without(&["claude-opus-4.8"]);
+            models.push(upstream("claude-brand-new", Some(200_000)));
+            Arc::new(FakeFetcher::new(vec![(3, Ok(models))]))
+        };
+
+        for _ in 0..3 {
+            ModelSyncService::new(store.clone(), fetcher()).sync_once(Some(3), now()).await.unwrap();
+        }
+
+        let out = store.load();
+
+        // 1) models 数组里不得出现 origin=builtin 的补写行
+        let snapshotted: Vec<&str> = out
+            .file
+            .models
+            .iter()
+            .filter(|r| r.origin == ModelOrigin::Builtin)
+            .map(|r| r.upstream_id.as_str())
+            .collect();
+        assert!(snapshotted.is_empty(), "内置行被快照进了 models: {:?}", snapshotted);
+
+        // 2) 更强的约束：任何内置 upstreamId 都不该出现在覆盖层里
+        for b in builtin_rows() {
+            assert!(
+                !out.file.models.iter().any(|r| r.upstream_id == b.upstream_id),
+                "内置行 {} 不该出现在 models 数组（会冻结成快照）",
+                b.upstream_id
+            );
+        }
+
+        // 3) 行数应保持在「人工覆盖 + 真正新增」的量级：这里只有 1 个真正的新模型
+        assert_eq!(
+            out.file.models.len(),
+            1,
+            "models 数组应只含真正新增的行，实际: {:?}",
+            out.file.models.iter().map(|r| &r.upstream_id).collect::<Vec<_>>()
+        );
+
+        // 4) 内置模型的同步元数据仍然被正确记录、并能从解析结果里读出来
+        let meta = out
+            .file
+            .sync_state
+            .model_meta
+            .get("claude-opus-4.8")
+            .expect("消失的内置模型必须在 modelMeta 里留下记录");
+        assert_eq!(meta.missing_sync_rounds, 3);
+        assert_eq!(meta.status, ModelStatus::Deprecated);
+
+        let opus = out.registry.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+        assert_eq!(opus.missing_sync_rounds, 3, "解析结果要把 modelMeta 叠加到内置行上");
+        assert_eq!(opus.status, ModelStatus::Deprecated);
+
+        // 5) 仍被上游返回的内置行也要有 lastSeenAt 元数据
+        let seen = out.file.sync_state.model_meta.get("claude-sonnet-5").unwrap();
+        assert_eq!(seen.missing_sync_rounds, 0);
+        assert_eq!(seen.status, ModelStatus::Active);
+        assert!(seen.last_seen_at.is_some());
+    }
+
+    /// N1 关键回归：内置行定义在代码里改了以后，已有部署的 models.json 不得把
+    /// 旧值冻结住。用同步真实写出的文件 + 一份「新版代码」的内置集来验证。
+    #[tokio::test]
+    async fn synced_file_does_not_freeze_changed_builtin_definition() {
+        use crate::anthropic::model_registry::builtin_rows;
+        let _registry_guard =
+            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("n1-definition-not-frozen");
+
+        let fetcher = || Arc::new(FakeFetcher::new(vec![(3, Ok(builtin_upstream_models()))]));
+        for _ in 0..2 {
+            ModelSyncService::new(store.clone(), fetcher()).sync_once(Some(3), now()).await.unwrap();
+        }
+        let synced_file = store.load().file;
+
+        // 模拟「下一个版本的代码把 claude-opus-4.8 的窗口和显示名改了」
+        let mut next_version_builtin = builtin_rows();
+        for r in next_version_builtin.iter_mut() {
+            if r.upstream_id == "claude-opus-4.8" {
+                r.context_window = 333_000;
+                r.display_name = "Claude Opus 4.8（新版）".to_string();
+            }
+        }
+
+        let registry = ModelRegistry::from_file_with_builtin(next_version_builtin, synced_file)
+            .expect("同步写出的文件必须能被新版内置集解析");
+        let row = registry.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+        assert_eq!(row.context_window, 333_000, "解析结果必须用新的代码定义，而不是同步时的快照");
+        assert_eq!(row.display_name, "Claude Opus 4.8（新版）");
+    }
+
+    /// N2：prefix 伪行（gpt-5）是 handlers 侧的家族通配符，上游的 modelId 永远
+    /// 不可能等于它，必须排除在消失判定之外，否则每次部署都确定性地被误标
+    /// Deprecated。
+    #[tokio::test]
+    async fn prefix_pseudo_row_is_never_deprecated() {
+        let _registry_guard =
+            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("n2-prefix-not-deprecated");
+
+        // 探针返回全部真实内置模型（不含也不可能含 "gpt-5" 这个伪行）
+        let fetcher = || Arc::new(FakeFetcher::new(vec![(3, Ok(builtin_upstream_models()))]));
+        for _ in 0..2 {
+            ModelSyncService::new(store.clone(), fetcher()).sync_once(Some(3), now()).await.unwrap();
+        }
+
+        let out = store.load();
+        let gpt5 = out.registry.rows().iter().find(|r| r.upstream_id == "gpt-5").unwrap();
+        assert_eq!(gpt5.match_kind, MatchKind::Prefix);
+        assert_ne!(gpt5.status, ModelStatus::Deprecated, "prefix 伪行不得被标记为 Deprecated");
+        assert_eq!(gpt5.missing_sync_rounds, 0, "prefix 伪行不该累计 missingSyncRounds");
+        assert!(
+            !out.file.sync_state.model_meta.contains_key("gpt-5"),
+            "prefix 伪行不该进入消失判定，也就不该产生同步元数据"
+        );
+    }
+
+    /// N3：单轮缺失比例超过有效行集的 50% → 判定探针不具代表性，跳过本轮消失判定
+    /// （其余部分正常进行），并打 error 日志。
+    #[tokio::test]
+    async fn unrepresentative_probe_skips_disappearance_check() {
+        let _registry_guard =
+            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("n3-unrepresentative-probe");
+
+        // 探针（例如订阅等级过低的凭据）只返回 1 个模型
+        let fetcher = || Arc::new(FakeFetcher::new(vec![(3, Ok(vec![upstream("claude-only-one", Some(200_000))]))]));
+
+        let s1 = ModelSyncService::new(store.clone(), fetcher()).sync_once(Some(3), now()).await.unwrap();
+        assert_eq!(s1.deprecated, 0);
+        assert_eq!(s1.added, 1, "新增仍应正常进行——只跳过消失判定，不中止整轮");
+
+        let s2 = ModelSyncService::new(store.clone(), fetcher()).sync_once(Some(3), now()).await.unwrap();
+        assert!(matches!(s2.round, RoundKind::Authoritative));
+        assert_eq!(s2.deprecated, 0, "缺失比例过半时不得标记任何模型");
+
+        let out = store.load();
+        for row in out.registry.rows() {
+            assert_eq!(
+                row.missing_sync_rounds, 0,
+                "{} 的 missingSyncRounds 应保持不变（判定被跳过）",
+                row.upstream_id
+            );
+            assert_eq!(row.status, ModelStatus::Active, "{} 不该被标记", row.upstream_id);
+        }
+        assert!(
+            out.file.sync_state.model_meta.values().all(|m| m.missing_sync_rounds == 0),
+            "跳过判定的轮次不得写出任何 missingSyncRounds 计数"
+        );
+    }
+
+    /// N3 对照组：缺失比例低于阈值时，消失判定必须照常执行。
+    #[tokio::test]
+    async fn representative_probe_still_runs_disappearance_check() {
+        let _registry_guard =
+            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("n3-representative-probe");
+
+        // 14 个内置 exact 行里只缺 1 个 → 远低于 50%
+        let fetcher =
+            || Arc::new(FakeFetcher::new(vec![(3, Ok(builtin_upstream_models_without(&["claude-opus-4.8"])))]));
+
+        let s1 = ModelSyncService::new(store.clone(), fetcher()).sync_once(Some(3), now()).await.unwrap();
+        assert_eq!(s1.deprecated, 0, "第一轮只累计");
+        let after1 = store.load();
+        let opus1 = after1.registry.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+        assert_eq!(opus1.missing_sync_rounds, 1, "低于阈值的轮次必须正常累计");
+
+        let s2 = ModelSyncService::new(store.clone(), fetcher()).sync_once(Some(3), now()).await.unwrap();
+        assert_eq!(s2.deprecated, 1, "达阈值应标记，且只标记这一个");
+        let out = store.load();
+        let opus = out.registry.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+        assert_eq!(opus.status, ModelStatus::Deprecated);
+    }
+
+    /// N4：探针失败后的降级采样不得再把刚失败的探针 id 选进来 ——
+    /// 它白占一个 SAMPLE_SIZE 名额，还多发一次注定失败的请求。
+    #[tokio::test]
+    async fn fallback_sampling_excludes_just_failed_probe() {
+        let _registry_guard =
+            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("n4-exclude-failed-probe");
+
+        let fetcher = Arc::new(FakeFetcher::new(vec![
+            (1, Err("token 刷新失败".to_string())),
+            (2, Ok(vec![upstream("claude-from-2", Some(200_000))])),
+            (4, Ok(vec![upstream("claude-from-4", Some(200_000))])),
+            (6, Ok(vec![upstream("claude-from-6", Some(200_000))])),
+        ]));
+        let summary =
+            ModelSyncService::new(store.clone(), fetcher.clone()).sync_once(Some(1), now()).await.unwrap();
+        assert!(matches!(summary.round, RoundKind::Advisory));
+
+        let calls = fetcher.calls();
+        assert_eq!(calls[0], 1, "第一次仍应尝试探针本身");
+        assert!(
+            !calls[1..].contains(&1),
+            "降级采样不得重复拉取刚失败的探针，实际调用序列: {:?}",
+            calls
+        );
+        assert_eq!(calls, vec![1, 2, 4, 6], "降级应采样探针以外的 SAMPLE_SIZE 个凭据");
     }
 }

@@ -3493,32 +3493,47 @@ impl crate::anthropic::model_sync::ModelListFetcher for MultiTokenManager {
         })
     }
 
-    /// 启用（未禁用）的凭据 id，升序。
+    /// 可用于同步的凭据 id，升序。判据与 `is_credential_usable` 完全一致
+    /// （见 `sync_credential_is_usable`）。
     fn candidate_credential_ids(&self) -> Vec<u64> {
         let entries = self.entries.lock();
-        let mut ids: Vec<u64> = entries.iter().filter(|e| !e.disabled).map(|e| e.id).collect();
+        let now = Instant::now();
+        let mut ids: Vec<u64> = entries
+            .iter()
+            .filter(|e| sync_credential_is_usable(e, now))
+            .map(|e| e.id)
+            .collect();
         ids.sort_unstable();
         ids
     }
 
-    /// I3 修复：此前只检查 `!disabled`，遗漏了 spec §6.2 要求的另外两条——
-    /// 「token 可刷新」与账号级 429 风控的 `throttled_until` 冷却窗口：
-    /// - 探针的 refreshToken 一旦失效（但尚未被自动禁用，如刚失效还没触发禁用阈值），
-    ///   `is_credential_usable` 仍会返回 true，选它当探针后 `fetch` 必然失败，
-    ///   若不在这里拦截会一直进权威分支再失败（详见 sync_once 里的探针失败回退）。
-    /// - `throttled_until` 明确注释「视为不可用」，但同步探针选择完全没看这个字段，
-    ///   冷却中的凭据仍可能被选为探针，同样必然拉取失败。
     fn is_credential_usable(&self, credential_id: u64) -> bool {
         let entries = self.entries.lock();
         let now = Instant::now();
-        entries.iter().any(|e| {
-            e.id == credential_id
-                && !e.disabled
-                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                && (e.credentials.is_api_key_credential()
-                    || validate_refresh_token(&e.credentials).is_ok())
-        })
+        entries
+            .iter()
+            .any(|e| e.id == credential_id && sync_credential_is_usable(e, now))
     }
+}
+
+/// 同步服务眼中「这条凭据现在能不能用来拉上游模型列表」的**唯一判据**。
+///
+/// N5 修复：此前 `is_credential_usable`（探针可用性）已收紧为
+/// 「未禁用 && 未冷却 && token 可刷新」，但 `candidate_credential_ids`
+/// （采样轮次的候选来源）仍只过滤 `!disabled`，两处判据不一致 ——
+/// 采样轮照样会选到冷却中、或 refreshToken 已失效的凭据，白发一次注定失败的
+/// 上游请求，还挤掉一个真能返回数据的名额。抽成同一个 helper，杜绝再次漂移。
+///
+/// 三条判据的由来（spec §6.2）：
+/// - `disabled`：人工或自动下线的凭据本就不参与轮换。
+/// - `throttled_until`：账号级 429 风控冷却窗口，字段注释即写明「视为不可用」。
+/// - refreshToken 可用性：refreshToken 失效（但尚未触发自动禁用阈值）的凭据
+///   拉取必然失败；API Key 凭据不走刷新流程，豁免这一条。
+fn sync_credential_is_usable(entry: &CredentialEntry, now: Instant) -> bool {
+    !entry.disabled
+        && !entry.throttled_until.map(|t| t > now).unwrap_or(false)
+        && (entry.credentials.is_api_key_credential()
+            || validate_refresh_token(&entry.credentials).is_ok())
 }
 
 #[cfg(test)]
@@ -4852,5 +4867,56 @@ mod tests {
 
         // 但 g2 仍可用
         assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
+    }
+
+    /// N5：`candidate_credential_ids`（采样轮次的候选来源）与 `is_credential_usable`
+    /// （探针可用性判据）必须用同一套判据，否则采样轮照样会选到冷却中、或
+    /// refreshToken 已失效的凭据，白发一次注定失败的上游请求。
+    #[test]
+    fn sync_candidate_ids_use_same_usability_predicate_as_probe() {
+        use crate::anthropic::model_sync::ModelListFetcher;
+
+        let good = |token: &str| {
+            let mut c = KiroCredentials::default();
+            c.refresh_token = Some(token.repeat(150));
+            c
+        };
+        // id=1 正常；id=2 将被置于冷却窗口；id=3 refreshToken 被截断（不可刷新）；
+        // id=4 已禁用。
+        let mut truncated = KiroCredentials::default();
+        truncated.refresh_token = Some("short".to_string());
+        let mut disabled = good("d");
+        disabled.disabled = true;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![good("a"), good("b"), truncated, disabled],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 把 2 号打进账号级 429 冷却窗口
+        {
+            let mut entries = manager.entries.lock();
+            let e = entries.iter_mut().find(|e| e.id == 2).unwrap();
+            e.throttled_until = Some(Instant::now() + std::time::Duration::from_secs(60));
+        }
+
+        assert_eq!(
+            manager.candidate_credential_ids(),
+            vec![1],
+            "冷却中(2)、refreshToken 失效(3)、已禁用(4) 的凭据都不该成为采样候选"
+        );
+        // 两处判据必须一致
+        for id in [1u64, 2, 3, 4] {
+            assert_eq!(
+                manager.candidate_credential_ids().contains(&id),
+                manager.is_credential_usable(id),
+                "凭据 {} 在两处判据下的结论不一致",
+                id
+            );
+        }
     }
 }

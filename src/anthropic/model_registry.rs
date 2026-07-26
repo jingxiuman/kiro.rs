@@ -306,6 +306,31 @@ pub fn normalize_model_name(requested: &str) -> String {
 /// 不做自动迁移：未来版本靠「只增字段」保持前向兼容。
 pub const REGISTRY_SCHEMA_VERSION: u32 = 1;
 
+/// 单个模型的**纯同步元数据**。
+///
+/// 为什么单独放一个结构、而不是写回 `models` 数组里的行：
+/// `from_file` 的叠加语义是 `*existing = incoming`（**整行替换**，不是逐字段
+/// 合并）。一旦为了承载 `missingSyncRounds` 把内置行整行写进 `models`，那一行
+/// 就冻结成写入时刻的完整快照——后续版本在代码的 `builtin_rows()` 里改
+/// `contextWindow` / `displayName`，对已有部署完全失效；`models.json` 也从
+/// 「稀疏的人工覆盖层」退化成「内置表的全量副本」。
+///
+/// 这三个字段都由同步服务单方面写入、不属于「用户覆盖」，因此挂在
+/// `syncState.modelMeta` 下，与 `models` 彻底解耦；解析时按 `upstreamId`
+/// 叠加到有效行集上（内置行也能拿到状态）。
+///
+/// **只放当前确实需要的字段**：消失判定计数、状态、最后一次被上游返回的时间。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncMeta {
+    #[serde(default)]
+    pub missing_sync_rounds: u32,
+    #[serde(default)]
+    pub status: ModelStatus,
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncState {
@@ -317,6 +342,9 @@ pub struct SyncState {
     /// 数据来源标记，如 `probe:3` 或 `sample:1,4,7`。
     #[serde(default)]
     pub source: Option<String>,
+    /// upstreamId → 同步元数据。见 `SyncMeta` 的说明。
+    #[serde(default)]
+    pub model_meta: HashMap<String, SyncMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -621,6 +649,17 @@ impl ModelRegistry {
     /// 校验顺序见 spec §4.5。唯一性校验不可省：重复 exposedId、alias 与
     /// exposedId 撞名都会让解析结果依赖遍历顺序。
     pub fn from_file(file: ModelRegistryFile) -> Result<Self, String> {
+        Self::from_file_with_builtin(builtin_rows(), file)
+    }
+
+    /// `from_file` 的可注入内置集版本。**存在的唯一理由是可测性**：
+    /// 「代码里的内置行定义变了、已有部署必须跟着变」这条回归无法用固定的
+    /// `builtin_rows()` 表达，需要注入一份「新版代码」的内置集来断言。
+    /// 生产代码只应调用 `from_file`。
+    pub fn from_file_with_builtin(
+        builtin: Vec<ModelRow>,
+        file: ModelRegistryFile,
+    ) -> Result<Self, String> {
         if file.version != REGISTRY_SCHEMA_VERSION {
             return Err(format!(
                 "不支持的 models.json schema 版本: {}（期望 {}）",
@@ -640,11 +679,26 @@ impl ModelRegistry {
         // 覆盖层叠加在内置默认之上（spec §4.6）：
         // 同 upstream_id 用文件中的行替换，其余内置行保留。
         // 这保证「文件里只写一行覆写」不会让其他模型消失。
-        let mut rows = builtin_rows();
+        let mut rows = builtin;
         for incoming in file.models {
             match rows.iter_mut().find(|r| r.upstream_id == incoming.upstream_id) {
                 Some(existing) => *existing = incoming,
                 None => rows.push(incoming),
+            }
+        }
+
+        // N1：同步元数据叠加。放在覆盖层叠加**之后**，因为 syncState.modelMeta 是
+        // 同步服务对这三个字段的唯一权威来源；覆盖层行上同名的内联字段只是本分支
+        // 开发期写出的老格式残留，有 modelMeta 记录时以 modelMeta 为准。
+        //
+        // 之所以「叠加元数据」而不是「把行复制进覆盖层再改字段」：上面的叠加是
+        // 整行替换（`*existing = incoming`），一旦内置行被写进 models 就冻结成
+        // 快照，代码里改内置定义对已有部署失效。见 `SyncMeta` 的文档。
+        for row in rows.iter_mut() {
+            if let Some(meta) = file.sync_state.model_meta.get(&row.upstream_id) {
+                row.missing_sync_rounds = meta.missing_sync_rounds;
+                row.status = meta.status;
+                row.last_seen_at = meta.last_seen_at.clone();
             }
         }
 
@@ -1294,6 +1348,106 @@ mod tests {
         let after_second = passthrough_warn_cache_len();
         assert_eq!(after_first, before + 1, "首次应记入");
         assert_eq!(after_second, after_first, "重复不应再记入");
+    }
+
+    /// N1：同步元数据挂在 syncState.modelMeta 下，解析时按 upstreamId 叠加到
+    /// 有效行集上——内置行不必被复制进 models 就能带上 status / missingSyncRounds。
+    #[test]
+    fn sync_meta_overlays_onto_builtin_rows() {
+        let mut file = file_with(vec![], vec![]);
+        file.sync_state.model_meta.insert(
+            "claude-opus-4.8".to_string(),
+            SyncMeta {
+                missing_sync_rounds: 2,
+                status: ModelStatus::Deprecated,
+                last_seen_at: Some("2026-07-25T04:00:00Z".to_string()),
+            },
+        );
+        let registry = ModelRegistry::from_file(file).unwrap();
+        let row = registry.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+        assert_eq!(row.missing_sync_rounds, 2);
+        assert_eq!(row.status, ModelStatus::Deprecated);
+        assert_eq!(row.last_seen_at.as_deref(), Some("2026-07-25T04:00:00Z"));
+        // models 数组里一行都没有，元数据却生效了——这正是解耦的目的。
+        assert_eq!(registry.rows().len(), builtin_rows().len());
+    }
+
+    /// N1 关键回归：**代码里的内置行定义变了，已有部署必须跟着变。**
+    ///
+    /// 上半段模拟新版本改了 `builtin_rows()`（窗口/显示名不同），文件里只有同步
+    /// 元数据 —— 解析结果必须用新定义。
+    /// 下半段是对照组：把内置行整行快照进 `models`（就是被废弃的旧做法），
+    /// 新定义立刻被冻结失效。两段合起来说明为什么元数据不能写进 models 数组。
+    #[test]
+    fn changed_builtin_definition_wins_over_stale_file() {
+        let mut new_builtin = builtin_rows();
+        for r in new_builtin.iter_mut() {
+            if r.upstream_id == "claude-opus-4.8" {
+                r.context_window = 333_000;
+                r.display_name = "Claude Opus 4.8（新版代码定义）".to_string();
+            }
+        }
+
+        let mut file = file_with(vec![], vec![]);
+        file.sync_state.model_meta.insert(
+            "claude-opus-4.8".to_string(),
+            SyncMeta { missing_sync_rounds: 1, status: ModelStatus::Active, last_seen_at: None },
+        );
+        let registry =
+            ModelRegistry::from_file_with_builtin(new_builtin.clone(), file).unwrap();
+        let row = registry.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+        assert_eq!(row.context_window, 333_000, "必须用新的代码定义，而不是旧文件里的值");
+        assert_eq!(row.display_name, "Claude Opus 4.8（新版代码定义）");
+        assert_eq!(row.missing_sync_rounds, 1, "同步元数据仍要叠加上去");
+
+        // 对照：旧做法把内置行整行写进 models（origin 仍是 builtin），
+        // 新定义被那一刻的快照冻结。
+        let stale_snapshot = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap(); // context_window = 1_000_000
+        let frozen = ModelRegistry::from_file_with_builtin(
+            new_builtin,
+            file_with(vec![stale_snapshot], vec![]),
+        )
+        .unwrap();
+        let frozen_row =
+            frozen.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+        assert_eq!(
+            frozen_row.context_window, 1_000_000,
+            "整行快照会冻结定义——这正是同步不得把内置行写进 models 的原因"
+        );
+    }
+
+    /// N1 老格式兼容：本分支开发期写出的 models.json 里，同步元数据是逐行内联的
+    /// （行上带 missingSyncRounds / status）。读取时不得 panic，且内联值仍生效；
+    /// 一旦 modelMeta 里有同 upstreamId 的记录，以 modelMeta 为准。
+    #[test]
+    fn legacy_inline_sync_fields_are_read_and_superseded_by_model_meta() {
+        let mut legacy = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        legacy.missing_sync_rounds = 2;
+        legacy.status = ModelStatus::Deprecated;
+        legacy.last_seen_at = Some("2026-01-01T00:00:00Z".to_string());
+
+        // 只有内联字段、没有 modelMeta → 内联值仍被读出来
+        let r = ModelRegistry::from_file(file_with(vec![legacy.clone()], vec![])).unwrap();
+        let row = r.rows().iter().find(|x| x.upstream_id == "claude-opus-4.8").unwrap();
+        assert_eq!(row.missing_sync_rounds, 2);
+        assert_eq!(row.status, ModelStatus::Deprecated);
+
+        // 两者同时存在 → modelMeta 优先（它是新格式下的唯一权威来源）
+        let mut file = file_with(vec![legacy], vec![]);
+        file.sync_state.model_meta.insert(
+            "claude-opus-4.8".to_string(),
+            SyncMeta { missing_sync_rounds: 0, status: ModelStatus::Active, last_seen_at: None },
+        );
+        let r = ModelRegistry::from_file(file).unwrap();
+        let row = r.rows().iter().find(|x| x.upstream_id == "claude-opus-4.8").unwrap();
+        assert_eq!(row.missing_sync_rounds, 0, "modelMeta 应覆盖行内联的老字段");
+        assert_eq!(row.status, ModelStatus::Active);
     }
 
     /// 精确匹配优先级必须高于宽松匹配
