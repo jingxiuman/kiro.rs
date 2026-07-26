@@ -1,0 +1,32 @@
+admin-ui/src/components/available-models-dialog.tsx
+  s_ac04534933677d::t_316e23310a7770 1-2,10,12-14,30-31,79,81-88,96-165
+  s_ac04534933677d::t_9ab371599c2104 166-167
+admin-ui/src/hooks/use-model-registry.ts
+  s_ac04534933677d::t_1f2a65d30ce3b8 1-103
+admin-ui/src/api/models.ts
+  s_ac04534933677d::t_49b83167f63397 1-100
+admin-ui/src/types/api.ts
+  s_ac04534933677d::t_8be89e15d5f8f1 579-729
+admin-ui/src/components/model-mapping-dialog.tsx
+  s_ac04534933677d::t_e456a7a18a035f 1-32,34-204,206-550,552-839
+  s_ac04534933677d::t_6178241020a61d 33,205,551
+admin-ui/src/components/topbar-tools.tsx
+  s_ac04534933677d::t_e84ef551bce4b6 4,27,48,116,132,239,256,296-298,341-350
+  s_ac04534933677d::t_8792ef9ae1b70e 351-354
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "e217e24b10b09048e2c295ceb2c8c68fe9d1b3eb",
+  "prompts": {},
+  "sessions": {
+    "s_ac04534933677d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "406a6388-eb5d-470d-a7b4-e094c57e8508",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
