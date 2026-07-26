@@ -1030,6 +1030,12 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 凭据可用模型集缓存：凭据 id 字符串 → upstream_id 列表。
+    /// 来自 `ModelRegistryStore` 的 `credential_support` 字段（models.json）。
+    /// 注意：本字段目前无人填充/更新 —— 启动时的初始加载与同步后的刷新由
+    /// T12（启动接线）负责，此处只提供读取（`credential_matches_request`）与
+    /// 写入入口（`set_credential_support`）。
+    credential_support: parking_lot::RwLock<std::collections::HashMap<String, Vec<String>>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1062,10 +1068,34 @@ fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
     }
 }
 
+/// 该凭据是否已知支持目标上游模型。
+///
+/// **无记录时放行**（保守，不误杀）——采样模式下大多数凭据没有 `credential_support`
+/// 记录，若无记录就拒绝，会把绝大多数凭据全部踢出轮换。
+/// 残留风险：未记录的凭据仍可能被选中并遇到上游 400，而 provider 对非 429/5xx 的
+/// 4xx 直接返回、不换凭据重试（provider.rs `is_client_error` 分支），客户端会直接
+/// 吃到这个错误。该风险由采样/回填机制在别处缓解，不属于本函数职责。
+///
+/// `support` 的键是凭据 id 的字符串形式（JSON 对象键的限制），值是 upstream_id
+/// 列表（点号形式，如 `claude-opus-4.8`）。传入的 `upstream_id` 必须是已经过
+/// 模型注册表映射后的上游 id，不是客户端请求中的原始模型名。
+pub fn credential_supports_model(
+    credential_id: u64,
+    upstream_id: &str,
+    support: &std::collections::HashMap<String, Vec<String>>,
+) -> bool {
+    match support.get(&credential_id.to_string()) {
+        Some(models) => models.iter().any(|m| m == upstream_id),
+        None => true,
+    }
+}
+
 fn credential_matches_request(
     credentials: &KiroCredentials,
+    credential_id: u64,
     model: Option<&str>,
     group: Option<&str>,
+    credential_support: &std::collections::HashMap<String, Vec<String>>,
 ) -> bool {
     let is_opus = model
         .map(|m| m.to_ascii_lowercase().contains("opus"))
@@ -1073,6 +1103,13 @@ fn credential_matches_request(
 
     if is_opus && !credentials.supports_opus() {
         return false;
+    }
+
+    // 按上游宣告的 credential_support 过滤（无记录则放行，见 credential_supports_model 注释）
+    if let Some(m) = model {
+        if !credential_supports_model(credential_id, m, credential_support) {
+            return false;
+        }
     }
 
     group_matches(&credentials.groups, group)
@@ -1197,6 +1234,7 @@ impl MultiTokenManager {
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            credential_support: parking_lot::RwLock::new(std::collections::HashMap::new()),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1257,6 +1295,14 @@ impl MultiTokenManager {
     }
 
     /// 获取可用凭据数量
+    /// 更新凭据可用模型集缓存（`credential_support`）。
+    ///
+    /// 调用时机（T12 负责接线）：启动时由 `ModelRegistryStore::load()` 的
+    /// `file.credential_support` 做初始填充；模型同步完成后用最新数据整体替换。
+    pub fn set_credential_support(&self, map: std::collections::HashMap<String, Vec<String>>) {
+        *self.credential_support.write() = map;
+    }
+
     pub fn available_count(&self) -> usize {
         let now = Instant::now();
         self.entries
@@ -1276,6 +1322,7 @@ impl MultiTokenManager {
     fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
+        let credential_support = self.credential_support.read();
 
         // 过滤可用凭据
         let available: Vec<_> = entries
@@ -1289,7 +1336,7 @@ impl MultiTokenManager {
                     return false;
                 }
                 // 模型/分组隔离：请求模型必须由该账号支持，且账号必须匹配请求分组
-                if !credential_matches_request(&e.credentials, model, group) {
+                if !credential_matches_request(&e.credentials, e.id, model, group, &credential_support) {
                     return false;
                 }
                 true
@@ -1356,13 +1403,14 @@ impl MultiTokenManager {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     let now = Instant::now();
+                    let credential_support = self.credential_support.read();
                     entries
                         .iter()
                         .find(|e| {
                             e.id == current_id
                                 && !e.disabled
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && credential_matches_request(&e.credentials, model, group)
+                                && credential_matches_request(&e.credentials, e.id, model, group, &credential_support)
                         })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
@@ -2304,12 +2352,13 @@ impl MultiTokenManager {
             }
 
             let throttled_now = Instant::now();
+            let credential_support = self.credential_support.read();
             entries
                 .iter()
                 .filter(|e| {
                     !e.disabled
                         && !e.throttled_until.map(|t| t > throttled_now).unwrap_or(false)
-                        && credential_matches_request(&e.credentials, model, group)
+                        && credential_matches_request(&e.credentials, e.id, model, group, &credential_support)
                 })
                 .count()
         }
@@ -4599,6 +4648,36 @@ mod tests {
         assert!(group_matches(&["g1".to_string(), "g2".to_string()], Some("g1")));
         assert!(!group_matches(&["g2".to_string()], Some("g1")));
         assert!(!group_matches(&[], Some("g1")));
+    }
+
+    #[test]
+    fn credential_support_filter_rules() {
+        use std::collections::HashMap;
+        let mut support: HashMap<String, Vec<String>> = HashMap::new();
+        support.insert("3".to_string(), vec!["claude-opus-4.8".to_string()]);
+
+        // 有记录且包含 → 放行
+        assert!(credential_supports_model(3, "claude-opus-4.8", &support));
+        // 有记录但不含 → 拒绝
+        assert!(!credential_supports_model(3, "claude-opus-5", &support));
+        // 无记录 → 放行（保守，不误杀）
+        assert!(credential_supports_model(9, "claude-opus-5", &support));
+    }
+
+    #[test]
+    fn credential_matches_request_opus_gate_and_support_gate_are_and() {
+        use std::collections::HashMap;
+        // 该凭据不支持 opus（FREE 订阅）
+        let mut creds = grouped_cred("a", &[]);
+        creds.subscription_title = Some("FREE".to_string());
+        assert!(!creds.supports_opus());
+
+        // credential_support 里却记录了该凭据"支持" claude-opus-5
+        // —— 两个门是 AND 关系：即便 support 记录放行，opus 订阅门仍应拒绝。
+        let mut support: HashMap<String, Vec<String>> = HashMap::new();
+        support.insert("1".to_string(), vec!["claude-opus-5".to_string()]);
+
+        assert!(!credential_matches_request(&creds, 1, Some("claude-opus-5"), None, &support));
     }
 
     #[test]
