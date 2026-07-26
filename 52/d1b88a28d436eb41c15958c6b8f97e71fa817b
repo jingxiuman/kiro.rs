@@ -1,0 +1,56 @@
+src/anthropic/converter.rs
+  s_ac04534933677d::t_fa5a9711616563 242-260,266
+  s_ac04534933677d::t_50ef63096e775b 3482-3564
+src/model/custom_models_import.rs
+  s_ac04534933677d::t_06aaf153bd354e 247-261
+  s_ac04534933677d::t_bc155125547ec2 38-49
+docs/superpowers/specs/2026-07-25-model-registry-design.md
+  s_ac04534933677d::t_3eead8a93df56f 46
+  s_ac04534933677d::t_09ce10ee5f3431 201
+src/anthropic/model_registry.rs
+  s_ac04534933677d::t_497a191dce0806 612-615
+  s_ac04534933677d::t_0c6509a52ce119 104-109
+  s_ac04534933677d::t_8fb2f6dcb44e02 318-320
+src/admin/types.rs
+  s_ac04534933677d::t_3e510e7fc64b6f 526-527
+  s_ac04534933677d::t_b4af7ce21059dc 519-525,528-529
+src/admin/service.rs
+  s_ac04534933677d::t_3cc8687ce3648f 3452-3453
+  s_ac04534933677d::t_77baedc20e0958 3527-3531
+  s_ac04534933677d::t_8ee422109bbe6e 3532,4256-4350
+  s_eacfb727b01475::t_da5d1c3ce0f7f6 3514-3517
+admin-ui/src/components/model-mapping-dialog.tsx
+  s_ac04534933677d::t_9877995b87bcc6 601-660
+  s_ac04534933677d::t_05181f2c4ecd05 385
+admin-ui/src/types/api.ts
+  s_ac04534933677d::t_88c0bc9bd52355 637,729-736
+  s_ac04534933677d::t_138e8fdbf6097e 638-642
+src/main.rs
+  s_ac04534933677d::t_0373b71c69c15b 277
+  s_ac04534933677d::t_b4cad70d546e7c 270-271
+  s_ac04534933677d::t_56968a8fbf05a9 299-309
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "52d1b88a28d436eb41c15958c6b8f97e71fa817b",
+  "prompts": {},
+  "sessions": {
+    "s_ac04534933677d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "406a6388-eb5d-470d-a7b4-e094c57e8508",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    },
+    "s_eacfb727b01475": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4dda43be5a6fbcfb",
+        "model": "unknown"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
