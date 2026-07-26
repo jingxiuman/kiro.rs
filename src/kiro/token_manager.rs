@@ -3452,9 +3452,23 @@ impl crate::anthropic::model_sync::ModelListFetcher for MultiTokenManager {
         ids
     }
 
+    /// I3 修复：此前只检查 `!disabled`，遗漏了 spec §6.2 要求的另外两条——
+    /// 「token 可刷新」与账号级 429 风控的 `throttled_until` 冷却窗口：
+    /// - 探针的 refreshToken 一旦失效（但尚未被自动禁用，如刚失效还没触发禁用阈值），
+    ///   `is_credential_usable` 仍会返回 true，选它当探针后 `fetch` 必然失败，
+    ///   若不在这里拦截会一直进权威分支再失败（详见 sync_once 里的探针失败回退）。
+    /// - `throttled_until` 明确注释「视为不可用」，但同步探针选择完全没看这个字段，
+    ///   冷却中的凭据仍可能被选为探针，同样必然拉取失败。
     fn is_credential_usable(&self, credential_id: u64) -> bool {
         let entries = self.entries.lock();
-        entries.iter().any(|e| e.id == credential_id && !e.disabled)
+        let now = Instant::now();
+        entries.iter().any(|e| {
+            e.id == credential_id
+                && !e.disabled
+                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                && (e.credentials.is_api_key_credential()
+                    || validate_refresh_token(&e.credentials).is_ok())
+        })
     }
 }
 
