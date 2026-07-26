@@ -3451,10 +3451,10 @@ mod tests {
     /// 转换结果必须携带窗口，供响应处理阶段使用（避免热重载导致映射/计量不一致）
     #[test]
     fn conversion_result_carries_context_window() {
-        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
+        // 这里**不需要** MODEL_GLOBALS_TEST_LOCK：本测试只读注册表、从不装表。
+        // 测试期 install_registry 写的是线程本地覆盖，进程级全局在整个测试进程里
+        // 恒为内置默认，所以并行的写者不可能让这里读到中间态。
+        // （改造前它确实需要这把锁——那时写者直接改进程级全局，是原始随机失败的来源之一。）
         let result = convert_request(&minimal_request("claude-opus-4-8")).unwrap();
         assert_eq!(result.context_window, 1_000_000);
 
