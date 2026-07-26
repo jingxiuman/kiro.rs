@@ -905,14 +905,67 @@ static REGISTRY: LazyLock<RwLock<Arc<ModelRegistry>>> =
 /// 未收录模型是否放行透传。默认 false（保留「模型名写错」的快速失败信号）。
 static ALLOW_PASSTHROUGH: LazyLock<RwLock<bool>> = LazyLock::new(|| RwLock::new(false));
 
+// 测试期的**线程本地**注册表覆盖。生产构建里这个 thread_local 根本不存在。
+//
+// 为什么需要它：测试之间想同时持有**不同**的注册表，而进程级全局只有一份。
+// 早先的做法是让所有写全局表的测试串行（`REGISTRY_TEST_LOCK`），但那只约束了
+// 写者 —— converter.rs 里有 80 条测试、88 处**不取锁**地读全局表，写者装临时表
+// 的那个窗口里，并行的读者会读到别人的表，表现为「随机某条 map_model 断言挂掉，
+// 每次挂的还不是同一条」。
+//
+// 线程本地覆盖从根上消掉了这个共享：`install_registry` 在测试里只写调用线程的
+// 覆盖，`current_registry` 优先读本线程的覆盖 —— 没装过表的测试永远读到进程全局
+// （测试期它恒为内置默认），不受任何并行测试影响，且读者一行都不用改。
+#[cfg(test)]
+thread_local! {
+    static REGISTRY_OVERRIDE: std::cell::RefCell<Option<Arc<ModelRegistry>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// 取当前注册表快照。读侧只做 Arc::clone，无锁竞争。
 pub fn current_registry() -> Arc<ModelRegistry> {
+    // 测试期先查本线程的覆盖；生产构建里这段代码不存在，无任何额外开销。
+    #[cfg(test)]
+    if let Some(overridden) = REGISTRY_OVERRIDE.with(|c| c.borrow().clone()) {
+        return overridden;
+    }
     REGISTRY.read().clone()
 }
 
 /// 热替换注册表。由启动流程与同步任务在落盘成功后调用。
+///
+/// **生产语义**：整体替换进程级全局 holder，读者下次 `current_registry()` 拿到新
+/// 快照。**测试语义**：只替换调用线程的覆盖，进程级全局在整个测试进程里始终是内置
+/// 默认 —— 这样两条并行测试可以各自持有完全不同的表。
 pub fn install_registry(registry: ModelRegistry) {
-    *REGISTRY.write() = Arc::new(registry);
+    #[cfg(test)]
+    {
+        // 测试期护栏：装表必须在持有 `REGISTRY_TEST_LOCK` 守卫的线程上进行。
+        //
+        // 在线程本地方案下，这条断言守护的是一个新问题，而不是原来的「并行覆盖」：
+        // `install_registry` 也被生产代码路径调用（`model_sync::sync_once`、
+        // `admin::service` 的落盘后重载）。如果哪天有测试从**另一条线程**驱动这些
+        // 路径（`#[tokio::test(flavor = "multi_thread")]`、`tokio::spawn` 到工作
+        // 线程、`std::thread::spawn`），覆盖会落在那条线程上：测试自己看不见它
+        // （断言会以「改了却没生效」的形式莫名其妙地失败），而 tokio 工作线程是
+        // **池化复用**的，覆盖会留在池里泄漏给后续测试。守卫只可能在测试线程上创建，
+        // 所以「本线程持有守卫」恰好等价于「覆盖落在了正确的、用完即销毁的线程上」。
+        //
+        // 生产构建里 `cfg(test)` 不成立，本断言完全不存在，无任何运行时开销。
+        assert!(
+            test_lock::held_by_current_thread(),
+            "install_registry() 必须在持有 REGISTRY_TEST_LOCK 的情况下调用。\
+             测试期装表写的是**线程本地覆盖**，不持守卫说明要么忘了取，要么这次调用\
+             发生在测试线程之外（多线程运行时的工作线程），后者会让覆盖对测试不可见\
+             并泄漏给复用该线程的其他测试。修法：在测试开头加一行\n\
+             let _guard = crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());"
+        );
+        REGISTRY_OVERRIDE.with(|c| *c.borrow_mut() = Some(Arc::new(registry)));
+    }
+    #[cfg(not(test))]
+    {
+        *REGISTRY.write() = Arc::new(registry);
+    }
 }
 
 pub fn set_allow_passthrough(allow: bool) {
@@ -923,12 +976,93 @@ pub fn allow_passthrough() -> bool {
     *ALLOW_PASSTHROUGH.read()
 }
 
-/// 测试专用串行锁：所有会调用 `install_registry()` 的测试必须先取此锁，
-/// 否则并行测试互相覆盖全局状态导致随机失败。用
-/// `unwrap_or_else(|e| e.into_inner())` 取锁，避免一个 panic 的测试
-/// 毒化锁、连累后续测试全部失败。
+/// 测试专用守卫。所有会调用 `install_registry()` 的测试必须先取它。
+///
+/// 名字里的 "LOCK" 是历史称谓（改名要动 30 处既有测试调用点与一条
+/// `#[should_panic(expected = ...)]`，不值得）。**注册表的隔离已经不靠它了** ——
+/// 靠的是 `REGISTRY_OVERRIDE` 这个线程本地覆盖。它现在只剩两件仍然说得清的职责：
+///
+/// 1. **给覆盖划定作用域**：`Drop` 时清掉本线程的覆盖。libtest 为每条测试单开线程
+///    （已实测：rustc 1.96.1 下 `--test-threads=1/4/默认` 三种模式、300 条测试，
+///    线程 id 无一复用），所以覆盖本来也会随线程销毁；显式清理是不依赖 libtest
+///    实现细节的那一道保险，也让「同一条测试里先装表、后段再看内置默认」成为可能。
+/// 2. **串行化另一份进程级全局** `PASSTHROUGH_WARN_CACHE`：
+///    `passthrough_warn_dedup_is_bounded` / `passthrough_warn_dedups_same_model`
+///    这两条测试对它做「读—改—验」，彼此必须互斥，而它没有（也不需要）线程本地化。
+///
+/// 取锁姿势与普通 `Mutex` 完全一致（见 `test_lock::RegistryTestLock::lock`），
+/// 用 `unwrap_or_else(|e| e.into_inner())` 取，避免一个 panic 的测试毒化锁、
+/// 连累后续测试全部失败。
 #[cfg(test)]
-pub(crate) static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static REGISTRY_TEST_LOCK: test_lock::RegistryTestLock = test_lock::RegistryTestLock::new();
+
+/// 测试期守卫的实现。见 `REGISTRY_TEST_LOCK` 的文档说明它还守护什么。
+///
+/// 「本线程持有守卫」这个标记用 thread_local 而非全局标志：全局标志只能回答
+/// 「有没有人持锁」，回答不了「**我**有没有持锁」，而后者才是 `install_registry`
+/// 的断言要问的（它要确认覆盖会落在一条持有守卫、用完即销毁的测试线程上）。
+#[cfg(test)]
+pub(crate) mod test_lock {
+    use std::cell::Cell;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    thread_local! {
+        /// 当前线程持有的 `REGISTRY_TEST_LOCK` 守卫数量（正常只会是 0 或 1）。
+        static HELD: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn held_by_current_thread() -> bool {
+        HELD.with(|c| c.get() > 0)
+    }
+
+    pub(crate) struct RegistryTestLock(Mutex<()>);
+
+    impl RegistryTestLock {
+        pub(crate) const fn new() -> Self {
+            Self(Mutex::new(()))
+        }
+
+        /// 与 `std::sync::Mutex::lock` 同形（返回 `Result<_, PoisonError<_>>`），
+        /// 因此调用方沿用 `.lock().unwrap_or_else(|e| e.into_inner())` 即可。
+        pub(crate) fn lock(
+            &self,
+        ) -> Result<RegistryTestGuard<'_>, PoisonError<RegistryTestGuard<'_>>> {
+            match self.0.lock() {
+                Ok(g) => Ok(RegistryTestGuard::new(g)),
+                // 毒化时也要把守卫交出去：一条 panic 的测试不该连累后续全部失败。
+                Err(e) => Err(PoisonError::new(RegistryTestGuard::new(e.into_inner()))),
+            }
+        }
+    }
+
+    pub(crate) struct RegistryTestGuard<'a> {
+        // 仅为持有互斥量的所有权而存在，字段本身不被读取。
+        _inner: MutexGuard<'a, ()>,
+    }
+
+    impl<'a> RegistryTestGuard<'a> {
+        fn new(inner: MutexGuard<'a, ()>) -> Self {
+            HELD.with(|c| c.set(c.get() + 1));
+            Self { _inner: inner }
+        }
+    }
+
+    impl Drop for RegistryTestGuard<'_> {
+        fn drop(&mut self) {
+            // 清掉本线程的注册表覆盖：作用域结束后 `current_registry()` 重新落回
+            // 进程全局（测试期恒为内置默认）。
+            //
+            // 注意这里**不能**写成 `install_registry(builtin())`：那样只是把覆盖换成
+            // 「一份恰好等于内置默认的覆盖」，覆盖本身还在，读者读到的仍是本线程的私货，
+            // 一旦将来内置默认与全局不同就会静默错。清空才是「回到默认状态」。
+            //
+            // 嵌套持有时（HELD > 1）也直接清空：本项目不存在嵌套取守卫的用法，
+            // 与其维护一个覆盖栈，不如让语义保持「守卫作用域结束 = 无覆盖」。
+            super::REGISTRY_OVERRIDE.with(|c| *c.borrow_mut() = None);
+            HELD.with(|c| c.set(c.get() - 1));
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1825,6 +1959,143 @@ mod tests {
         for f in SYNC_MANAGED_FIELDS {
             assert!(seen.insert(*f), "SYNC_MANAGED_FIELDS 里有重复项: {}", f);
         }
+    }
+
+    // ---- 全局表测试纪律的「机制」本身（这两条测试证明护栏真的会触发）----
+
+    /// 护栏一：不取 `REGISTRY_TEST_LOCK` 就写全局表，必须**当场**炸在违规的那一行，
+    /// 而不是把污染留给随机的其他测试。
+    ///
+    /// 断言在写入之前执行，所以这条测试自己不会改动全局表，可以安全地不取锁。
+    #[test]
+    #[should_panic(expected = "必须在持有 REGISTRY_TEST_LOCK")]
+    fn install_registry_without_lock_fails_loudly() {
+        install_registry(ModelRegistry::builtin());
+    }
+
+    /// 护栏二：守卫释放前会把全局表复原成内置默认，"用完复原"不再依赖每条测试
+    /// 自觉在末尾补一行。
+    ///
+    /// 断言方式：装一行**只有本测试会用**的合成模型，释放守卫后重新取锁再看。
+    /// 重新取锁是必要的——不取锁读全局表本身就在跟别的测试竞争。
+    /// 若哪天有人把 `Drop` 里的复原删掉：要么这行合成模型还在（失败），
+    /// 要么中途插进来的其他测试留下了它自己的表（与 builtin 不等，同样失败）。
+    #[test]
+    fn registry_test_guard_restores_builtin_on_drop() {
+        const MARKER: &str = "t14-followup-drop-restore-marker";
+
+        {
+            let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut r = ModelRegistry::builtin();
+            r.rows_mut().push({
+                let mut row = builtin_rows()
+                    .into_iter()
+                    .find(|x| x.upstream_id == "claude-opus-4.8")
+                    .unwrap();
+                row.upstream_id = MARKER.to_string();
+                row.exposed_id = MARKER.to_string();
+                row.display_name = MARKER.to_string();
+                row.sort_order = 9_901;
+                row.origin = ModelOrigin::Synced;
+                row
+            });
+            install_registry(r);
+            assert!(
+                current_registry().rows().iter().any(|x| x.upstream_id == MARKER),
+                "前置条件：合成行确实装进了全局表"
+            );
+        }
+
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !current_registry().rows().iter().any(|x| x.upstream_id == MARKER),
+            "守卫释放后合成行必须消失（Drop 里的自动复原没生效）"
+        );
+        assert_eq!(
+            serde_json::to_value(current_registry().rows()).unwrap(),
+            serde_json::to_value(builtin_rows()).unwrap(),
+            "守卫释放后全局表必须逐字段回到内置默认"
+        );
+    }
+
+    /// 护栏三：装表只对**本线程**可见。
+    ///
+    /// 这条直接钉住线程本地方案要解决的那个问题：converter.rs 里 78 条测试不取任何
+    /// 守卫就读全局表，它们与写表的测试真并行。断言方式是在本线程装一张带合成行的表，
+    /// 同时开一条**不装表、不取守卫**的线程去读 —— 它必须读到内置默认，而不是我的表。
+    /// 用另开线程而非另一条测试来断言，是因为「两条测试真的同时在跑」不可控，而线程
+    /// 内的读取是确定性的，却复现了完全相同的共享关系。
+    #[test]
+    fn registry_override_is_visible_only_to_installing_thread() {
+        const MARKER: &str = "t14-followup-thread-local-marker";
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut r = ModelRegistry::builtin();
+        r.rows_mut().push({
+            let mut row = builtin_rows()
+                .into_iter()
+                .find(|x| x.upstream_id == "claude-opus-4.8")
+                .unwrap();
+            row.upstream_id = MARKER.to_string();
+            row.exposed_id = MARKER.to_string();
+            row.display_name = MARKER.to_string();
+            row.context_window = 12_345;
+            row.sort_order = 9_902;
+            row.origin = ModelOrigin::Synced;
+            row
+        });
+        install_registry(r);
+
+        // B2：装表的线程看得见自己的表。
+        assert!(
+            current_registry().rows().iter().any(|x| x.upstream_id == MARKER),
+            "装表线程必须看得见自己装的表"
+        );
+
+        // B3：另一条线程（模拟没装表的并行测试）此刻读到的必须是内置默认。
+        let other = std::thread::spawn(|| {
+            let seen = current_registry();
+            (
+                seen.rows().iter().any(|x| x.upstream_id == MARKER),
+                serde_json::to_value(seen.rows()).unwrap(),
+            )
+        })
+        .join()
+        .expect("读线程不应 panic");
+
+        assert!(!other.0, "没装表的线程不得看见别人装的合成行");
+        assert_eq!(
+            other.1,
+            serde_json::to_value(builtin_rows()).unwrap(),
+            "没装表的线程必须逐字段读到内置默认"
+        );
+
+        // 装表线程在对方读完之后仍然持有自己的表——隔离是双向的。
+        assert!(
+            current_registry().rows().iter().any(|x| x.upstream_id == MARKER),
+            "本线程的覆盖不应被别的线程的读取影响"
+        );
+    }
+
+    /// 护栏四：测试期 `install_registry` **不得**写进程级全局。
+    ///
+    /// 这是护栏三的另一半，也是「读者一行不用改」的前提：只要全局在整个测试进程里
+    /// 恒为内置默认，任何不装表的测试无论何时读都是干净的。若哪天有人把
+    /// `install_registry` 的 `cfg(test)` 分支删掉、退回直接写全局，这条会立刻失败。
+    #[test]
+    fn install_registry_never_touches_process_global_in_tests() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut r = ModelRegistry::builtin();
+        r.rows_mut().clear();
+        install_registry(r);
+
+        assert!(current_registry().rows().is_empty(), "前置条件：本线程覆盖已生效");
+        assert_eq!(
+            serde_json::to_value(REGISTRY.read().rows()).unwrap(),
+            serde_json::to_value(builtin_rows()).unwrap(),
+            "测试期进程级全局必须保持内置默认不被写入"
+        );
     }
 
     /// 精确匹配优先级必须高于宽松匹配

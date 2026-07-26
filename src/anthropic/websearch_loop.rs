@@ -252,6 +252,33 @@ async fn decode_round(
     }
 }
 
+/// Conversion failure -> HTTP response for the web-search route (English wording).
+///
+/// Extracted for one reason only: testability. The `match` used to be inlined inside
+/// `run_round`, which needs a live upstream provider to reach, so "what status code and
+/// body does an unknown model actually produce here" was never covered by a test.
+///
+/// NOTE: the anthropic routes (`handlers::conversion_error_response`) carry a Chinese
+/// wording on purpose. The two wordings are intentionally different - do not merge them.
+pub(crate) fn conversion_error_response(e: &ConversionError) -> (StatusCode, Json<ErrorResponse>) {
+    let (et, msg) = match e {
+        ConversionError::UnsupportedModel(m) => {
+            ("invalid_request_error", format!("unsupported model: {}", m))
+        }
+        ConversionError::ModelDisabled(m) => {
+            ("invalid_request_error", format!("model disabled: {}", m))
+        }
+        ConversionError::EmptyMessages => {
+            ("invalid_request_error", "message list is empty".to_string())
+        }
+        ConversionError::UnsupportedToolMapping(reason) => (
+            "invalid_request_error",
+            format!("unsupported tool mapping: {}", reason),
+        ),
+    };
+    (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg)))
+}
+
 /// Run one upstream round (convert + streaming request + buffer decode)
 ///
 /// On upstream/conversion failure, returns Err(an already-constructed pass-through error Response)
@@ -266,23 +293,9 @@ async fn run_round(
     let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
         Ok(c) => c,
         Err(e) => {
-            let (et, msg) = match &e {
-                ConversionError::UnsupportedModel(m) => {
-                    ("invalid_request_error", format!("unsupported model: {}", m))
-                }
-                ConversionError::ModelDisabled(m) => {
-                    ("invalid_request_error", format!("model disabled: {}", m))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "message list is empty".to_string())
-                }
-                ConversionError::UnsupportedToolMapping(reason) => (
-                    "invalid_request_error",
-                    format!("unsupported tool mapping: {}", reason),
-                ),
-            };
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg))).into_response());
+            // Wording and status code live in conversion_error_response (extracted to be testable)
+            return Err(conversion_error_response(&e).into_response());
         }
     };
 
@@ -1721,5 +1734,41 @@ mod tests {
         // "unified" them and silently changed one route's contract.
         assert_ne!(unsupported.to_string(), "unsupported model: claude-opus-9");
         assert_ne!(disabled.to_string(), "model disabled: claude-opus-9");
+    }
+
+    /// The web-search route's error **response** itself, not just its literals.
+    ///
+    /// The canary above compares strings; this one builds the real response and
+    /// decodes it: status code + JSON shape + every wording, all four variants.
+    /// `run_round`'s `Err` arm now calls exactly this function, so a change here
+    /// is a change on the wire.
+    #[tokio::test]
+    async fn conversion_error_response_carries_status_and_english_body() {
+        use crate::anthropic::converter::ConversionError;
+
+        let cases: Vec<(ConversionError, &str)> = vec![
+            (
+                ConversionError::UnsupportedModel("claude-opus-9".to_string()),
+                "unsupported model: claude-opus-9",
+            ),
+            (
+                ConversionError::ModelDisabled("claude-opus-9".to_string()),
+                "model disabled: claude-opus-9",
+            ),
+            (ConversionError::EmptyMessages, "message list is empty"),
+            (
+                ConversionError::UnsupportedToolMapping("exec".to_string()),
+                "unsupported tool mapping: exec",
+            ),
+        ];
+
+        for (err, expected_message) in cases {
+            let resp = conversion_error_response(&err).into_response();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{:?} must be a 400", err);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["type"], "invalid_request_error", "{:?} -> {}", err, json);
+            assert_eq!(json["error"]["message"], expected_message, "{:?} -> {}", err, json);
+        }
     }
 }

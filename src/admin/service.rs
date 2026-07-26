@@ -4185,6 +4185,167 @@ mod model_registry_tests {
         crate::anthropic::model_registry::install_registry(ModelRegistry::builtin());
     }
 
+    // ===== 同步 → credentialSupport → 调度层过滤：整条链 =====
+
+    /// 只有 1 号凭据能拉到列表，其余一律失败。用来产生「只覆盖一个凭据」的
+    /// credentialSupport 记录 —— 这正是真实探针轮次的形状。
+    struct ProbeOnlyFetcher {
+        models: Vec<UpstreamModel>,
+    }
+
+    impl ModelListFetcher for ProbeOnlyFetcher {
+        fn fetch(&self, id: u64) -> BoxFuture<'_, Result<Vec<UpstreamModel>, String>> {
+            let models = if id == 1 { self.models.clone() } else { Vec::new() };
+            let ok = id == 1;
+            Box::pin(async move {
+                if ok {
+                    Ok(models)
+                } else {
+                    Err("本测试只允许探针凭据拉取".to_string())
+                }
+            })
+        }
+        fn candidate_credential_ids(&self) -> Vec<u64> {
+            vec![1, 2]
+        }
+        fn is_credential_usable(&self, id: u64) -> bool {
+            id == 1
+        }
+    }
+
+    fn live_cred(id: u64, token: &str, priority: u32) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.id = Some(id);
+        c.access_token = Some(token.to_string());
+        // 未过期 → acquire_context 不会去刷 token（测试环境没有上游）
+        c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        c.priority = priority;
+        c
+    }
+
+    /// **本轮收尾的重点：同步跑完之后，调度层的凭据过滤真的按新数据变了。**
+    ///
+    /// 此前这条链上每一段都有测试，唯独没有一条把它们串起来跑：
+    /// `sync_once` 写 `credentialSupport` → `AdminService::sync_models` 把它灌回
+    /// `MultiTokenManager` → `credential_matches_request` 依据它筛凭据。
+    /// 段段都绿而接缝错位（例如同步写的键格式与过滤读的不一致）是发现不了的。
+    ///
+    /// 断言方式刻意**不是**「刷新函数被调用了」，而是**同一个凭据 + 同一个模型，
+    /// 同步前后的过滤结果不同**：
+    /// - 同步前：1 号凭据无记录 → 放行 → 按 priority 选中 1 号；
+    /// - 同步后：1 号凭据有记录且不含该模型 → 拒绝 → 改选无记录的 2 号。
+    ///
+    /// 顺带钉住键/值的格式：键是凭据 id 的**字符串**，值是**上游 id**（带点号，
+    /// 不是对外的连字符形式）—— 这两处任何一处漂移，过滤都会静默失效（永远放行）。
+    #[tokio::test]
+    async fn sync_refresh_changes_credential_filtering_end_to_end() {
+        use crate::kiro::token_manager::credential_supports_model;
+
+        let _guard = crate::anthropic::model_registry::REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // 探针（1 号）能看到的模型集里**没有** claude-sonnet-5。
+        // 「看得见」的那个刻意选带点号的上游 id：它的对外名是 claude-sonnet-4-5，
+        // 两者不同，于是下面「值必须是上游 id」的断言才真的能挡住键值格式漂移。
+        const PROBE_SEES: &str = "claude-sonnet-4.5";
+        const PROBE_DOES_NOT_SEE: &str = "claude-sonnet-5";
+
+        let token_manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![live_cred(1, "tok-probe", 1), live_cred(2, "tok-other", 10)],
+                None,
+                None,
+                true,
+            )
+            .unwrap(),
+        );
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("kiro-admin-models-e2e-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(ModelRegistryStore::new(path.clone()));
+
+        let sync_service = Arc::new(ModelSyncService::new(
+            Arc::clone(&store),
+            Arc::new(ProbeOnlyFetcher {
+                models: vec![UpstreamModel {
+                    model_id: PROBE_SEES.to_string(),
+                    model_name: Some("Claude Sonnet 4.5".to_string()),
+                    max_input_tokens: Some(200_000),
+                }],
+            }),
+        ));
+        let settings = Arc::new(parking_lot::RwLock::new(ModelSyncSettings {
+            enabled: true,
+            time: "04:00".to_string(),
+            probe_credential_id: Some(1),
+            allow_passthrough: false,
+        }));
+        let service = AdminService::new(Arc::clone(&token_manager), Vec::<String>::new())
+            .with_model_registry(Some(Arc::clone(&store)), Some(sync_service))
+            .with_model_sync_settings(settings);
+
+        // ---- 同步前：无记录 → 放行 → 选到高优先级的 1 号 ----
+        assert!(
+            token_manager.credential_support().is_empty(),
+            "前置条件：启动时没有任何 credentialSupport 记录"
+        );
+        assert!(
+            credential_supports_model(1, PROBE_DOES_NOT_SEE, &token_manager.credential_support()),
+            "无记录必须放行（保守，不误杀）"
+        );
+        let before = token_manager
+            .acquire_context(Some(PROBE_DOES_NOT_SEE), None)
+            .await
+            .expect("同步前应能选到凭据");
+        assert_eq!(before.id, 1, "同步前：1 号无记录、优先级更高，应被选中");
+
+        // ---- 跑一轮真同步（走的是 /models/sync 的生产路径）----
+        let summary = service.sync_models().await.expect("同步应成功");
+        assert_eq!(summary.round, "authoritative");
+        assert!(summary.trusted);
+
+        // ---- 落盘内容的格式：键是 id 字符串，值是上游 id ----
+        let support = token_manager.credential_support();
+        assert_eq!(
+            support.get("1").map(|v| v.as_slice()),
+            Some([PROBE_SEES.to_string()].as_slice()),
+            "刷新后的 credentialSupport 必须按「id 字符串 → 上游 id 列表」记录，实际: {:?}",
+            support
+        );
+        assert!(
+            !support.contains_key("2"),
+            "拉取失败的凭据不得留下记录（否则会被当成「不支持任何模型」永久踢出轮换）"
+        );
+
+        // ---- 同步后：同一个凭据 + 同一个模型，过滤结论反转 ----
+        assert!(
+            !credential_supports_model(1, PROBE_DOES_NOT_SEE, &support),
+            "1 号已有记录且不含该模型 → 必须被过滤掉"
+        );
+        assert!(
+            credential_supports_model(1, PROBE_SEES, &support),
+            "1 号对记录内的模型仍应放行"
+        );
+        let after = token_manager
+            .acquire_context(Some(PROBE_DOES_NOT_SEE), None)
+            .await
+            .expect("2 号无记录，仍应能选到凭据");
+        assert_eq!(
+            after.id, 2,
+            "同步后：1 号被 credentialSupport 过滤掉，调度层应改选 2 号 —— \
+             这一条才证明刷新真的传导到了过滤行为，而不只是「刷新函数被调用了」"
+        );
+        // 说明：这里不再断言「换个模型又会选回 1 号」——priority 模式下
+        // `acquire_context` 会优先复用 current_id（上一步已粘在 2 号），
+        // 那是负载均衡的既有语义，与本测试要证明的过滤传导无关。
+        // 「1 号对记录内的模型仍放行」由上面的 credential_supports_model 断言覆盖。
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// 写入的文件必须能被 from_file 加载（落盘前校验的兜底断言）
     #[test]
     fn patched_file_still_loads() {

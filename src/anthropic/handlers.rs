@@ -387,6 +387,34 @@ fn available_models() -> Vec<Model> {
     crate::anthropic::model_registry::current_registry().exposed_models()
 }
 
+/// 请求转换失败 → 对客户端的 HTTP 响应（anthropic 路由，中文文案）。
+///
+/// **抽出来的唯一目的是可测**：`post_messages` 与 `post_messages_cc` 原先各内联
+/// 一份完全相同的 `match` + `format!`，而要走到那段代码得有一个活的上游 provider，
+/// 于是「请求一个未收录的模型到底拿到什么状态码、什么报文」这件事实际上从未被
+/// 测过——只有一条比对字面量的哨兵测试，它证明不了路由真的这样响应。
+///
+/// **注意：web-search 路径（`websearch_loop::run_round`）另有一份英文文案，
+/// 那是刻意的差异，不要顺手合并到这里。** 两份文案面向的客户端不同。
+pub(crate) fn conversion_error_response(e: &ConversionError) -> (StatusCode, Json<ErrorResponse>) {
+    let (error_type, message) = match e {
+        ConversionError::UnsupportedModel(model) => {
+            ("invalid_request_error", format!("模型不支持: {}", model))
+        }
+        ConversionError::ModelDisabled(model) => {
+            ("invalid_request_error", format!("模型已禁用: {}", model))
+        }
+        ConversionError::EmptyMessages => ("invalid_request_error", "消息列表为空".to_string()),
+        ConversionError::UnsupportedToolMapping(reason) => {
+            ("invalid_request_error", format!("工具映射不支持: {}", reason))
+        }
+    };
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse::new(error_type, message)),
+    )
+}
+
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
@@ -487,27 +515,10 @@ pub async fn post_messages(
     let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
         Ok(result) => result,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::ModelDisabled(model) => {
-                    ("invalid_request_error", format!("模型已禁用: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-                ConversionError::UnsupportedToolMapping(reason) => {
-                    ("invalid_request_error", format!("工具映射不支持: {}", reason))
-                }
-            };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
+            // 文案与状态码见 conversion_error_response（抽出来是为了可测）
+            return conversion_error_response(&e).into_response();
         }
     };
 
@@ -1289,27 +1300,10 @@ pub async fn post_messages_cc(
     let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
         Ok(result) => result,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::ModelDisabled(model) => {
-                    ("invalid_request_error", format!("模型已禁用: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-                ConversionError::UnsupportedToolMapping(reason) => {
-                    ("invalid_request_error", format!("工具映射不支持: {}", reason))
-                }
-            };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
+            // 文案与状态码见 conversion_error_response（抽出来是为了可测）
+            return conversion_error_response(&e).into_response();
         }
     };
 
@@ -1820,18 +1814,16 @@ mod tests {
     // 单测里 `registry.exposed_models()` 全绿，不代表 `/v1/models` 端点
     // 也读的是同一份表。
     //
-    // **全局状态纪律**（本分支出过一次污染事故，务必遵守）：
-    // 1. 任何 `install_registry()` 的测试都先取 `REGISTRY_TEST_LOCK`。
-    //    仅靠「末尾复原」不够 —— 复原只保证测试**结束后**干净，不保证
-    //    执行期间另一个同样在改全局表的测试不会读到我的中间态，更糟的是
-    //    对方的「复原成 builtin」会直接抹掉我刚装上的表，让断言随机失败。
-    //    这把锁把所有写全局表的测试串成一条线。
-    // 2. 末尾一律 `install_registry(ModelRegistry::builtin())` 复原。
+    // **全局状态纪律**（本分支出过一次污染事故）：
+    // 1. 任何 `install_registry()` 的测试都先取 `REGISTRY_TEST_LOCK` 守卫。
+    //    测试期装表写的是**线程本地覆盖**（见 model_registry 里 `REGISTRY_OVERRIDE`
+    //    的说明），测试之间根本不共享注册表；守卫的作用是给覆盖划定作用域，并让
+    //    「装表发生在非测试线程」这类错误当场 panic 而不是静默失效。
+    // 2. 末尾复原（`install_registry(ModelRegistry::builtin())`）已非必需 ——
+    //    守卫 Drop 会清掉覆盖。既有写法保留不动，多写一次无害。
     // 3. **只往 builtin 上追加合成行，绝不改动既有 builtin 行的标志位。**
-    //    这条是关键：converter.rs 与本文件里还有大量**不取锁**的测试
-    //    （`available_models_include_4_8_variants`、各种 `map_model` 断言）
-    //    在并行读全局表，锁管不到它们。追加一行谁也不认识的合成模型，
-    //    则无论怎样交错，它们的断言对象都没被动过。
+    //    这条在线程本地方案下已不再是正确性前提（并行读者读不到本线程的覆盖），
+    //    但仍是好习惯：断言对象越少被动过，测试意图越清楚。
     use crate::anthropic::model_registry::{
         builtin_rows, install_registry, ModelOrigin, ModelRegistry, ModelRow, ModelStatus,
         REGISTRY_TEST_LOCK,
@@ -2086,5 +2078,77 @@ mod tests {
         let e = ConversionError::ModelDisabled("claude-opus-9".to_string());
         assert_eq!(e.to_string(), "模型已禁用: claude-opus-9");
         assert_eq!(format!("模型已禁用: {}", "claude-opus-9"), e.to_string());
+    }
+
+    /// anthropic 两条路由（`post_messages` / `post_messages_cc`）的错误**响应**本身。
+    ///
+    /// 与上面那条哨兵的区别：哨兵比的是 `ConversionError::Display` 的字面量，
+    /// 证明不了路由真的这样回；这条直接把响应构造出来，解出真实报文，
+    /// 断言**状态码 + JSON 结构 + 每一条文案**。四个变体一个不落 ——
+    /// 漏掉一个分支（比如以后新增变体后 match 写错）会在这里当场暴露。
+    ///
+    /// 覆盖的是抽出来的 `conversion_error_response`，两条路由的 `Err` 分支现在
+    /// 都只调用它，不再各自内联一份 `format!`。
+    #[tokio::test]
+    async fn conversion_error_response_carries_status_and_chinese_body() {
+        use crate::anthropic::converter::ConversionError;
+
+        let cases: Vec<(ConversionError, &str)> = vec![
+            (
+                ConversionError::UnsupportedModel("claude-opus-9".to_string()),
+                "模型不支持: claude-opus-9",
+            ),
+            (
+                ConversionError::ModelDisabled("claude-opus-9".to_string()),
+                "模型已禁用: claude-opus-9",
+            ),
+            (ConversionError::EmptyMessages, "消息列表为空"),
+            (
+                ConversionError::UnsupportedToolMapping("web_search".to_string()),
+                "工具映射不支持: web_search",
+            ),
+        ];
+
+        for (err, expected_message) in cases {
+            let resp = conversion_error_response(&err).into_response();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{:?} 必须是 400，客户端靠状态码区分「请求写错了」与「上游挂了」",
+                err
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json["error"]["type"], "invalid_request_error",
+                "{:?} 的 error.type 不对，实际报文: {}",
+                err, json
+            );
+            assert_eq!(
+                json["error"]["message"], expected_message,
+                "{:?} 的文案不对，实际报文: {}",
+                err, json
+            );
+        }
+    }
+
+    /// 中文/英文两套文案是**刻意**不同的（anthropic 路由 vs web-search 路由）。
+    /// 谁要是"顺手统一"，这里当场红。
+    #[test]
+    fn anthropic_and_websearch_routes_keep_distinct_wording() {
+        use crate::anthropic::converter::ConversionError;
+
+        let err = ConversionError::UnsupportedModel("claude-opus-9".to_string());
+        let (zh_status, zh) = conversion_error_response(&err);
+        let (en_status, en) =
+            crate::anthropic::websearch_loop::conversion_error_response(&err);
+
+        assert_eq!(zh_status, en_status, "两条路由的状态码必须一致（都是 400）");
+        assert_eq!(zh.0.error.message, "模型不支持: claude-opus-9");
+        assert_eq!(en.0.error.message, "unsupported model: claude-opus-9");
+        assert_ne!(
+            zh.0.error.message, en.0.error.message,
+            "两条路由的文案不得合并：客户端可能在匹配其中一份"
+        );
     }
 }
