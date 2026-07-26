@@ -1,0 +1,60 @@
+admin-ui/src/components/model-mapping-dialog.tsx
+  s_ac04534933677d::t_2d05e41d6e0152 478,491-493
+  s_ac04534933677d::t_b9e90c03fe62d8 266-270,275-278
+  s_ac04534933677d::t_2d85b51ae22b99 541,546-549,557-561,563-564
+  s_ac04534933677d::t_5e6b091f02fac0 130,134-135,143-148,173-198,209
+src/admin/types.rs
+  s_ac04534933677d::t_df00214ec0f6cc 540-543
+  s_ac04534933677d::t_8994a261b063cb 601-616
+  s_ac04534933677d::t_b037703e1e247a 489-494
+  s_ac04534933677d::t_8695780a7f4050 575-580
+admin-ui/src/hooks/use-model-registry.ts
+  s_ac04534933677d::t_02052f65027fd4 85
+  s_ac04534933677d::t_61b60835334040 78-80
+admin-ui/src/api/models.ts
+  s_ac04534933677d::t_3a90f4f9d8c0f5 30-42
+admin-ui/src/types/api.ts
+  s_ac04534933677d::t_1938163a4ebb31 688-696,708-710
+.superpowers/sdd/final-fix-sync-report.md
+  s_ac04534933677d::t_caea587bad2ceb 1-116
+src/admin/service.rs
+  s_ac04534933677d::t_c1b42b90a195e8 4425-4494
+  s_ac04534933677d::t_04df2036eb0d8b 4363
+  s_ac04534933677d::t_15c7385a067d0a 3852-3853
+  s_ac04534933677d::t_caf4d536fb2253 3603-3613
+  s_ac04534933677d::t_307f7cdb5ca8e1 1435,1437,1443-1446,1448-1452
+  s_ac04534933677d::t_4f8d8616107651 1488-1503,1505-1510
+  s_ac04534933677d::t_7fd4fca92e0cac 1473-1474
+  s_ac04534933677d::t_8451e13c94bd5d 3825-3837,3841
+src/anthropic/model_sync.rs
+  s_ac04534933677d::t_88c09a6e4c15e2 389-503,505-509,611
+  s_ac04534933677d::t_c93e08adac28d3 544-561,563
+  s_ac04534933677d::t_3154ebe17ecff9 69-113
+  s_ac04534933677d::t_1250c215abec83 574-587,591,600-608,610
+  s_ac04534933677d::t_7f717e95192623 613-641,651-657,670-679
+  s_ac04534933677d::t_6b2b62cd2ee284 12
+  s_ac04534933677d::t_7d1d8eebd77cf0 132-142
+  s_ac04534933677d::t_1873cffb52b761 236,241-251
+  s_ac04534933677d::t_7221204f52e58a 504
+  s_ac04534933677d::t_76a16483945ce2 1499-1657
+  s_ac04534933677d::t_3d845df206ac30 330-331
+  s_ac04534933677d::t_a278b97e6351ca 612
+src/admin/handlers.rs
+  s_ac04534933677d::t_81b4b4144c337f 1604-1613
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "c64fbbfef7c6a5a8a843488f72f166b206228082",
+  "prompts": {},
+  "sessions": {
+    "s_ac04534933677d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "406a6388-eb5d-470d-a7b4-e094c57e8508",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
