@@ -3326,18 +3326,13 @@ impl AdminService {
 // AdminService（构造它需要一个真实的 MultiTokenManager）单独单测。
 // AdminService 上的方法只负责「取 store → mutate → 热替换 → 返回快照」。
 
-/// 可写字段中「会被自动 pin」的那部分 → pinned 中记录的字段名。
+/// 可写字段中「会被自动 pin」的那部分 = **同步会覆盖的字段**，直接复用
+/// `SYNC_MANAGED_FIELDS`，不在这里另抄一份（抄第二份就会漂移）。
 ///
-/// 为什么不是全部可写字段：`enabled` / `sortOrder` / `matchKind` 是**本地展示与
-/// 准入策略**，同步流程（`merge_synced_row`）根本不碰它们，pin 了也没有意义，
-/// 只会让 UI 上多出永远解不掉的锁标记。真正需要 pin 的是同步会覆盖的字段。
-pub const PATCHABLE_PINNED_FIELDS: &[&str] = &[
-    "exposedId",
-    "displayName",
-    "contextWindow",
-    "maxOutputTokens",
-    "exposeThinkingVariant",
-];
+/// 这条等式就是 pin 的定义本身：pin 的全部意义是挡住同步，所以「值得 pin 的字段」
+/// 恰好是「同步会覆盖的字段」。反过来说，`enabled` / `sortOrder` / `matchKind` 是
+/// 本地展示与准入策略，同步流程根本不碰，pin 了只会在 UI 上多出永远解不掉的锁标记。
+use crate::anthropic::model_registry::SYNC_MANAGED_FIELDS as PATCHABLE_PINNED_FIELDS;
 
 /// 领域错误穿过 `ModelRegistryStore::mutate` 的 `String` 通道时用的标签。
 /// mutate 的闭包只能返回 `String`，直接丢失错误类型会让「模型不存在」变成 500。

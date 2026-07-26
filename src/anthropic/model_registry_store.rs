@@ -119,24 +119,17 @@ impl ModelRegistryStore {
 
 /// 把同步得到的 `incoming` 合并进已有行 `existing`，**逐字段跳过 pinned**。
 ///
-/// 字段名用 camelCase，与 JSON 中的 `pinned` 数组一致。
+/// 字段清单与拷贝逻辑都来自 `model_registry::SYNC_MANAGED_FIELDS` /
+/// `copy_sync_managed_field`：写侧（这里）与读侧（`overlay_onto_builtin`）同源，
+/// 不再各抄一份 —— 两份清单漂移会造成「同步跑了但值没变」这种极难排查的症状。
+/// pinned 判定也因此收敛成循环里的一处（原先每个字段各判一次，语义完全相同：
+/// 5 个字段互相独立，跳过与否只取决于自己的名字在不在 pinned 里）。
 pub fn merge_synced_row(existing: &mut ModelRow, incoming: &ModelRow) {
-    let pinned = |name: &str| existing.pinned.iter().any(|p| p == name);
-
-    if !pinned("displayName") {
-        existing.display_name = incoming.display_name.clone();
-    }
-    if !pinned("contextWindow") {
-        existing.context_window = incoming.context_window;
-    }
-    if !pinned("maxOutputTokens") {
-        existing.max_output_tokens = incoming.max_output_tokens;
-    }
-    if !pinned("exposedId") {
-        existing.exposed_id = incoming.exposed_id.clone();
-    }
-    if !pinned("exposeThinkingVariant") {
-        existing.expose_thinking_variant = incoming.expose_thinking_variant;
+    for field in super::model_registry::SYNC_MANAGED_FIELDS {
+        if existing.pinned.iter().any(|p| p == field) {
+            continue;
+        }
+        super::model_registry::copy_sync_managed_field(existing, incoming, field);
     }
 
     // 同步元数据不受 pinned 影响
@@ -248,6 +241,50 @@ mod tests {
 
         assert_eq!(existing.context_window, 800_000, "pinned 字段被覆盖了");
         assert_eq!(existing.display_name, "Claude Opus 4.8", "未 pinned 字段应更新");
+    }
+
+    /// pinned 判定收敛成一处之后，**逐字段**语义必须原样保持：
+    /// 对每一个同步管辖字段分别验证「未 pin → 被上游值覆盖」「pin 了 → 保持不变」。
+    /// 原先每个字段各写一次 `if !pinned(...)`，这条测试替代那份重复代码的表达力。
+    #[test]
+    fn merge_is_pinned_aware_per_field() {
+        use crate::anthropic::model_registry::SYNC_MANAGED_FIELDS;
+
+        let base = row("claude-opus-4.8");
+        let mut incoming = base.clone();
+        incoming.display_name = "上游名字".to_string();
+        incoming.context_window = 123_456;
+        incoming.max_output_tokens = 7_890;
+        incoming.exposed_id = "claude-opus-4-8-upstream".to_string();
+        incoming.expose_thinking_variant = !base.expose_thinking_variant;
+
+        let read = |row: &ModelRow, field: &str| -> String {
+            let v = serde_json::to_value(row).unwrap();
+            v.get(field).unwrap().to_string()
+        };
+
+        for field in SYNC_MANAGED_FIELDS {
+            // 未 pin → 跟随上游
+            let mut existing = base.clone();
+            merge_synced_row(&mut existing, &incoming);
+            assert_eq!(
+                read(&existing, field),
+                read(&incoming, field),
+                "{} 未被 pin，应跟随上游值",
+                field
+            );
+
+            // pin 了 → 保持原值
+            let mut existing = base.clone();
+            existing.pinned = vec![field.to_string()];
+            merge_synced_row(&mut existing, &incoming);
+            assert_eq!(
+                read(&existing, field),
+                read(&base, field),
+                "{} 已被 pin，同步不得覆盖它",
+                field
+            );
+        }
     }
 
     /// deprecated 行在上游重新出现时复活

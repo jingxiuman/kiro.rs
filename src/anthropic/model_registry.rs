@@ -214,16 +214,54 @@ pub fn builtin_rows() -> Vec<ModelRow> {
     ]
 }
 
-/// 同步服务（`merge_synced_row`）会写入的字段，用 pinned 数组里的 camelCase 名字。
-/// **这个集合必须与 `merge_synced_row` 保持一致**：它既是「同步会覆盖哪些字段」，
-/// 也是「加载时哪些字段可以由覆盖层提供上游值」的定义。
-const SYNC_MANAGED_FIELDS: &[&str] = &[
+/// 同步服务会写入的字段，用 pinned 数组里的 camelCase 名字。
+///
+/// **这是「哪些字段归同步管」的唯一定义处**，三个消费方全部由它派生，不再各写一份：
+/// - 写侧 `merge_synced_row`（同步落盘时逐字段跳过 pinned）
+/// - 读侧 `overlay_onto_builtin`（加载时判断该字段能否由覆盖层提供）
+/// - admin 的「PATCH 后自动 pin 哪些字段」白名单
+///
+/// 三处同源不是风格问题：它们表达的是同一条业务规则 ——
+/// **pin 的全部意义就是挡住同步，所以「可被 pin 的字段」必须恰好等于「同步会覆盖的字段」。**
+/// 早先这条规则被抄成三份，任何一份漂移都会导致「同步跑了但值没变」或「pin 了却挡不住」
+/// 这类极难排查的症状。
+pub const SYNC_MANAGED_FIELDS: &[&str] = &[
     "displayName",
     "contextWindow",
     "maxOutputTokens",
     "exposedId",
     "exposeThinkingVariant",
 ];
+
+/// 把 `src` 的某个同步管辖字段拷到 `dst`。**写侧与读侧都只经这里改这几个字段**，
+/// 于是「字段清单」与「怎么拷」只有一处定义，不存在两边漂移的可能。
+///
+/// 兜底分支是**响亮失败**而不是静默跳过：往 `SYNC_MANAGED_FIELDS` 里加了字段却忘了
+/// 在这里处理，任何遍历该常量的代码路径（同步、加载、以及测试
+/// `every_sync_managed_field_is_actually_copied`）都会当场 panic 并指名道姓。
+/// 发布构建里 `debug_assert!` 不生效，退化为 error 日志 —— 线上不该因为这个崩，
+/// 但也绝不能一声不吭地把字段漏掉。
+pub(crate) fn copy_sync_managed_field(dst: &mut ModelRow, src: &ModelRow, field: &str) {
+    match field {
+        "displayName" => dst.display_name = src.display_name.clone(),
+        "contextWindow" => dst.context_window = src.context_window,
+        "maxOutputTokens" => dst.max_output_tokens = src.max_output_tokens,
+        "exposedId" => dst.exposed_id = src.exposed_id.clone(),
+        "exposeThinkingVariant" => dst.expose_thinking_variant = src.expose_thinking_variant,
+        other => {
+            debug_assert!(
+                false,
+                "SYNC_MANAGED_FIELDS 里新增了 {}，但 copy_sync_managed_field 没有处理它\
+                 ——同步与加载都会静默漏掉这个字段",
+                other
+            );
+            tracing::error!(
+                "未知的同步管辖字段 {}：copy_sync_managed_field 没有处理它，本次跳过",
+                other
+            );
+        }
+    }
+}
 
 /// 把覆盖层的行叠加到同 id 的内置行上（spec §4.7）。
 ///
@@ -256,30 +294,20 @@ fn overlay_onto_builtin(builtin: &ModelRow, overlay: ModelRow, sync_touched: boo
     out.match_kind = overlay.match_kind;
     // origin 决定 UI 上的来源徽章，必须反映「这一行被人动过/被同步写过」。
     out.origin = overlay.origin;
-    out.pinned = overlay.pinned;
+    out.pinned = overlay.pinned.clone();
 
     // 2) 同步元数据：老格式内联在行上（新格式在 syncState.modelMeta，
     //    调用方随后还会再叠加一次并以它为准）。
     out.missing_sync_rounds = overlay.missing_sync_rounds;
     out.status = overlay.status;
-    out.last_seen_at = overlay.last_seen_at;
+    out.last_seen_at = overlay.last_seen_at.clone();
 
     // 3) 同步管辖的 5 个字段：pinned（用户的值）或同步写过（上游的值）才取覆盖层，
     //    否则回落到内置定义——这正是「代码改了内置定义，已有部署跟着变」的实现点。
-    let pinned = |name: &str| out.pinned.iter().any(|p| p == name);
     for field in SYNC_MANAGED_FIELDS {
-        if !(pinned(field) || sync_touched) {
-            continue;
-        }
-        match *field {
-            "displayName" => out.display_name = overlay.display_name.clone(),
-            "contextWindow" => out.context_window = overlay.context_window,
-            "maxOutputTokens" => out.max_output_tokens = overlay.max_output_tokens,
-            "exposedId" => out.exposed_id = overlay.exposed_id.clone(),
-            "exposeThinkingVariant" => {
-                out.expose_thinking_variant = overlay.expose_thinking_variant
-            }
-            _ => {}
+        let pinned = out.pinned.iter().any(|p| p == field);
+        if pinned || sync_touched {
+            copy_sync_managed_field(&mut out, &overlay, field);
         }
     }
 
@@ -1717,6 +1745,75 @@ mod tests {
         assert_eq!(out.sort_order, 5);
         // 同时验证同步管辖字段仍回落到新代码定义
         assert_eq!(out.context_window, 333_000);
+    }
+
+    // ---- 同步管辖字段清单的单一来源 ----
+
+    /// 两行之间「哪些字段不同」，用序列化后的 JSON 比对，不依赖手写的字段列表 ——
+    /// 手写列表就是这次要消灭的东西。
+    fn differing_fields(a: &ModelRow, b: &ModelRow) -> Vec<String> {
+        let a = serde_json::to_value(a).unwrap();
+        let b = serde_json::to_value(b).unwrap();
+        let (a, b) = (a.as_object().unwrap(), b.as_object().unwrap());
+        a.iter()
+            .filter(|(k, v)| b.get(*k) != Some(*v))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// `SYNC_MANAGED_FIELDS` 里的每一项都必须真的被 `copy_sync_managed_field` 处理：
+    /// 拷完之后**恰好**是那一个字段发生了变化。
+    ///
+    /// 这条测试就是「加了字段却忘了处理」的自动捕获点：新字段进了常量而没进 match，
+    /// 循环走到它时 `copy_sync_managed_field` 的兜底分支会 panic 并指名道姓；
+    /// 即使有人把兜底改成静默跳过，下面的断言也会因为「什么都没变」而失败。
+    #[test]
+    fn every_sync_managed_field_is_actually_copied() {
+        let base = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+
+        // src 与 base 在全部 5 个同步管辖字段上都不同
+        let mut src = base.clone();
+        src.display_name = "上游名字".to_string();
+        src.context_window = 123_456;
+        src.max_output_tokens = 7_890;
+        src.exposed_id = "claude-opus-4-8-upstream".to_string();
+        src.expose_thinking_variant = !base.expose_thinking_variant;
+
+        for field in SYNC_MANAGED_FIELDS {
+            let mut dst = base.clone();
+            copy_sync_managed_field(&mut dst, &src, field);
+            let changed = differing_fields(&base, &dst);
+            assert_eq!(
+                changed,
+                vec![field.to_string()],
+                "拷贝 {} 应当且只应当改动它自己，实际改动: {:?}",
+                field,
+                changed
+            );
+        }
+    }
+
+    /// 兜底分支必须是响亮失败，不是静默跳过。
+    /// 这里直接模拟「常量里多了一个同步器不认识的字段」的那一刻。
+    #[test]
+    #[should_panic(expected = "SYNC_MANAGED_FIELDS 里新增了 brandNewField")]
+    fn unknown_sync_managed_field_fails_loudly() {
+        let base = builtin_rows().into_iter().next().unwrap();
+        let src = base.clone();
+        let mut dst = base;
+        copy_sync_managed_field(&mut dst, &src, "brandNewField");
+    }
+
+    /// 常量里不得有重复项（重复本身无害，但说明有人手工编辑时抄串行了）
+    #[test]
+    fn sync_managed_fields_are_unique() {
+        let mut seen = HashSet::new();
+        for f in SYNC_MANAGED_FIELDS {
+            assert!(seen.insert(*f), "SYNC_MANAGED_FIELDS 里有重复项: {}", f);
+        }
     }
 
     /// 精确匹配优先级必须高于宽松匹配
