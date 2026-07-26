@@ -4130,7 +4130,7 @@ mod model_registry_tests {
     /// 光测「PATCH 写进去了」不够，必须真跑一轮同步再看值。
     #[tokio::test]
     async fn pinned_field_survives_a_sync_round() {
-        let _guard = crate::anthropic::model_registry::REGISTRY_TEST_LOCK
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
@@ -4241,7 +4241,7 @@ mod model_registry_tests {
     async fn sync_refresh_changes_credential_filtering_end_to_end() {
         use crate::kiro::token_manager::credential_supports_model;
 
-        let _guard = crate::anthropic::model_registry::REGISTRY_TEST_LOCK
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 

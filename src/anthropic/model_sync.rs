@@ -586,10 +586,10 @@ mod tests {
     #[tokio::test]
     async fn adds_new_upstream_model() {
         // I4 修复：sync_once 落盘成功后会调用 install_registry() 改写进程级全局状态，
-        // 所有会走到这里的测试都必须先取 REGISTRY_TEST_LOCK 串行化，否则并行测试互相
+        // 所有会走到这里的测试都必须先取 MODEL_GLOBALS_TEST_LOCK 串行化，否则并行测试互相
         // 覆盖全局注册表，其他模块（如 converter.rs）断言内置 upstream_id 的测试会随机挂。
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("add");
         let fetcher = Arc::new(FakeFetcher::new(vec![(
             3,
@@ -613,7 +613,7 @@ mod tests {
     #[tokio::test]
     async fn gpt_exposed_id_keeps_dots() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("gpt");
         let fetcher = Arc::new(FakeFetcher::new(vec![(
             3,
@@ -631,7 +631,7 @@ mod tests {
     #[tokio::test]
     async fn untrusted_round_does_not_touch_file() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("untrusted");
         // 先建一行
         let ok = Arc::new(FakeFetcher::new(vec![(3, Ok(vec![upstream("claude-a", Some(200_000))]))]));
@@ -656,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn empty_upstream_list_is_untrusted() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("empty");
         let ok = Arc::new(FakeFetcher::new(vec![(3, Ok(vec![upstream("claude-a", Some(200_000))]))]));
         ModelSyncService::new(store.clone(), ok).sync_once(Some(3), now()).await.unwrap();
@@ -672,7 +672,7 @@ mod tests {
     #[tokio::test]
     async fn advisory_round_never_deprecates() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("advisory");
         let full = Arc::new(FakeFetcher::new(vec![(
             3,
@@ -699,7 +699,7 @@ mod tests {
     async fn authoritative_rounds_deprecate_after_threshold() {
         use crate::anthropic::model_registry::ModelStatus;
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("deprecate");
         // 注意（N3 护栏导致的必要调整）：探针必须「有代表性」，否则单轮缺失比例超过
         // 有效行集的 50%，消失判定会被整轮跳过（那是 N3 要拦的探针配置错误场景，
@@ -737,7 +737,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_max_input_tokens_falls_back() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("badwindow");
         let f = Arc::new(FakeFetcher::new(vec![(
             3,
@@ -760,7 +760,7 @@ mod tests {
     #[tokio::test]
     async fn union_conflict_resolution() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("union");
         let f = Arc::new(FakeFetcher::new(vec![
             (7, Ok(vec![UpstreamModel { model_id: "claude-x".into(), model_name: Some("从 7 来".into()), max_input_tokens: Some(200_000) }])),
@@ -780,7 +780,7 @@ mod tests {
     #[tokio::test]
     async fn records_credential_support() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("credsupport");
         let f = Arc::new(FakeFetcher::new(vec![(3, Ok(vec![upstream("claude-a", Some(200_000))]))]));
         ModelSyncService::new(store.clone(), f).sync_once(Some(3), now()).await.unwrap();
@@ -797,7 +797,7 @@ mod tests {
     #[tokio::test]
     async fn empty_credential_is_not_recorded_in_credential_support() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("c1-empty-cred");
         // 采样轮次同时命中 2 个凭据：2 号返回空列表，3 号返回非空——整轮仍可信。
         let f = Arc::new(FakeFetcher::new(vec![
@@ -821,7 +821,7 @@ mod tests {
     #[tokio::test]
     async fn authoritative_round_deprecates_missing_builtin_model() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("i1-builtin-deprecate");
         // 上游返回除 claude-opus-4.8 以外的全部内置模型，外加一个真正的新模型。
         //
@@ -858,7 +858,7 @@ mod tests {
     #[tokio::test]
     async fn new_row_sort_order_exceeds_all_builtin_rows() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("m1-sort-order");
         let f = Arc::new(FakeFetcher::new(vec![(3, Ok(vec![upstream("claude-brand-new", Some(200_000))]))]));
         ModelSyncService::new(store.clone(), f).sync_once(Some(3), now()).await.unwrap();
@@ -884,7 +884,7 @@ mod tests {
     #[tokio::test]
     async fn last_sync_at_ordering_uses_real_instant_not_string_order() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         // 场景 1：负偏移曾经漏挡。lastSyncAt 写成 "...-05:00"（真实时刻是 05:00Z），
         // 本轮起始时间是 04:00Z（比真实的 lastSyncAt 更旧，应当被丢弃）。
@@ -950,7 +950,7 @@ mod tests {
     #[tokio::test]
     async fn probe_fetch_failure_falls_back_to_advisory_sample() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("i3-probe-fallback");
         // 探针凭据 3 本身"可用"（未禁用），但 fetch 会失败（如 refreshToken 失效）；
         // 采样候选里还有 5 号凭据能正常返回结果。
@@ -979,7 +979,7 @@ mod tests {
     async fn authoritative_sync_never_snapshots_builtin_rows_into_overlay() {
         use crate::anthropic::model_registry::{builtin_rows, ModelOrigin};
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("n1-no-builtin-snapshot");
 
         // 探针有代表性（返回几乎全部内置模型），但少了 claude-opus-4.8 ——
@@ -1050,7 +1050,7 @@ mod tests {
     async fn synced_file_does_not_freeze_changed_builtin_definition() {
         use crate::anthropic::model_registry::builtin_rows;
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("n1-definition-not-frozen");
 
         let fetcher = || Arc::new(FakeFetcher::new(vec![(3, Ok(builtin_upstream_models()))]));
@@ -1081,7 +1081,7 @@ mod tests {
     #[tokio::test]
     async fn prefix_pseudo_row_is_never_deprecated() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("n2-prefix-not-deprecated");
 
         // 探针返回全部真实内置模型（不含也不可能含 "gpt-5" 这个伪行）
@@ -1106,7 +1106,7 @@ mod tests {
     #[tokio::test]
     async fn unrepresentative_probe_skips_disappearance_check() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("n3-unrepresentative-probe");
 
         // 探针（例如订阅等级过低的凭据）只返回 1 个模型
@@ -1139,7 +1139,7 @@ mod tests {
     #[tokio::test]
     async fn representative_probe_still_runs_disappearance_check() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("n3-representative-probe");
 
         // 14 个内置 exact 行里只缺 1 个 → 远低于 50%
@@ -1169,7 +1169,7 @@ mod tests {
     #[tokio::test]
     async fn guard_ratio_does_not_ratchet_after_normal_retirements() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("n6-ratchet");
 
         const BATCH_1: [&str; 4] =
@@ -1234,7 +1234,7 @@ mod tests {
     #[tokio::test]
     async fn guard_distinguishes_unrepresentative_probe_from_bulk_retirement() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         const FIRST_WAVE: [&str; 4] =
             ["claude-opus-4.5", "claude-sonnet-4.5", "claude-haiku-4.5", "gpt-5.6-luna"];
@@ -1309,7 +1309,7 @@ mod tests {
     async fn mutate_drops_stale_builtin_snapshot_rows_from_overlay() {
         use crate::anthropic::model_registry::{builtin_rows, ModelOrigin};
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("mn1-drop-builtin-snapshot");
 
         // 模拟老文件：覆盖层里躺着一份内置行的整行快照，窗口是写入那一刻的旧值
@@ -1344,7 +1344,7 @@ mod tests {
     #[tokio::test]
     async fn fallback_sampling_excludes_just_failed_probe() {
         let _registry_guard =
-            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("n4-exclude-failed-probe");
 
         let fetcher = Arc::new(FakeFetcher::new(vec![

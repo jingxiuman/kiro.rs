@@ -3425,7 +3425,7 @@ mod tests {
     /// 被禁用的模型必须报 ModelDisabled，而不是 UnsupportedModel
     #[test]
     fn disabled_model_yields_model_disabled_error() {
-        let _guard = crate::anthropic::model_registry::REGISTRY_TEST_LOCK
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
@@ -3451,7 +3451,7 @@ mod tests {
     /// 转换结果必须携带窗口，供响应处理阶段使用（避免热重载导致映射/计量不一致）
     #[test]
     fn conversion_result_carries_context_window() {
-        let _guard = crate::anthropic::model_registry::REGISTRY_TEST_LOCK
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 

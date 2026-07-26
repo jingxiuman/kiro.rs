@@ -1815,7 +1815,7 @@ mod tests {
     // 也读的是同一份表。
     //
     // **全局状态纪律**（本分支出过一次污染事故）：
-    // 1. 任何 `install_registry()` 的测试都先取 `REGISTRY_TEST_LOCK` 守卫。
+    // 1. 任何 `install_registry()` 的测试都先取 `MODEL_GLOBALS_TEST_LOCK` 守卫。
     //    测试期装表写的是**线程本地覆盖**（见 model_registry 里 `REGISTRY_OVERRIDE`
     //    的说明），测试之间根本不共享注册表；守卫的作用是给覆盖划定作用域，并让
     //    「装表发生在非测试线程」这类错误当场 panic 而不是静默失效。
@@ -1826,7 +1826,7 @@ mod tests {
     //    但仍是好习惯：断言对象越少被动过，测试意图越清楚。
     use crate::anthropic::model_registry::{
         builtin_rows, install_registry, ModelOrigin, ModelRegistry, ModelRow, ModelStatus,
-        REGISTRY_TEST_LOCK,
+        MODEL_GLOBALS_TEST_LOCK,
     };
 
     /// 以 opus-4.8 为模板造一行「谁也不认识」的合成模型，
@@ -1856,7 +1856,7 @@ mod tests {
     /// - `listed == false` 不出现，但**仍可解析** —— 这是 gpt-5 prefix 行的语义。
     #[test]
     fn models_endpoint_visibility_follows_installed_registry() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut r = ModelRegistry::builtin();
         {
@@ -1929,7 +1929,7 @@ mod tests {
     /// 报成 1M。这里刻意让两者取互不相同的值，混淆即失败。
     #[tokio::test]
     async fn get_models_endpoint_serializes_registry_rows() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut r = ModelRegistry::builtin();
         {
@@ -1983,7 +1983,7 @@ mod tests {
     /// 或 store 把 builtin 丢了）却发现不了，只有走完整条链才能钉住。
     #[test]
     fn absent_models_json_serves_byte_identical_builtin_listing() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut path = std::env::temp_dir();
         path.push(format!("kiro-t14-absent-{}.json", std::process::id()));
@@ -2009,7 +2009,7 @@ mod tests {
     /// - `aliases` 只存在于文件里、不在内置默认中，能被 `map_model` 解析到。
     #[tokio::test]
     async fn overlay_file_flows_through_store_into_listing_and_resolution() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut path = std::env::temp_dir();
         path.push(format!("kiro-t14-overlay-{}.json", std::process::id()));
