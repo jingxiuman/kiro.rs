@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Network,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -24,6 +24,7 @@ import { useUpdateCheck } from '@/hooks/use-update-check'
 import { updateAdminKey } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
+import { ModelMappingDialog } from '@/components/model-mapping-dialog'
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、刷新、在线更新、设置（Key 管理）。
@@ -44,6 +45,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const { data: updateCheck } = useUpdateCheck()
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
+  const [modelMappingOpen, setModelMappingOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
@@ -111,6 +113,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     isSettingThrottle,
     loadBalancingMode: loadBalancingData?.mode,
     openImageUpdate: () => setImageUpdateOpen(true),
+    openModelMapping: () => setModelMappingOpen(true),
     openKeyDialog,
     throttleConfig,
     updateCheck,
@@ -126,6 +129,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     <>
       {compact ? <CompactTools controls={controls} /> : <FullTools controls={controls} />}
       <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
+      <ModelMappingDialog open={modelMappingOpen} onOpenChange={setModelMappingOpen} />
 
       <Dialog
         open={keyDialogOpen}
@@ -232,6 +236,7 @@ interface ToolControls {
   loadBalancingMode?: 'priority' | 'balanced'
   openImageUpdate: () => void
   openKeyDialog: () => void
+  openModelMapping: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
@@ -248,6 +253,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onToggleFailover={controls.handleToggleFailover}
         onChangeCooldown={controls.updateCooldown}
       />
+      <ModelMappingButton controls={controls} />
       <RefreshButton onRefresh={controls.handleRefresh} />
       <ImageUpdateButton controls={controls} />
       <KeySettingsMenu onOpenKeyDialog={controls.openKeyDialog} />
@@ -287,6 +293,9 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <DropdownMenuItem onSelect={controls.handleRefresh}>
           <RefreshCw />刷新数据
         </DropdownMenuItem>
+        <DropdownMenuItem onSelect={controls.openModelMapping}>
+          <Network />模型映射
+        </DropdownMenuItem>
         <DropdownMenuItem onSelect={controls.openImageUpdate}>
           <UploadCloud />镜像在线更新
         </DropdownMenuItem>
@@ -325,6 +334,20 @@ function RefreshButton({ onRefresh }: { onRefresh: () => void }) {
   return (
     <Button variant="ghost" size="icon" onClick={onRefresh} title="刷新">
       <RefreshCw className="h-4 w-4" />
+    </Button>
+  )
+}
+
+/** 打开全局模型映射弹窗（模型表 / 别名 / 同步设置） */
+function ModelMappingButton({ controls }: { controls: ToolControls }) {
+  return (
+    <Button
+      variant="ghost"
+      size="icon"
+      onClick={controls.openModelMapping}
+      title="模型映射"
+    >
+      <Network className="h-4 w-4" />
     </Button>
   )
 }
