@@ -239,12 +239,31 @@ pub fn get_context_window_size(model: &str) -> i32 {
 
 /// 是否为已确认接受 `additionalModelRequestFields.output_config` 的模型。
 ///
+/// 三态语义（对应 `ModelRow.supports_reasoning`）：先查注册表里该 upstream_id
+/// 对应行的 `supportsReasoning`——`Some(true)`/`Some(false)` 是管理员或
+/// customModels 导入显式声明的能力，直接采信；`None`（内置模型的常态，
+/// 无需逐个补字段）回落到下面的硬编码判断，改造前后行为逐一致。
+///
+/// `model_id` 是 `resolve()` 之后的 upstream_id（见 `convert_request_with_mode`
+/// 第 1 步），不是客户端原始请求名，所以这里按 upstream_id 查表。
+fn model_supports_native_reasoning(model_id: &str) -> bool {
+    if let Some(row) = super::model_registry::current_registry().row_by_upstream(model_id)
+        && let Some(supports) = row.supports_reasoning
+    {
+        return supports;
+    }
+    model_supports_native_reasoning_builtin(model_id)
+}
+
+/// 硬编码的内置判断，`model_supports_native_reasoning` 在注册表未显式声明时
+/// 的回落逻辑。
+///
 /// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6 接受
 /// `output_config`。Claude 5 系（fable-5 / mythos-5 / sonnet-5 / opus-5 / claude-5）
 /// 与 xhigh 能力一致，一并视为支持。其余（4.5 系、haiku、sonnet-4.8 等）保守视为
 /// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
 /// 若后续实测某模型 400，从这里去除即可。
-fn model_supports_native_reasoning(model_id: &str) -> bool {
+fn model_supports_native_reasoning_builtin(model_id: &str) -> bool {
     let m = model_id.to_ascii_lowercase();
     matches!(
         m.as_str(),
@@ -3458,6 +3477,89 @@ mod tests {
         assert_eq!(err.to_string(), "模型已禁用: claude-opus-4-6");
 
         install_registry(ModelRegistry::builtin());
+    }
+
+    /// `supportsReasoning = Some(true)` 让一个内置硬编码判断不支持的模型
+    /// 通过原生 reasoning 判定——registry 的显式声明必须比硬编码优先。
+    #[test]
+    fn registry_supports_reasoning_true_overrides_builtin_unsupported() {
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        assert!(
+            !model_supports_native_reasoning_builtin("claude-sonnet-4.8"),
+            "前置条件：sonnet-4.8 硬编码判断本应不支持"
+        );
+
+        let mut r = ModelRegistry::builtin();
+        for row in r.rows_mut() {
+            if row.upstream_id == "claude-sonnet-4.8" {
+                row.supports_reasoning = Some(true);
+            }
+        }
+        install_registry(r);
+
+        assert!(
+            model_supports_native_reasoning("claude-sonnet-4.8"),
+            "显式 supportsReasoning=true 应让本不支持的模型通过判定"
+        );
+
+        install_registry(ModelRegistry::builtin());
+    }
+
+    /// `supportsReasoning = Some(false)` 让一个内置硬编码支持的模型被显式关掉。
+    #[test]
+    fn registry_supports_reasoning_false_overrides_builtin_supported() {
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        assert!(
+            model_supports_native_reasoning_builtin("claude-opus-4.8"),
+            "前置条件：opus-4.8 硬编码判断本应支持"
+        );
+
+        let mut r = ModelRegistry::builtin();
+        for row in r.rows_mut() {
+            if row.upstream_id == "claude-opus-4.8" {
+                row.supports_reasoning = Some(false);
+            }
+        }
+        install_registry(r);
+
+        assert!(
+            !model_supports_native_reasoning("claude-opus-4.8"),
+            "显式 supportsReasoning=false 应让本支持的模型被关掉"
+        );
+
+        install_registry(ModelRegistry::builtin());
+    }
+
+    /// `supportsReasoning = None`（内置行的默认值）必须与改造前的硬编码判断
+    /// 逐一致——这是「内置模型不用逐个补字段」承诺的回归基线。
+    #[test]
+    fn registry_none_falls_back_to_builtin_and_matches_pre_change_behavior() {
+        // 不装表：内置默认注册表所有行 supports_reasoning 皆为 None，
+        // current_registry() 恒定读到内置默认，天然验证回落路径。
+        for m in [
+            "claude-opus-4.6",
+            "claude-opus-4.7",
+            "claude-opus-4.8",
+            "claude-sonnet-4.6",
+            "claude-fable-5",
+            "claude-sonnet-5",
+            "claude-sonnet-4.8",
+            "claude-sonnet-4.5",
+            "claude-opus-4.5",
+            "claude-haiku-4.5",
+        ] {
+            assert_eq!(
+                model_supports_native_reasoning(m),
+                model_supports_native_reasoning_builtin(m),
+                "{m}: registry 命中 None 时应与硬编码判断逐一致"
+            );
+        }
     }
 
     /// 转换结果必须携带窗口，供响应处理阶段使用（避免热重载导致映射/计量不一致）

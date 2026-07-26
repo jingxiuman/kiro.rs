@@ -635,6 +635,12 @@ export interface ModelRow {
   /** 额外的子串匹配关键字（只读，后端内置） */
   matchSubstrings?: string[]
   /**
+   * 是否支持原生 reasoning / `output_config`。三态：`true`/`false` 是显式声明；
+   * 字段缺失（`undefined`）表示未设置，运行时回落到内置硬编码判断。与
+   * `enabled`/`sortOrder`/`matchKind` 同组，不受自动同步管辖，不显示锁图标。
+   */
+  supportsReasoning?: boolean
+  /**
    * 这一行能否被删除，只读，响应期计算。与后端 `DELETE /models/{upstreamId}`
    * 的判据同源，不与 `origin` 等价：PATCH 一个内置模型会在覆盖层落一条
    * `origin = 'manual'` 的行，但它本质仍是内置模型、仍不可删。删除按钮的
@@ -720,6 +726,14 @@ export interface PatchModelRequest {
   enabled?: boolean
   sortOrder?: number
   matchKind?: MatchKind
+  /**
+   * 是否支持原生 reasoning / `output_config`。要清回「跟随内置默认」（即把
+   * 后端字段变回 `None`）需要传 `supportsReasoning: undefined` 且
+   * `supportsReasoningSet: true`——只传 `undefined` 的 `supportsReasoning`
+   * 而不带 `Set` 标记，后端视为「本次不改这个字段」。
+   */
+  supportsReasoning?: boolean
+  supportsReasoningSet?: boolean
   /** 解除锁定的字段名，使其回归自动同步 */
   unpin?: string[]
 }

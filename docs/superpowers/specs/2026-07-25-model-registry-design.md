@@ -43,6 +43,7 @@ src/kiro/token_manager.rs:627  拉取上游
 
 1. **不做按凭据/按分组的差异化映射表。** 映射发生在选凭据之前（`handlers.rs:694` 先 `convert_request_with_mode()`，之后才由 provider 层注入 `profile_arn`），改为 per-credential 需重构请求主链路时序。
 2. 不做模型能力矩阵（vision / tool use / effort 支持）。`model_supports_native_reasoning()` / `model_supports_xhigh_effort()` 保持不变。
+   > **修订（2026-07-26）**：`model_supports_xhigh_effort()` 仍未改动；`model_supports_native_reasoning()` 新增单点例外——先查 `ModelRow.supportsReasoning`（三态），命中 `Some` 才采信显式值，否则回落原硬编码判断。这不是能力矩阵的开端：矩阵意味着为 vision/tool use/effort 等每个维度都建字段化的通用机制，这里只加了 reasoning 一个维度、一个布尔字段。加它的理由是上游 PR #46 的 `customModels[].supportsReasoning` 证明了真实存在的运营需求（同步/导入进来的新模型需要能单独声明是否携带 `output_config`，而不是等下一次发版改硬编码表）；没有新的诉求出现前，不再类推着为其他维度也加字段。
 3. 不引入新 crate（`parking_lot`、`chrono`、`rusqlite` 均已在依赖内）。
 4. 不做 `models.json` 的自动 schema 迁移（见 §4.5）。
 
@@ -197,6 +198,7 @@ src/anthropic/websearch_loop.rs:200 web-search 循环
 | `pinned` | 已人工编辑、同步时逐字段跳过的字段名 |
 | `missingSyncRounds` | 连续多少轮**权威**同步未见于上游 |
 | `credentialSupport` | `凭据 id → 该凭据可用 upstreamId 列表`，同步时顺带记录（零额外请求），供 §6.6 调度过滤 |
+| `supportsReasoning` | 是否支持原生 reasoning / `additionalModelRequestFields.output_config`。**三态**：`true`/`false` 是显式声明（来自管理员 PATCH，或旧版 `config.json` `customModels[].supportsReasoning` 的启动时导入），直接采信；缺省 `None` 回落到 `converter.rs::model_supports_native_reasoning` 的硬编码判断——内置模型不用逐个补字段，行为零回归。**同步不管**：`ListAvailableModels` 不返回这个信息，没有数据源可覆盖它，因此与 `enabled`/`sortOrder`/`matchKind` 同组——本地策略字段，不在 `SYNC_MANAGED_FIELDS`、不参与 `pinned`、UI 不显示锁图标（详见修订说明） |
 
 > **`contextWindow` 与 `maxOutputTokens` 必须是两个字段。** 二者语义不同且数值差一个数量级：`gpt-5.6-sol` 的 `Model.max_tokens` 是 `64000`（输出），而 `get_context_window_size()` 返回 `272000`（输入）。v1 用单一 `contextWindow` 同时喂两处，会把 `/v1/models` 的输出上限错报成输入窗口。
 

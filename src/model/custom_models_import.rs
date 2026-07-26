@@ -35,6 +35,18 @@ pub struct ImportPlan {
     pub skipped: Vec<SkippedCustomModel>,
 }
 
+/// 降级态（`models.json` 校验失败、已退回内置默认运行）下是否应跳过本轮导入。
+///
+/// **根因**：判重（`plan_import` 的 upstreamId/exposedId 冲突检测）基于**当次
+/// 装载的 registry**。若这次装载是校验失败后的降级态，`effective_rows` 只是
+/// 内置默认表，不包含用户 `models.json` 里已有的行——据此算出的「无冲突」结论
+/// 是假的：下次 `models.json` 恢复正常后，刚才在降级态写入的行可能与其中的
+/// 既有行冲突，或凭一份不完整的视图产生本不该发生的自动写入。降级态下唯一
+/// 安全的动作是什么都不做，等人工把 `models.json` 修好。
+pub fn should_skip_import_when_degraded(degraded_reason: &Option<String>) -> bool {
+    degraded_reason.is_some()
+}
+
 /// 根据 `customModels` 列表与**当前有效行集**（内置 ⊕ models.json 覆盖后的
 /// 最终结果）计算导入计划。
 ///
@@ -231,5 +243,20 @@ mod tests {
         let plan = plan_import(&[cm], &[], now());
 
         assert_eq!(plan.rows_to_add[0].supports_reasoning, Some(true));
+    }
+
+    /// 降级态（`degraded_reason` 非 None）必须跳过导入：判重用的 `effective_rows`
+    /// 只是内置默认表，不是用户 `models.json` 的真实内容，任何这时算出的「无冲突」
+    /// 结论都不可信。
+    #[test]
+    fn skips_import_when_registry_is_degraded() {
+        assert!(should_skip_import_when_degraded(&Some(
+            "models.json 版本号不受支持".to_string()
+        )));
+    }
+
+    #[test]
+    fn does_not_skip_import_when_registry_is_healthy() {
+        assert!(!should_skip_import_when_degraded(&None));
     }
 }

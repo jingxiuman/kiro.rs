@@ -3449,7 +3449,8 @@ pub fn apply_model_patch(
         let names: Vec<&str> = req.extra.keys().map(|k| k.as_str()).collect();
         return Err(AdminServiceError::InvalidModelField(format!(
             "以下字段不可写（只读或未知）: {}。可写字段: exposedId、displayName、\
-             contextWindow、maxOutputTokens、exposeThinkingVariant、enabled、sortOrder、matchKind",
+             contextWindow、maxOutputTokens、exposeThinkingVariant、enabled、sortOrder、\
+             matchKind、supportsReasoning",
             names.join("、")
         )));
     }
@@ -3510,7 +3511,10 @@ pub fn apply_model_patch(
         row.expose_thinking_variant = v;
         pin(row, "exposeThinkingVariant");
     }
-    // 以下三个字段同步流程不覆盖，不需要 pin（见 PATCHABLE_PINNED_FIELDS 注释）
+    // 以下四个字段同步流程不覆盖，不需要 pin（见 PATCHABLE_PINNED_FIELDS 注释）：
+    // enabled/sortOrder/matchKind 是既有的本地策略；supportsReasoning 同理——
+    // 同步的数据源（ListAvailableModels）不返回这个信息，加进 pin 名单只会让
+    // 它永远显示解不开的锁，且没有任何东西会去解它。
     if let Some(v) = req.enabled {
         row.enabled = v;
     }
@@ -3519,6 +3523,12 @@ pub fn apply_model_patch(
     }
     if let Some(v) = req.match_kind {
         row.match_kind = v;
+    }
+    // 用 `supportsReasoningSet` 标出「本次确实要动这个字段」，而不是直接看
+    // `supports_reasoning.is_some()`——否则「清回跟随内置默认」（值本身是 None）
+    // 就永远无法通过 PATCH 表达，只能靠直接改 models.json。
+    if req.supports_reasoning_set {
+        row.supports_reasoning = req.supports_reasoning;
     }
 
     for field in &req.unpin {
@@ -4240,6 +4250,101 @@ mod model_registry_tests {
         let _ = std::fs::remove_file(&path);
         // sync_once 会 install_registry 到全局 holder：必须还原，
         // 否则 800K 的 opus 窗口会漏给后面依赖内置默认的测试（converter 侧）。
+        crate::anthropic::model_registry::install_registry(ModelRegistry::builtin());
+    }
+
+    /// PATCH `supportsReasoning` 不进 pinned——它与 `enabled`/`sortOrder`/
+    /// `matchKind` 同组：本地策略开关，同步没有数据源覆盖它，pin 了只会在 UI
+    /// 上留一个永远解不开的锁。
+    #[test]
+    fn patch_supports_reasoning_does_not_pin() {
+        let mut row = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        assert_eq!(row.supports_reasoning, None, "前置条件：内置行默认未设置");
+
+        let req = PatchModelRequest {
+            supports_reasoning: Some(false),
+            supports_reasoning_set: true,
+            ..Default::default()
+        };
+        apply_model_patch(&mut row, &req).unwrap();
+
+        assert_eq!(row.supports_reasoning, Some(false));
+        assert!(
+            !row.pinned.contains(&"supportsReasoning".to_string()),
+            "supportsReasoning 不应自动进 pinned"
+        );
+
+        // supportsReasoningSet 标出「清回 None」，而不是 Option<bool> 字段本身
+        // 缺省时的「不改」语义。
+        let clear_req = PatchModelRequest {
+            supports_reasoning: None,
+            supports_reasoning_set: true,
+            ..Default::default()
+        };
+        apply_model_patch(&mut row, &clear_req).unwrap();
+        assert_eq!(row.supports_reasoning, None, "supportsReasoningSet 应能清回未设置");
+    }
+
+    /// PATCH `supportsReasoning` 后跑一轮同步，值不应被抹掉——同步的数据源
+    /// （`ListAvailableModels`）根本不携带这个信息，因此它必须走「用户专属
+    /// 字段覆盖层始终胜出」这条路径，而不是「同步管辖字段仅 pinned 时保留」。
+    #[tokio::test]
+    async fn supports_reasoning_survives_a_sync_round() {
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "kiro-admin-models-supports-reasoning-sync-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(ModelRegistryStore::new(path.clone()));
+
+        store
+            .mutate(|f| {
+                patch_model_in_file(
+                    f,
+                    "claude-opus-4.8",
+                    &PatchModelRequest {
+                        supports_reasoning: Some(false),
+                        supports_reasoning_set: true,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+
+        let fetcher = Arc::new(StubFetcher {
+            models: vec![UpstreamModel {
+                model_id: "claude-opus-4.8".to_string(),
+                model_name: Some("Claude Opus 4.8".to_string()),
+                max_input_tokens: Some(1_000_000),
+            }],
+        });
+        let sync = ModelSyncService::new(Arc::clone(&store), fetcher);
+        sync.sync_once(Some(1), Utc::now()).await.unwrap();
+
+        let out = store.load();
+        let row = out
+            .registry
+            .rows()
+            .iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        assert_eq!(
+            row.supports_reasoning,
+            Some(false),
+            "supportsReasoning 不应被同步抹掉"
+        );
+
+        let _ = std::fs::remove_file(&path);
         crate::anthropic::model_registry::install_registry(ModelRegistry::builtin());
     }
 

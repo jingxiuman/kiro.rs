@@ -101,9 +101,12 @@ pub struct ModelRow {
     #[serde(default)]
     pub match_substrings: Vec<String>,
     /// 是否支持原生 reasoning / `output_config`（来自旧版 `config.json`
-    /// `customModels[].supportsReasoning` 的导入值）。**本字段目前只存不读**——
-    /// `model_supports_native_reasoning` 尚未查它，接入是后续任务的事。
-    /// 缺省不写入 JSON，保持 `models.json` 对老文件的兼容。
+    /// `customModels[].supportsReasoning` 的导入值，或管理员 PATCH）。
+    /// 三态：`Some(true)`/`Some(false)` 是显式声明，直接采信；`None` 回落到
+    /// `converter.rs::model_supports_native_reasoning` 的硬编码判断——内置模型
+    /// 不需要逐个补这个字段。同步（ListAvailableModels）不返回这个信息，不受
+    /// 自动同步管辖（不在 `SYNC_MANAGED_FIELDS`，同 `enabled`/`sortOrder` 一组，
+    /// 不参与 pin）。缺省不写入 JSON，保持 `models.json` 对老文件的兼容。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_reasoning: Option<bool>,
 }
@@ -312,6 +315,9 @@ fn overlay_onto_builtin(builtin: &ModelRow, overlay: ModelRow, sync_touched: boo
     out.enabled = overlay.enabled;
     out.sort_order = overlay.sort_order;
     out.match_kind = overlay.match_kind;
+    // supportsReasoning 同理：同步（ListAvailableModels）不返回这个信息，没有
+    // 数据源可覆盖，只可能来自人工 PATCH 或 customModels 导入，覆盖层始终胜出。
+    out.supports_reasoning = overlay.supports_reasoning;
     // origin 决定 UI 上的来源徽章，必须反映「这一行被人动过/被同步写过」。
     out.origin = overlay.origin;
     out.pinned = overlay.pinned.clone();
@@ -603,7 +609,10 @@ impl ModelRegistry {
         self.aliases = aliases;
     }
 
-    fn row_by_upstream(&self, upstream_id: &str) -> Option<&ModelRow> {
+    /// 按 upstream_id 精确查行。`pub(crate)`：`converter.rs` 的
+    /// `model_supports_native_reasoning` 需要按解析后的 upstream_id 查
+    /// `supportsReasoning`，不走 `resolve()` 的九步匹配（那是给客户端请求名用的）。
+    pub(crate) fn row_by_upstream(&self, upstream_id: &str) -> Option<&ModelRow> {
         self.rows.iter().find(|r| r.upstream_id == upstream_id)
     }
 

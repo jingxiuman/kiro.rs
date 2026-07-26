@@ -267,11 +267,14 @@ async fn main() {
     let model_sync_settings = std::sync::Arc::new(parking_lot::RwLock::new(
         admin::ModelSyncSettings::from_config(&config),
     ));
+    // 供下方 customModels 导入判断降级态用；outcome 本身作用域到本块结束。
+    let model_registry_degraded_reason: Option<String>;
     {
         let outcome = model_store.load();
         if let Some(reason) = &outcome.degraded_reason {
             tracing::error!("模型表降级运行（使用内置默认）: {}", reason);
         }
+        model_registry_degraded_reason = outcome.degraded_reason.clone();
         // 调度层的凭据过滤靠这份记录；不灌就永远走「无记录 → 放行」，等于没生效。
         token_manager.set_credential_support(outcome.file.credential_support);
         anthropic::model_registry::install_registry(outcome.registry);
@@ -293,7 +296,17 @@ async fn main() {
     // 一次，转换成 Manual 行写入 models.json，此后完全由注册表接管。
     // 每次启动都跑这一步，但只在「注册表里确实还没有对应行」时才真正写盘，
     // 因此天然幂等：已导入过的条目下次会在 plan_import 里全部落进 skipped。
-    if !config.custom_models.is_empty() {
+    if !config.custom_models.is_empty()
+        && model::custom_models_import::should_skip_import_when_degraded(
+            &model_registry_degraded_reason,
+        )
+    {
+        tracing::warn!(
+            "模型表当前处于降级态（{}），跳过本轮 customModels 导入——降级态下 \
+             effective_rows 只是内置默认表，据此判重不可信，等 models.json 修好后再启动一次即可",
+            model_registry_degraded_reason.as_deref().unwrap_or("未知原因")
+        );
+    } else if !config.custom_models.is_empty() {
         let effective_rows: Vec<_> =
             anthropic::model_registry::current_registry().rows().to_vec();
         let plan = model::custom_models_import::plan_import(

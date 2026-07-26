@@ -516,6 +516,17 @@ pub struct PatchModelRequest {
     pub enabled: Option<bool>,
     pub sort_order: Option<i32>,
     pub match_kind: Option<crate::anthropic::model_registry::MatchKind>,
+    /// 是否支持原生 reasoning / `output_config`。三态：`Some(true)`/`Some(false)`
+    /// 显式声明，`None` 回落内置判断。与 `probeCredentialId`/`probeCredentialIdSet`
+    /// 同一模式：`supportsReasoning` 单独出现无法区分「不改」与「清回 None」，
+    /// 靠 `supportsReasoningSet` 显式标出「本次请求确实要动这个字段」。
+    /// 与 `enabled`/`sortOrder`/`matchKind` 同组：本地策略开关，同步
+    /// （ListAvailableModels）不返回这个信息、无数据源覆盖它，因此不进
+    /// pinned、UI 不显示锁图标。
+    #[serde(default)]
+    pub supports_reasoning: Option<bool>,
+    #[serde(default)]
+    pub supports_reasoning_set: bool,
     /// 解除锁定的字段名，使其回归自动同步
     #[serde(default)]
     pub unpin: Vec<String>,

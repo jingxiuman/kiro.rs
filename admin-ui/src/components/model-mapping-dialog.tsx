@@ -382,6 +382,7 @@ function ModelRowCard({ row }: { row: ModelRow }) {
           disabled={busy}
           onApply={apply}
         />
+        <ReasoningField row={row} disabled={busy} onApply={apply} />
       </div>
 
       {row.status === 'deprecated' && (
@@ -593,6 +594,66 @@ function NumberField({
         currentValue={{ [field]: value }}
         onApply={onApply}
       />
+    </div>
+  )
+}
+
+/**
+ * 「原生思考」三态开关：跟随内置默认（未设置） / 开 / 关。
+ *
+ * 控制的是向上游是否携带 `thinking`/`additionalModelRequestFields.output_config`
+ * 原生 reasoning 字段——不是本地「思考变体」（-thinking 暴露名，纯前端展示层面
+ * 的东西）。`undefined` 表示这一行没有显式声明，运行时按内置硬编码表判断；
+ * 选「跟随默认」会显式发一次「清回未设置」的 PATCH（而不是本地不发请求），
+ * 这样才能把已经显式设置过的值收回去。
+ */
+function ReasoningField({
+  row,
+  disabled,
+  onApply,
+}: {
+  row: ModelRow
+  disabled?: boolean
+  onApply: (patch: PatchModelRequest) => void
+}) {
+  const current = row.supportsReasoning // undefined | true | false
+
+  const OPTIONS: { key: 'default' | 'on' | 'off'; label: string; patch: PatchModelRequest }[] = [
+    { key: 'default', label: '跟随默认', patch: { supportsReasoningSet: true, supportsReasoning: undefined } },
+    { key: 'on', label: '开', patch: { supportsReasoningSet: true, supportsReasoning: true } },
+    { key: 'off', label: '关', patch: { supportsReasoningSet: true, supportsReasoning: false } },
+  ]
+  const active = current === undefined ? 'default' : current ? 'on' : 'off'
+
+  return (
+    <div className="flex items-center gap-2 sm:col-span-2">
+      <label
+        className="w-24 shrink-0 text-[11px] text-muted-foreground"
+        title="是否向上游携带原生 thinking / output_config 字段。未设置时按模型硬编码的兼容表判断"
+      >
+        原生思考
+      </label>
+      <div className="flex items-center gap-0.5 rounded-full border border-border/60 p-0.5">
+        {OPTIONS.map((opt) => (
+          <button
+            key={opt.key}
+            type="button"
+            disabled={disabled}
+            onClick={() => active !== opt.key && onApply(opt.patch)}
+            className={
+              'rounded-full px-2.5 py-0.5 text-[11px] transition-colors disabled:opacity-50 ' +
+              (active === opt.key
+                ? 'bg-primary text-primary-foreground'
+                : 'text-muted-foreground hover:text-foreground')
+            }
+          >
+            {opt.label}
+          </button>
+        ))}
+      </div>
+      <span className="text-[11px] text-muted-foreground">
+        控制是否向上游发送原生 reasoning（thinking / output_config）请求字段
+      </span>
     </div>
   )
 }
