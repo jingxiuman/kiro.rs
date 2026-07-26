@@ -1601,9 +1601,16 @@ pub async fn get_model_registry(State(state): State<AdminState>) -> impl IntoRes
 }
 
 /// POST /api/admin/models/sync
-/// 手动同步，返回 diff 摘要（新增 / 更新 / 标记 deprecated / 轮次类型）
-pub async fn sync_models(State(state): State<AdminState>) -> impl IntoResponse {
-    match state.service.sync_models().await {
+/// 手动同步，返回 diff 摘要（新增 / 更新 / 标记 deprecated / 轮次类型 / 护栏状态）
+///
+/// `?force=true` 强制放行一次消失判定：比例护栏触发时，同步会暂停消失判定并等人
+/// 确认（spec §6.3 第四版 —— 探针误配与真实大批退役在数据上无法区分）。运维确认
+/// 探针无误后带上这个参数跑一轮。缺省 false，绝不是默认行为。
+pub async fn sync_models(
+    State(state): State<AdminState>,
+    Query(query): Query<super::types::SyncModelsQuery>,
+) -> impl IntoResponse {
+    match state.service.sync_models(query.force).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => e.into_http_response(),
     }

@@ -75,11 +75,14 @@ export function useDeleteAlias() {
 
 /**
  * 手动同步。返回的是 diff 摘要而非全表，所以这里只能失效查询触发重新拉取。
+ *
+ * `mutate(true)` 对应强制放行一次消失判定（`?force=true`），供护栏横幅上的
+ * 「确认并强制执行」按钮使用；不传或传 `false` 就是普通的「立即同步」。
  */
 export function useSyncModels() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: syncModels,
+    mutationFn: (force: boolean) => syncModels(force),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: MODEL_REGISTRY_KEY })
     },

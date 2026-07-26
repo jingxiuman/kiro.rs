@@ -685,6 +685,15 @@ export interface ModelRegistryResponse {
   credentialSupportCovered: number
   /** 启用中的凭据总数 */
   credentialTotal: number
+  /**
+   * 最近一轮同步是否因「单轮标记比例护栏」暂停了消失判定（spec §6.3 第四版）。
+   * 从 syncState.source 解码而来，服务重启、定时同步（不经 admin 层）之后
+   * 仍能看见——不暴露这个字段，系统会长期处于「同步天天成功、消失判定其实
+   * 已停机」而无人知晓的状态。
+   */
+  disappearanceCheckSkipped: boolean
+  /** 触发护栏判据的实际缺失比例（0.0~1.0）。未跳过时为 0 */
+  missingRatio: number
 }
 
 /** `POST /models/sync` 的 diff 摘要 */
@@ -696,6 +705,9 @@ export interface SyncSummary {
   deprecated: number
   trusted: boolean
   source: string
+  /** 本轮是否因护栏暂停了消失判定（新增/更新照常进行） */
+  disappearanceCheckSkipped: boolean
+  missingRatio: number
 }
 
 /** `PATCH /models/{upstreamId}` 请求体。只列可写字段 */
