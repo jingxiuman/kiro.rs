@@ -137,7 +137,8 @@ src/anthropic/websearch_loop.rs:200 web-search 循环
 
 - `modelSyncEnabled` 缺省 `false` —— 保证零行为回归。
 - `modelSyncTime` 缺省 `"04:00"`；校验与时区语义复用既有实现（`admin/service.rs:209` 校验 hh:mm 范围，`:923` 使用本地时区）。
-- `config.json` 写入经**新增的 config 写 mutex** 串行化。既有写路径（`admin/service.rs:1236`）是无保护的 load-modify-save，本设计顺带修掉这一类丢失更新。
+- `config.json` 写入经**新增的 config 写 mutex** 串行化 —— **仅覆盖本设计新增的 `set_model_sync_settings` 路径**。
+  > 实现期修正：原文曾写「本设计顺带修掉这一类丢失更新」，这是写过头了。既有的 6 处 `update_config_file` 调用点仍是无保护的 load-modify-save；把它们纳入同一把锁需要将若干同步方法改成 async 并连带修改 `admin/handlers.rs`，范围远超本设计。该问题是改造前既有行为、非本次引入的回归，列为已知限制（§12）。
 
 ### 4.2 模型表（`models.json`）
 
@@ -319,6 +320,13 @@ enum Resolution {
 | 上游有、表内无 | 新增行：`origin=synced`、`enabled=true`、`status=active`、`matchKind=exact`、`exposedId` 按 §4.4 派生、`contextWindow` = `maxInputTokens` 经 §6.4 校验后取值、`maxOutputTokens` = 同族内置默认或 64000、`sortOrder` = 当前最大值 + 10 |
 | 两侧都有 | 逐字段更新**非 `pinned`** 字段；`missingSyncRounds = 0`；`lastSeenAt = now`；若原 `status = deprecated` 则**复活为 `active`** |
 | 表内有、上游无（**仅权威轮次**） | `missingSyncRounds += 1`；达阈值 `M = 2` → `status = deprecated`。**永不删行** |
+
+> **「表内有」指的是有效行集 = 内置默认 ∪ 覆盖层，不是 `file.models` 单独。** 实现期修正：原文只写「表内有」，实现者合理地读成了覆盖层文件里的行，后果是**最该被标 deprecated 的老内置模型永远标不上** —— 它们不在 `file.models` 里，消失判定遍历不到。同一根因还导致首轮同步把全部内置模型计为「新增」，让 `/models/sync` 的 diff 摘要失真。
+> 正确做法：diff 基线取 `ModelRegistry::from_file(file.clone())?.rows()` 的有效行集；对不在 `file.models` 里的内置行，按需在覆盖层补写一行以承载 `missingSyncRounds` / `status`。新行的 `sortOrder` 基线同理要取内置 ∪ 覆盖层的最大值，否则会与内置行撞号。
+>
+> **返回空列表的凭据不得写入 `credentialSupport` 记录。** 空列表已被规则「不可信轮次」判为不可信信号，若仍持久化成一条空记录，按 §6.6 的过滤语义（有记录则要求包含目标模型）就等于断言「该凭据不支持任何模型」，一次 token 抖动会把凭据永久踢出轮换。实现上应 `if models.is_empty() { continue; }` 后再记录。
+>
+> **乱序保护必须解析时间戳后比较，不得用 RFC3339 字符串字典序。** 时区偏移会双向破坏单调性：负偏移导致漏挡（旧观测覆盖新观测），正偏移导致误挡（同步在偏移时长内全部停摆）。`models.json` 是人可编辑的配置文件，写成 `...Z` 或本地偏移即触发。解析失败时按「无记录」放行。
 
 ### 6.4 数值与并集冲突
 
