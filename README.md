@@ -121,7 +121,7 @@ docker compose logs --tail=200 kiro-rs
 指定镜像版本：
 
 ```bash
-KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.7.1 docker compose up -d
+KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.7.2 docker compose up -d
 ```
 
 ### 下载二进制
@@ -549,7 +549,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `opus` + `4-5` / `4.5` | `claude-opus-4.5` |
 | 任意 `haiku` | `claude-haiku-4.5` |
 
-没有命中上述规则的模型会作为不支持模型处理。
+没有命中上述规则、且不在下文「自定义模型」表中的模型会作为不支持模型处理。
 
 上下文窗口估算：
 
@@ -624,6 +624,14 @@ Admin API：`GET/POST /api/admin/models`、`PATCH/DELETE /api/admin/models/{upst
 3. **护栏 3 的 error 日志按同步周期重复打印，无去重。** 探针配错是一个持续状态，不是一次性事件，因此每轮都会刷一条。看到重复日志请去改探针凭据，而不是当噪音忽略。
 4. **`config.json` 既有的 6 处写入点仍是无保护的 load-modify-save**，并发写有丢失更新的可能。这是本次改造之前就存在的行为，不是新引入的；本次只把新增的 `PATCH /models/settings` 路径纳入了锁保护。`models.json` 自身的所有写路径都经写锁串行化。
 5. **「同步成功后刷新 `credentialSupport`」缺端到端验证。** 测试环境没有可用的上游凭据，`sync_once` 在选凭据阶段就会失败。启动时的灌入路径已实测，同步写入侧有单测，但这条链路整体未跑通过。
+
+### 自定义模型（`customModels`，已迁移至模型注册表）
+
+`config.json` 里的 `customModels` 数组是**旧版**自定义模型映射机制，字段含义（`id`/`backendId`/`displayName`/`contextWindow`/`maxTokens`/`supportsReasoning`/`ownedBy`）与以前一致，但**不再由它直接驱动路由**——现在由上面的[模型注册表](#model-registry)统一管理。
+
+启动时，若 `customModels` 非空，程序会把其中**注册表里还不存在**（按 `backendId` 对应的 `upstreamId` 或 `id` 对应的 `exposedId` 判断）的条目自动导入为 `models.json` 里的一条人工（Manual）行；已存在同名条目的则跳过、不覆盖注册表里的编辑（注册表以 Admin UI / API 的修改为准）。这个导入每次启动都会执行，但只在首次真正写入 —— 已导入过的条目第二次会被跳过，`models.json` 不再变化。
+
+**建议**：新部署直接用 Admin UI（凭据管理页顶栏「模型映射」）或 `POST /api/admin/models` 添加自定义模型，不必再写 `customModels`。这个配置项只是为了让老配置文件平滑过渡，后续版本可能移除。
 
 <a id="thinking-tools-websearch"></a>
 ## Thinking、工具与 WebSearch
@@ -862,7 +870,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 构建并推送 Docker Hub 多架构镜像。
 - 创建 GitHub Release。
 
-当前稳定版：[v0.7.1](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.7.1)。
+当前稳定版：[v0.7.2](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.7.2)。
 
 Docker 镜像：
 

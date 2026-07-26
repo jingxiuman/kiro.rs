@@ -287,6 +287,59 @@ async fn main() {
         );
     }
 
+    // ---- 旧版 customModels → 模型注册表的启动时一次性导入 ----
+    // 决策：不保留 PR #46 引入的独立 customModels 运行时映射机制（已被模型
+    // 注册表整体取代）；customModels 字段仅用于兼容老配置文件，在这里被消费
+    // 一次，转换成 Manual 行写入 models.json，此后完全由注册表接管。
+    // 每次启动都跑这一步，但只在「注册表里确实还没有对应行」时才真正写盘，
+    // 因此天然幂等：已导入过的条目下次会在 plan_import 里全部落进 skipped。
+    if !config.custom_models.is_empty() {
+        let effective_rows: Vec<_> =
+            anthropic::model_registry::current_registry().rows().to_vec();
+        let plan = model::custom_models_import::plan_import(
+            &config.custom_models,
+            &effective_rows,
+            chrono::Utc::now(),
+        );
+        for skipped in &plan.skipped {
+            tracing::info!(
+                "customModels 条目已跳过（不覆盖模型注册表）: id={}, backendId={}, 原因={}",
+                skipped.id,
+                skipped.backend_id,
+                skipped.reason
+            );
+        }
+        if !plan.rows_to_add.is_empty() {
+            let added_count = plan.rows_to_add.len();
+            match model_store
+                .mutate(|file| {
+                    file.models.extend(plan.rows_to_add.clone());
+                    Ok(())
+                })
+                .await
+            {
+                Ok(file) => match anthropic::model_registry::ModelRegistry::from_file(file) {
+                    Ok(registry) => {
+                        anthropic::model_registry::install_registry(registry);
+                        tracing::info!(
+                            "customModels 已导入模型注册表（新增 {} 行）；建议迁移到 admin UI 管理，\
+                             该配置项后续版本可能移除",
+                            added_count
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("customModels 导入后重新装载模型表失败: {}，本次导入不生效", e);
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("customModels 导入写入 models.json 失败: {}", e);
+                }
+            }
+        } else {
+            tracing::info!("customModels 已全部存在于模型注册表，无需导入");
+        }
+    }
+
     // 同步服务：定时调度器与 admin 的手动触发端点共用同一个实例（同一把写锁串行化）。
     let model_sync_service = std::sync::Arc::new(anthropic::model_sync::ModelSyncService::new(
         model_store.clone(),

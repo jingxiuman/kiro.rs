@@ -3685,6 +3685,7 @@ fn create_model_in_file(
         missing_sync_rounds: 0,
         last_seen_at: None,
         match_substrings: Vec::new(),
+        supports_reasoning: None,
         upstream_id,
         match_kind,
     };

@@ -30,6 +30,43 @@ pub enum ToolCompatibilityMode {
     Raw,
 }
 
+/// 自定义模型定义。
+///
+/// 用户在 `config.json` 的 `customModels` 数组里声明客户端模型别名到 Kiro 后端
+/// 模型 ID 的映射及元数据。运行期由 [`crate::model::custom_models`] 全局注册表按
+/// `id`（大小写不敏感）精确匹配，优先于内置的模糊映射逻辑——既能新增模型，也能
+/// 覆盖内置模型的映射。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomModel {
+    /// 客户端请求时使用的模型名（别名）。匹配大小写不敏感。
+    pub id: String,
+
+    /// 映射到的 Kiro 后端模型 ID（实际下发给上游）。
+    pub backend_id: String,
+
+    /// `/v1/models` 展示名（可选，缺省用 `id`）。
+    #[serde(default)]
+    pub display_name: Option<String>,
+
+    /// 上下文窗口大小（可选，缺省 200000）。
+    #[serde(default)]
+    pub context_window: Option<i32>,
+
+    /// 单次响应最大 token 数，用于 `/v1/models` 展示（可选，缺省 64000）。
+    #[serde(default)]
+    pub max_tokens: Option<i32>,
+
+    /// 是否支持原生 reasoning / `output_config`（可选，缺省 false）。
+    /// 命中的自定义模型置 true 时，会按 backend_id 放行 `additionalModelRequestFields`。
+    #[serde(default)]
+    pub supports_reasoning: Option<bool>,
+
+    /// `/v1/models` 的 `owned_by` 字段（可选，缺省 "custom"）。
+    #[serde(default)]
+    pub owned_by: Option<String>,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -197,6 +234,15 @@ pub struct Config {
     #[serde(default)]
     pub allow_unknown_model_passthrough: bool,
 
+    /// 自定义模型映射表（兼容旧版 config.json 配置项）。
+    ///
+    /// **已被模型注册表（`models.json` / admin UI）取代**：启动时一次性把这里
+    /// 未在注册表中出现的条目导入为 Manual 行（见
+    /// [`crate::model::custom_models_import`]），此后以注册表为准。保留此字段
+    /// 只是为了不让老配置文件在升级后直接报错；新部署请直接用 admin UI 管理模型。
+    #[serde(default)]
+    pub custom_models: Vec<CustomModel>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -318,6 +364,7 @@ impl Default for Config {
             model_sync_time: default_model_sync_time(),
             model_sync_probe_credential_id: None,
             allow_unknown_model_passthrough: false,
+            custom_models: Vec::new(),
             config_path: None,
         }
     }

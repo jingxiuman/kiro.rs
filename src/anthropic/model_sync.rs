@@ -536,6 +536,7 @@ impl ModelSyncService {
                         missing_sync_rounds: 0,
                         last_seen_at: Some(seen_at.clone()),
                         match_substrings: Vec::new(),
+                        supports_reasoning: None,
                     };
 
                     let existing_idx = file.models.iter().position(|r| &r.upstream_id == upstream_id);

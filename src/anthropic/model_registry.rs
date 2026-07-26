@@ -100,6 +100,12 @@ pub struct ModelRow {
     /// （旧行为是 None）。
     #[serde(default)]
     pub match_substrings: Vec<String>,
+    /// 是否支持原生 reasoning / `output_config`（来自旧版 `config.json`
+    /// `customModels[].supportsReasoning` 的导入值）。**本字段目前只存不读**——
+    /// `model_supports_native_reasoning` 尚未查它，接入是后续任务的事。
+    /// 缺省不写入 JSON，保持 `models.json` 对老文件的兼容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_reasoning: Option<bool>,
 }
 
 /// 手动别名。生命周期与 models 不同：models 会被同步覆盖，aliases 只属于人工。
@@ -139,6 +145,7 @@ pub fn builtin_rows() -> Vec<ModelRow> {
         missing_sync_rounds: 0,
         last_seen_at: None,
         match_substrings: Vec::new(),
+        supports_reasoning: None,
     };
     let claude = |upstream: &str,
                   exposed: &str,
@@ -172,6 +179,7 @@ pub fn builtin_rows() -> Vec<ModelRow> {
             }
             _ => Vec::new(),
         },
+        supports_reasoning: None,
     };
 
     vec![
@@ -196,6 +204,7 @@ pub fn builtin_rows() -> Vec<ModelRow> {
             missing_sync_rounds: 0,
             last_seen_at: None,
             match_substrings: Vec::new(),
+            supports_reasoning: None,
         },
         // ---- 顺序与改造前 available_models() 完全一致 ----
         gpt("gpt-5.6-sol", "GPT-5.6 Sol", 10),
