@@ -322,7 +322,14 @@ enum Resolution {
 | 表内有、上游无（**仅权威轮次**） | `missingSyncRounds += 1`；达阈值 `M = 2` → `status = deprecated`。**永不删行** |
 
 > **「表内有」指的是有效行集 = 内置默认 ∪ 覆盖层，不是 `file.models` 单独。** 实现期修正：原文只写「表内有」，实现者合理地读成了覆盖层文件里的行，后果是**最该被标 deprecated 的老内置模型永远标不上** —— 它们不在 `file.models` 里，消失判定遍历不到。同一根因还导致首轮同步把全部内置模型计为「新增」，让 `/models/sync` 的 diff 摘要失真。
-> 正确做法：diff 基线取 `ModelRegistry::from_file(file.clone())?.rows()` 的有效行集；对不在 `file.models` 里的内置行，按需在覆盖层补写一行以承载 `missingSyncRounds` / `status`。新行的 `sortOrder` 基线同理要取内置 ∪ 覆盖层的最大值，否则会与内置行撞号。
+> 正确做法：diff 基线取 `ModelRegistry::from_file(file.clone())?.rows()` 的有效行集。新行的 `sortOrder` 基线同理要取内置 ∪ 覆盖层的最大值，否则会与内置行撞号。
+>
+> **同步元数据不得写进 `models` 数组。** 二次修正：本节原先写「对不在 `file.models` 里的内置行，按需在覆盖层补写一行以承载 `missingSyncRounds` / `status`」—— 这个处方是错的。`from_file` 的叠加语义是 `*existing = incoming`（**整行替换**，非逐字段合并），所以一旦内置行被补写进 `file.models`，它就成了那一刻的**完整冻结快照**：后续版本在代码里修改该行的 `contextWindow` / `displayName` 对已有部署**完全失效**，`models.json` 也从「稀疏的人工覆盖」退化成「内置表的全量副本」。实测首个权威轮次即写入 14 行 `origin=Builtin` 快照。
+> 正确做法：`missingSyncRounds` / `status` / `lastSeenAt` 是**纯同步元数据**，应存在 `syncState` 下的 `modelMeta: { <upstreamId>: { missingSyncRounds, status, lastSeenAt } }`，与 `models` 数组解耦。解析时由 `ModelRegistry` 把元数据叠加到有效行集上，而不是把行复制进覆盖层。
+>
+> **`matchKind == "prefix"` 的行必须排除在消失判定之外。** 上游的 `modelId` 永远不可能等于 `gpt-5`（它是家族通配符，不是真实模型），参与判定会导致**每次部署都确定性地误标 Deprecated**。
+>
+> **消失判定需要一道「单轮标记比例」护栏。** 规则 1 防的是「网络抖动把全表刷成 deprecated」，但探针配置错误（例如把低订阅等级的凭据设为探针）会从另一条路径造成同样后果 —— 实测探针只返回 1 个模型时，第 2 个权威轮次把 14/14 内置行全部标记。当单轮缺失行数超过有效行集的 50% 时，应判定为「探针可能不具代表性」，**跳过本轮消失判定并打 error 级日志**，而不是照单执行。
 >
 > **返回空列表的凭据不得写入 `credentialSupport` 记录。** 空列表已被规则「不可信轮次」判为不可信信号，若仍持久化成一条空记录，按 §6.6 的过滤语义（有记录则要求包含目标模型）就等于断言「该凭据不支持任何模型」，一次 token 抖动会把凭据永久踢出轮换。实现上应 `if models.is_empty() { continue; }` 后再记录。
 >
