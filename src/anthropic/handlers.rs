@@ -659,9 +659,15 @@ async fn handle_stream_request(
     let credential_id = call_result.credential_id;
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
+    let mut ctx = StreamContext::new_with_thinking(
+        model,
+        input_tokens,
+        context_window,
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+    );
     ctx.cache_usage = cache_usage;
-    ctx.context_window = context_window;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1448,12 +1454,12 @@ async fn handle_stream_request_buffered(
     let mut ctx = BufferedStreamContext::new(
         model,
         fallback_input_tokens,
+        context_window,
         thinking_enabled,
         tool_name_map,
         known_tool_names,
     );
     ctx.set_cache_usage(cache_usage);
-    ctx.set_context_window(context_window);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);

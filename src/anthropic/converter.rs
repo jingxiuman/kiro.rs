@@ -199,6 +199,12 @@ Complete all chunked operations without commentary.";
 /// 签名保持不变，既有调用点与测试无需改动。
 /// 注意：无法表达「命中但被禁用」——需要区分时用
 /// `model_registry::current_registry().resolve(...)`。
+///
+/// **本函数已无生产调用方，仅为既有测试保留**（生产链路一律直接用
+/// `current_registry().resolve(...)`，因为它还能区分 Disabled/Unknown）。
+/// 用 `#[cfg(test)]` 门禁而不只是写句注释：注释挡不住下一个人，编译门禁能——
+/// 谁要在生产代码里再引一次表，会直接编不过。
+#[cfg(test)]
 pub fn map_model(model: &str) -> Option<String> {
     use super::model_registry::{allow_passthrough, current_registry, Resolution};
     match current_registry().resolve(model, allow_passthrough()) {
@@ -214,8 +220,14 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 改造后查 `ModelRegistry`。**这是输入窗口，与 `/v1/models` 的
 /// `max_tokens`（输出上限）是两个不同的量。**
 ///
-/// 保留此函数是为了兼容既有测试；请求主链路应使用
-/// `ConversionResult.context_window`（单请求内只取一次快照，见 spec §3.3）。
+/// **本函数已无生产调用方，仅为既有测试保留。** 请求主链路一律使用
+/// `ConversionResult.context_window`：窗口在请求入口随模型一起解析一次，
+/// 向下传给 `StreamContext` / 非流式与 web-search 路径（spec §3.3）。
+/// 响应处理阶段再查一次表会导致热重载时「用旧表映射、用新表计量」。
+///
+/// 同 `map_model`，用 `#[cfg(test)]` 门禁把这条约束交给编译器执行，
+/// 而不是指望后来者读到这段注释。
+#[cfg(test)]
 pub fn get_context_window_size(model: &str) -> i32 {
     use super::model_registry::{allow_passthrough, current_registry, Resolution};
     match current_registry().resolve(model, allow_passthrough()) {

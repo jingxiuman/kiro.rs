@@ -292,18 +292,27 @@ enum Resolution {
 
 ### 5.3 解析顺序
 
+实现期核验（`model_registry.rs::resolve`）发现比本节 v2 初稿多一步真实存在的宽松匹配规则，且 `prefix` 步骤的位置与初稿不同（初稿排在 `matchSubstrings` 之后，实现排在归一化 `upstreamId` 匹配之**前**，理由见步骤 4 下方说明）。以下为与代码一致的最终 9 步：
+
 1. `aliases.from` 精确命中 → 取其 `to` 指向的行
 2. `exposedId` 精确命中
 3. `{exposedId}-thinking` 命中 **且该行 `exposeThinkingVariant == true`**
-4. 规范化后与 **`upstreamId`** 精确命中
+4. `matchKind == "prefix"` 的行按 `exposedId` 做前缀匹配，最长前缀优先；`upstream_id` = **请求名原样**（规范化前、仅小写）
+   > 必须排在「归一化后匹配 `upstreamId`」（第 5 步）**之前**：归一化会剥掉日期后缀（如 `-20250929`），但 `gpt-5.6-sol-20250929` 这类 `gpt-5*` 请求必须原样透传、日期不能丢——若归一化先跑，日期已被剥掉，第 4 步命中时上游 id 就不再是原始请求名。claude 系没有 prefix 行，不受此调整影响。
+5. 规范化后与 **`upstreamId`** 精确命中
    > 规范化的产物形态恰好就是上游 id 的形态（点号版本段），所以这一步对 `upstreamId` 匹配、而非 `exposedId`。这是必需的：`claude-opus-4-5`（不带日期后缀）今天能用（`map_model` 走 `contains("4-5")`），但表里的 `exposedId` 是 `claude-opus-4-5-20251101`；只有规范化到 `claude-opus-4.5` 再匹配 `upstreamId` 才能保住它。
-5. `matchSubstrings` 命中（请求名小写后包含其中任一子串）→ 取该行
-6. `matchKind == "prefix"` 的行按 `exposedId` 做前缀匹配，最长前缀优先；`upstream_id` = **请求名原样**（规范化前、仅小写）
-7. `allowUnknownModelPassthrough == true` → `Passthrough`（规范化后名字，窗口 200K）
-8. 否则 `Rejected(Unknown)`
+6. `matchSubstrings` 命中（请求名小写后包含其中任一子串）→ 取该行
+7. **家族 + 版本宽松匹配**（v2 初稿遗漏、实现期补上）：复现旧 `map_model` 对 sonnet/opus 4.x 系列 `contains(家族) && contains(版本)` 的语义，用于容忍 Bedrock/Vertex 风格前缀（`anthropic.claude-opus-4-8`）、`-latest`/`-preview`/`@日期` 等后缀、以及省略 `claude-` 前缀的简写（`opus-4.8`）。规则完全从 `upstreamId` 派生，不新增数据字段：
+   - 仅对 `upstreamId` 以 `claude-` 开头、且最后一段形如 `<数字>.<数字>` 的行启用（如 `claude-opus-4.8` 的 `"4.8"`）；**刻意排除无点号的版本段**（`claude-sonnet-5`/`claude-fable-5` 的 `"5"`）——若把单段数字也当版本号，`contains("sonnet") && contains("5")` 会让 `claude-3-5-sonnet` 被误判为 sonnet 5 代（旧行为是 `None`）；这些行的宽松别名已由第 6 步 `matchSubstrings` 单独覆盖。
+   - 家族关键字 = `upstreamId` 按 `-` 切分的第 2 段（`claude-opus-4.8` → `"opus"`）。
+   - 版本形态两种（点号 `"4.8"` / 连字符 `"4-8"`），命中其一即可。
+   - 多行都命中时按 `sortOrder` 升序取第一个。
+   - 已知可接受差异：旧代码 opus 分支判断顺序为 `4-8 → 4-7 → 4-5 → 4-6`，这里按 `sortOrder`（即 `4.8 → 4.7 → 4.6 → 4.5`）；仅当输入同时包含两个不同版本号的病态请求（如 `claude-opus-4-5-4-6`）时结果才会不同。
+8. `allowUnknownModelPassthrough == true` → `Passthrough`（规范化后名字，窗口 200K）
+9. 否则 `Rejected(Unknown)`
 
-**「thinking 变体被关闭」的拒绝必须延后到第 6 步之后再生效。** 即：第 3/4 步发现请求名带 `-thinking` 而命中行 `exposeThinkingVariant == false` 时，**记下这个待定拒绝但继续往下走**；只有第 5、6 步都没命中，才返回 `Rejected(Unknown)`。
-> 否则 `gpt-5.6-sol-thinking` 会在第 4 步被 gpt 精确行的 `exposeThinkingVariant: false` 拦掉，走不到第 6 步的 prefix 透传——而旧代码对任何 `gpt-5` 开头的名字一律原样透传（`converter.rs:234` 的 `starts_with("gpt-5") => Some(model_lower)`，不做 `-thinking` 剥离）。`claude-opus-4-8-thinking` 在变体关闭时仍然正确返回 `Unknown`，因为它既无 `matchSubstrings` 也无 prefix 行可命中。
+**「thinking 变体被关闭」的拒绝必须延后到第 7 步之后再生效。** 即：第 3/5/7 步发现请求名带 `-thinking` 而命中行 `exposeThinkingVariant == false`（或该行本身 `enabled == false`，此时直接 `Rejected(Disabled)`，优先级高于「变体未开启」）时，**记下这个待定拒绝但继续往下走**；只有第 4/6/7 步都没能提供兜底命中，才返回 `Rejected(Unknown)`。
+> 否则 `gpt-5.6-sol-thinking` 会在第 5 步被 gpt 精确行的 `exposeThinkingVariant: false` 拦掉，走不到第 4 步已经跳过、也走不到后续兜底——而旧代码对任何 `gpt-5` 开头的名字一律原样透传（`converter.rs:234` 的 `starts_with("gpt-5") => Some(model_lower)`，不做 `-thinking` 剥离）。`claude-opus-4-8-thinking` 在变体关闭时仍然正确返回 `Unknown`，因为它既无 `matchSubstrings` 也无 prefix 行、宽松匹配同样会命中同一行的门禁。第 7 步的宽松匹配尤其需要显式过一遍 thinking 门禁：它不看 `-thinking` 后缀，若不重复判定会把第 3/5 步已记下的「变体关闭」待定拒绝悄悄绕过。
 
 补充规则：
 
@@ -313,6 +322,7 @@ enum Resolution {
 - **`prefix` 行是 `gpt-5*` 通配的落点。** 内置默认含一行 `{ upstreamId: "gpt-5", matchKind: "prefix", exposedId: "gpt-5", contextWindow: 272000, listed: false }`，复现 `converter.rs:234` 现有的 `starts_with("gpt-5")` 原样透传语义（返回值为**小写后的请求名原样**，与现有 `Some(model_lower)` 一致）。
   该行 `listed: false`，否则 `/v1/models` 会多出一个并不存在的 `gpt-5` 条目——而三个真实的 `gpt-5.6-sol` / `-terra` / `-luna` 仍以 `matchKind: "exact"` 行存在于列表中（`handlers.rs:388-412`）。
   > v1 只有精确/规范化匹配 + 默认关闭的 passthrough，**无法复现现有 `gpt-5*` 通配**，是行为回归。
+- **用户新增的 `prefix` 行会遮蔽第 5 步的归一化 `upstreamId` 匹配。** 因为 `prefix` 匹配（第 4 步）排在归一化匹配（第 5 步）之前，如果管理员新增一条 `matchKind: "prefix"`、`exposedId` 恰好是某个已有 `upstreamId` 前缀的行（例如新增 `exposedId: "claude-opus-4"` 的 prefix 行），它会抢在 `claude-opus-4.8` 之类精确行的归一化匹配之前命中，把请求错误地导向这条新 prefix 行而非原本期望的精确行。新增 prefix 行时必须确认其 `exposedId` 不会与任何现有 `upstreamId`/`exposedId` 产生前缀重叠；未来若要加固，可在加载校验阶段对此做显式冲突检测（当前未做，属已知限制）。
 
 ## 6. 同步流程
 
@@ -508,6 +518,7 @@ if is_opus && !credentials.supports_opus() { return false; }
 2. **不支持 schema 自动迁移**：`version != 1` 直接拒绝并退回内置默认。
 3. **`create_router_with_provider` 需调用方先初始化 registry**：未初始化时退回内置默认（不 panic），需在文档注释中写明。
 4. **`config.json` 与 `models.json` 是两个文件**：settings 与模型表分处两地，需分别备份。
+5. **新增 `prefix` 行与既有 `upstreamId` 的前缀冲突未做加载期校验**：见 §5.3「用户新增 prefix 行会遮蔽归一化 upstreamId 匹配」——管理员需自行避免新增 prefix 行的 `exposedId` 与现有行前缀重叠，加载校验阶段当前不拦截此类配置错误。
 
 ## 13. v1 → v2 修订记录
 

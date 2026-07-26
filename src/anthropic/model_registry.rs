@@ -350,20 +350,73 @@ pub const PASSTHROUGH_CONTEXT_WINDOW: i32 = 200_000;
 /// `MessagesRequest.model` 由客户端控制，无界集合可被打爆内存。
 const PASSTHROUGH_WARN_CACHE_CAP: usize = 64;
 
-static PASSTHROUGH_WARN_CACHE: LazyLock<RwLock<Vec<String>>> =
-    LazyLock::new(|| RwLock::new(Vec::new()));
+/// 去重集合溢出后的 warn 节流间隔（spec §7.2「超出后按分钟节流」）。
+const PASSTHROUGH_FLOOD_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// 记录一次 passthrough 命中；同名模型只 warn 一次，集合满则整体清空重来
-/// （等价于粗粒度节流，避免无界增长）。
+/// passthrough warn 的进程级去重 + 节流状态。三个字段必须在同一把锁下读改，
+/// 否则「判定该不该 warn」与「记下已经 warn 过」会撕裂。
+struct PassthroughWarnState {
+    /// 已 warn 过的模型名，容量上限 `PASSTHROUGH_WARN_CACHE_CAP`。
+    seen: Vec<String>,
+    /// 上次发出「溢出汇总 warn」的时刻；`None` 表示还没发过。
+    last_flood_warn_at: Option<std::time::Instant>,
+    /// 自上次汇总 warn 以来被抑制掉的命中次数，随汇总 warn 一起吐出并清零。
+    suppressed_since_flood_warn: u64,
+    /// 本进程实际发出的 warn 条数。生产侧不读，只为测试能断言「写放大被抑制」——
+    /// 日志条数本身没有别的可观测出口。一次 u64 自增，开销可忽略。
+    emitted: u64,
+}
+
+static PASSTHROUGH_WARN_STATE: LazyLock<RwLock<PassthroughWarnState>> = LazyLock::new(|| {
+    RwLock::new(PassthroughWarnState {
+        seen: Vec::new(),
+        last_flood_warn_at: None,
+        suppressed_since_flood_warn: 0,
+        emitted: 0,
+    })
+});
+
+/// 记录一次 passthrough 命中：同名模型只 warn 一次；集合满之后**不清空**，
+/// 改为按分钟节流。
+///
+/// 为什么不能「满了就清空」（改造前的做法）：模型名由客户端控制，只要它轮转
+/// 使用 65 个不同的名字，第 65 个就会把整个集合清掉，于是下一轮 64 个名字全都
+/// 命中不了去重，再次逐个 warn —— 去重彻底失效，6500 次调用产生 6500 条 warn，
+/// 成了客户端可驱动的日志写放大。保留集合、对溢出部分按分钟节流，两个目标
+/// （内存有界 / 日志有界）才同时成立。
 pub fn note_passthrough_model(model: &str) {
-    let mut cache = PASSTHROUGH_WARN_CACHE.write();
-    if cache.iter().any(|m| m == model) {
+    let mut state = PASSTHROUGH_WARN_STATE.write();
+    if state.seen.iter().any(|m| m == model) {
         return;
     }
-    if cache.len() >= PASSTHROUGH_WARN_CACHE_CAP {
-        cache.clear();
+
+    if state.seen.len() >= PASSTHROUGH_WARN_CACHE_CAP {
+        state.suppressed_since_flood_warn += 1;
+        let now = std::time::Instant::now();
+        let due = state
+            .last_flood_warn_at
+            .is_none_or(|last| now.duration_since(last) >= PASSTHROUGH_FLOOD_WARN_INTERVAL);
+        if !due {
+            return;
+        }
+        state.last_flood_warn_at = Some(now);
+        let suppressed = std::mem::take(&mut state.suppressed_since_flood_warn);
+        state.emitted += 1;
+        // 先放锁再打日志：tracing 的订阅者可能很慢，不该把它压在全局写锁里。
+        drop(state);
+        tracing::warn!(
+            "passthrough 未收录模型过多（去重集合已满 {} 个），近一分钟内另有 {} 次未收录命中被合并；\
+             窗口一律按 {} 估算。模型名由客户端控制，出现此日志通常意味着有客户端在乱发模型名",
+            PASSTHROUGH_WARN_CACHE_CAP,
+            suppressed,
+            PASSTHROUGH_CONTEXT_WINDOW
+        );
+        return;
     }
-    cache.push(model.to_string());
+
+    state.seen.push(model.to_string());
+    state.emitted += 1;
+    drop(state);
     tracing::warn!(
         "模型 {} 未在映射表中，走透传，窗口按 {} 估算",
         model,
@@ -373,7 +426,27 @@ pub fn note_passthrough_model(model: &str) {
 
 #[cfg(test)]
 pub fn passthrough_warn_cache_len() -> usize {
-    PASSTHROUGH_WARN_CACHE.read().len()
+    PASSTHROUGH_WARN_STATE.read().seen.len()
+}
+
+/// 本进程累计实际发出的 passthrough warn 条数。
+#[cfg(test)]
+pub fn passthrough_warn_emitted_count() -> u64 {
+    PASSTHROUGH_WARN_STATE.read().emitted
+}
+
+/// 清空 passthrough warn 的全部进程级状态。
+///
+/// 去重集合满了之后就**不会**再自行缩小（这正是节流的前提），因此对它做
+/// 「读—改—验」的测试必须先归零，否则断言结果取决于同进程内谁先跑。
+/// 调用方需持有 `MODEL_GLOBALS_TEST_LOCK`。
+#[cfg(test)]
+pub fn reset_passthrough_warn_state() {
+    let mut state = PASSTHROUGH_WARN_STATE.write();
+    state.seen.clear();
+    state.last_flood_warn_at = None;
+    state.suppressed_since_flood_warn = 0;
+    state.emitted = 0;
 }
 
 /// 规范化模型名。产物形态恰好是上游 id 的形态（点号版本段），
@@ -905,6 +978,21 @@ static REGISTRY: LazyLock<RwLock<Arc<ModelRegistry>>> =
 /// 未收录模型是否放行透传。默认 false（保留「模型名写错」的快速失败信号）。
 static ALLOW_PASSTHROUGH: LazyLock<RwLock<bool>> = LazyLock::new(|| RwLock::new(false));
 
+// 测试期的**线程本地**透传开关覆盖，与 `REGISTRY_OVERRIDE` 同构、同理由。
+//
+// 为什么它也必须线程本地：这个开关是 `resolve()` 的第二个入参
+// （`converter.rs` 的 map_model / get_context_window_size / convert 三处都读它），
+// 翻它等于改变**所有**并行测试看到的解析结果。converter.rs 里大量
+// `assert_eq!(map_model("gpt-4"), None)` 这类断言依赖它为 false —— 一旦哪条测试
+// 把进程级全局翻成 true，那些断言就变成抛硬币，而且失败信息里不会有任何线索
+// 指向这个开关。今天没有测试调用 `set_allow_passthrough` 纯属侥幸，本分支已经
+// 在注册表上吃过一次「约定挡不住下一个人」的亏，不再靠约定第二次。
+#[cfg(test)]
+thread_local! {
+    static ALLOW_PASSTHROUGH_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 // 测试期的**线程本地**注册表覆盖。生产构建里这个 thread_local 根本不存在。
 //
 // 为什么需要它：测试之间想同时持有**不同**的注册表，而进程级全局只有一份。
@@ -968,11 +1056,42 @@ pub fn install_registry(registry: ModelRegistry) {
     }
 }
 
+/// 设置未收录模型是否放行透传。
+///
+/// **生产语义**：写进程级全局。**测试语义**：只写调用线程的覆盖，进程级全局在整个
+/// 测试进程里恒为 false —— 与 `install_registry` 完全同构，理由见
+/// `ALLOW_PASSTHROUGH_OVERRIDE` 与本函数内那条断言。
 pub fn set_allow_passthrough(allow: bool) {
-    *ALLOW_PASSTHROUGH.write() = allow;
+    #[cfg(test)]
+    {
+        // 与 `install_registry` 同一条守卫断言，拦的是同一件事：本函数也被生产代码
+        // 路径调用（`admin::service::set_model_sync_settings`、`main.rs` 启动），
+        // 若某天有测试从另一条线程驱动它，覆盖会落在那条线程上——测试自己看不见
+        // （表现为「设了却没生效」），而 tokio 工作线程是池化复用的，覆盖还会泄漏
+        // 给后续测试。守卫只可能在测试线程上创建，所以「本线程持有守卫」恰好等价于
+        // 「覆盖落在了正确的、用完即销毁的线程上」。
+        assert!(
+            test_lock::held_by_current_thread(),
+            "set_allow_passthrough() 必须在持有 MODEL_GLOBALS_TEST_LOCK 的情况下调用。\
+             测试期它写的是**线程本地覆盖**，不持守卫说明要么忘了取，要么这次调用\
+             发生在测试线程之外（多线程运行时的工作线程），后者会让开关对测试不可见\
+             并泄漏给复用该线程的其他测试。修法：在测试开头加一行\n\
+             let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());"
+        );
+        ALLOW_PASSTHROUGH_OVERRIDE.with(|c| c.set(Some(allow)));
+    }
+    #[cfg(not(test))]
+    {
+        *ALLOW_PASSTHROUGH.write() = allow;
+    }
 }
 
 pub fn allow_passthrough() -> bool {
+    // 测试期先查本线程的覆盖；生产构建里这段代码不存在，无任何额外开销。
+    #[cfg(test)]
+    if let Some(overridden) = ALLOW_PASSTHROUGH_OVERRIDE.with(|c| c.get()) {
+        return overridden;
+    }
     *ALLOW_PASSTHROUGH.read()
 }
 
@@ -985,14 +1104,15 @@ pub fn allow_passthrough() -> bool {
 ///    这份 warn 去重集合是货真价实的进程级全局，没有也不需要线程本地化；
 ///    `passthrough_warn_dedup_is_bounded` / `passthrough_warn_dedups_same_model`
 ///    对它做「读—改—验」，彼此必须互斥，否则断言随机失败。
-/// 2. **给线程本地注册表覆盖划定作用域**：`Drop` 时清掉本线程的覆盖。
+/// 2. **给线程本地覆盖划定作用域**：`Drop` 时清掉本线程的注册表覆盖
+///    （`REGISTRY_OVERRIDE`）与透传开关覆盖（`ALLOW_PASSTHROUGH_OVERRIDE`）。
 ///    libtest 为每条测试单开线程（已实测：rustc 1.96.1 下
 ///    `--test-threads=1/4/默认` 三种模式、300 条测试，线程 id 无一复用），
 ///    覆盖本来也会随线程销毁；显式清理是不依赖 libtest 实现细节的那道保险，
 ///    也让「同一条测试里先装表、后段再看内置默认」成为可能。
-/// 3. **作为 `install_registry` 断言的凭据**：守卫在构造时给当前线程打标记
-///    （见 `test_lock::HELD`），`install_registry` 断言这个标记存在。它拦的是
-///    「装表发生在测试线程之外」——见那条断言处的注释。
+/// 3. **作为 `install_registry` / `set_allow_passthrough` 断言的凭据**：守卫在
+///    构造时给当前线程打标记（见 `test_lock::HELD`），这两个写全局的入口都断言
+///    这个标记存在。它拦的是「写发生在测试线程之外」——见那两条断言处的注释。
 ///
 /// ## 它**不**守护什么
 ///
@@ -1068,6 +1188,8 @@ pub(crate) mod test_lock {
             // 嵌套持有时（HELD > 1）也直接清空：本项目不存在嵌套取守卫的用法，
             // 与其维护一个覆盖栈，不如让语义保持「守卫作用域结束 = 无覆盖」。
             super::REGISTRY_OVERRIDE.with(|c| *c.borrow_mut() = None);
+            // 透传开关的线程本地覆盖同理：作用域结束 = 回到进程默认（false）。
+            super::ALLOW_PASSTHROUGH_OVERRIDE.with(|c| c.set(None));
             HELD.with(|c| c.set(c.get() - 1));
         }
     }
@@ -1601,6 +1723,7 @@ mod tests {
     #[test]
     fn passthrough_warn_dedup_is_bounded() {
         let _guard = MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_passthrough_warn_state();
         // 客户端可控的 model 字段意味着无界去重集合可被打爆内存
         for i in 0..200 {
             note_passthrough_model(&format!("unknown-model-{}", i));
@@ -1611,6 +1734,7 @@ mod tests {
     #[test]
     fn passthrough_warn_dedups_same_model() {
         let _guard = MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_passthrough_warn_state();
         let before = passthrough_warn_cache_len();
         note_passthrough_model("some-unique-model-for-dedup-test");
         let after_first = passthrough_warn_cache_len();
@@ -1618,6 +1742,61 @@ mod tests {
         let after_second = passthrough_warn_cache_len();
         assert_eq!(after_first, before + 1, "首次应记入");
         assert_eq!(after_second, after_first, "重复不应再记入");
+    }
+
+    /// M1：透传开关的测试期覆盖必须是线程本地的，且随守卫作用域结束而消失。
+    ///
+    /// 守护的损失：这个开关是 `resolve()` 的入参，翻成 true 会让 converter.rs 里
+    /// 一大批 `map_model("gpt-4") == None` 断言在并行下随机失败，且没有任何提示
+    /// 指向它。这里正面验证「装了生效 / 出作用域即失效」，避免下一个人以为
+    /// 直接写全局也没关系。
+    #[test]
+    fn allow_passthrough_override_is_scoped_to_guard() {
+        {
+            let _guard = MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!allow_passthrough(), "默认必须是 false");
+            set_allow_passthrough(true);
+            assert!(allow_passthrough(), "覆盖必须对本线程生效");
+            // 生效范围仅限本线程的覆盖：进程级全局始终没被写过。
+            assert!(!*ALLOW_PASSTHROUGH.read(), "测试期不得写进程级全局");
+        }
+        assert!(!allow_passthrough(), "守卫作用域结束后必须回到默认 false");
+    }
+
+    /// spec §7.2 的分钟级节流：去重集合满了之后必须**节流**，不是清空重来。
+    ///
+    /// 这条测试守护的是一次真实回归：改造前「满 64 就 clear」，只要客户端轮转
+    /// 使用 65 个名字，去重就永远命中不了 —— 实测 6500 次调用产生 6500 条 warn，
+    /// 是客户端可驱动的日志写放大。
+    #[test]
+    fn passthrough_warn_throttles_flood_of_rotating_names() {
+        let _guard = MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_passthrough_warn_state();
+
+        // 65 = 容量上限 + 1，恰好是旧实现「每轮都被清空」的最小触发规模
+        let names: Vec<String> = (0..65).map(|i| format!("flood-model-{}", i)).collect();
+        let rounds = 100;
+        for _ in 0..rounds {
+            for name in &names {
+                note_passthrough_model(name);
+            }
+        }
+        let total_calls = (rounds * names.len()) as u64;
+        assert_eq!(total_calls, 6500);
+
+        let emitted = passthrough_warn_emitted_count();
+        // 上界：64 个名字各一条 + 溢出汇总条（本测试远快于 1 分钟，只会有 1 条；
+        // 留 2 条余量以防 CI 极端卡顿跨过节流窗口）。
+        assert!(
+            emitted <= PASSTHROUGH_WARN_CACHE_CAP as u64 + 2,
+            "6500 次调用只应产生 <= {} 条 warn，实际 {}",
+            PASSTHROUGH_WARN_CACHE_CAP + 2,
+            emitted
+        );
+        // 下界：不能靠「一条都不发」来达标，溢出必须有汇总告警。
+        assert!(emitted > PASSTHROUGH_WARN_CACHE_CAP as u64, "溢出后应有汇总 warn，实际 {}", emitted);
+        // 集合仍然有界，且没有被清空。
+        assert_eq!(passthrough_warn_cache_len(), PASSTHROUGH_WARN_CACHE_CAP);
     }
 
     /// N1：同步元数据挂在 syncState.modelMeta 下，解析时按 upstreamId 叠加到
