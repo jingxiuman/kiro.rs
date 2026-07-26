@@ -1432,15 +1432,24 @@ impl AdminService {
     /// 原因原样带回给 UI —— 这些都是需要人看到具体原因才能处理的情况。
     pub async fn sync_models(
         &self,
+        force_disappearance_check: bool,
     ) -> Result<crate::admin::types::SyncSummaryResponse, AdminServiceError> {
-        use crate::anthropic::model_sync::RoundKind;
+        use crate::anthropic::model_sync::{RoundKind, SyncOptions};
 
         let service = self.model_sync_service.as_ref().ok_or_else(|| {
             AdminServiceError::InternalError("模型同步服务未初始化".to_string())
         })?;
         let probe = self.model_sync_settings().probe_credential_id;
+        if force_disappearance_check {
+            // 强制放行会真的把模型标成 deprecated，留一条谁都能查到的痕迹。
+            tracing::warn!("运维显式强制放行一次消失判定（POST /models/sync?force=true）");
+        }
         let summary = service
-            .sync_once(probe, Utc::now())
+            .sync_once_with(
+                probe,
+                Utc::now(),
+                SyncOptions { force_disappearance_check },
+            )
             .await
             .map_err(|e| AdminServiceError::InternalError(format!("模型同步失败: {}", e)))?;
 
@@ -1461,6 +1470,8 @@ impl AdminService {
             deprecated: summary.deprecated,
             trusted: summary.trusted,
             source: summary.source,
+            disappearance_check_skipped: summary.disappearance_check_skipped,
+            missing_ratio: summary.missing_ratio,
         })
     }
 
@@ -1474,9 +1485,29 @@ impl AdminService {
         &self,
         req: SetModelSyncSettingsRequest,
     ) -> Result<ModelSyncSettings, AdminServiceError> {
-        // 校验时间格式，复用既有解析器
+        // M1：白名单之外的键一律拒绝。serde 默认静默丢弃未知字段，实测
+        // `{"allowUnknownModelPassthrough":true}`（config.json 里的真实键名）
+        // 返回 200 却什么都没改 —— 用户会以为开关已经打开。
+        if !req.extra.is_empty() {
+            let names: Vec<&str> = req.extra.keys().map(|k| k.as_str()).collect();
+            return Err(AdminServiceError::InvalidModelField(format!(
+                "以下字段未知: {}。可写字段: enabled、time、probeCredentialId\
+                 （配合 probeCredentialIdSet）、allowPassthrough",
+                names.join("、")
+            )));
+        }
+
+        // 校验时间格式，复用既有解析器。
+        // M2：解析器的错误文案属于「二进制自动更新」那条路径（凭据无效: 自动更新时间…），
+        // 用在这里会把「模型同步时间」说成「凭据无效」，排查方向直接被带偏。
+        // 这里改挂 §8 为模型字段准备的 InvalidModelField，并换成本路径的措辞。
         if let Some(time) = req.time.as_deref() {
-            parse_auto_apply_time(time)?;
+            parse_auto_apply_time(time).map_err(|_| {
+                AdminServiceError::InvalidModelField(format!(
+                    "模型同步时间无效：{}（应为 HH:MM，HH 0-23，MM 0-59）",
+                    time
+                ))
+            })?;
         }
 
         // 串行化 config.json 的 load-modify-save，避免并发写丢失更新
@@ -3569,6 +3600,17 @@ fn create_model_in_file(
     use crate::anthropic::model_registry::{MatchKind, ModelOrigin, ModelRow, ModelStatus};
     use crate::anthropic::model_sync::{derive_exposed_id, derive_thinking_variant};
 
+    // M1：未知字段一律拒绝（与 PATCH 同一处理）。静默丢弃会让「字段名写错」
+    // 表现成 200 成功，而值根本没进表 —— 用户下次看到的是「我明明设过了」。
+    if !req.extra.is_empty() {
+        let names: Vec<&str> = req.extra.keys().map(|k| k.as_str()).collect();
+        return Err(AdminServiceError::InvalidModelField(format!(
+            "以下字段不可写（只读或未知）: {}。可写字段: upstreamId、exposedId、displayName、\
+             contextWindow、maxOutputTokens、exposeThinkingVariant、enabled、sortOrder、matchKind",
+            names.join("、")
+        )));
+    }
+
     let upstream_id = req.upstream_id.trim().to_string();
     if upstream_id.is_empty() {
         return Err(AdminServiceError::InvalidModelField(
@@ -3780,10 +3822,23 @@ fn build_model_registry_response(
         })
         .count();
 
+    // 护栏结论编码在 syncState.source 里（定时同步不经 admin 层、重启会丢内存态，
+    // 唯有落盘的字段能让 UI 持续看见「消失判定已停机」）。这里拆成两个显式字段，
+    // 并把 source 还原成干净的来源串给 UI 展示。
+    let mut sync_state = out.file.sync_state;
+    let (clean_source, disappearance_check_skipped, missing_ratio) = sync_state
+        .source
+        .as_deref()
+        .map(crate::anthropic::model_sync::decode_source)
+        .unwrap_or_else(|| (String::new(), false, 0.0));
+    if sync_state.source.is_some() {
+        sync_state.source = Some(clean_source);
+    }
+
     ModelRegistryResponse {
         models,
         aliases: out.registry.aliases().to_vec(),
-        sync_state: out.file.sync_state,
+        sync_state,
         settings: ModelSyncSettingsResponse {
             enabled: settings.enabled,
             time: settings.time,
@@ -3794,6 +3849,8 @@ fn build_model_registry_response(
         degraded_reason: out.degraded_reason,
         credential_support_covered,
         credential_total: enabled_credential_ids.len(),
+        disappearance_check_skipped,
+        missing_ratio,
     }
 }
 
@@ -4303,7 +4360,7 @@ mod model_registry_tests {
         assert_eq!(before.id, 1, "同步前：1 号无记录、优先级更高，应被选中");
 
         // ---- 跑一轮真同步（走的是 /models/sync 的生产路径）----
-        let summary = service.sync_models().await.expect("同步应成功");
+        let summary = service.sync_models(false).await.expect("同步应成功");
         assert_eq!(summary.round, "authoritative");
         assert!(summary.trusted);
 
@@ -4364,6 +4421,76 @@ mod model_registry_tests {
             .rows()
             .iter()
             .any(|r| r.exposed_id == "claude-opus-4-8x"));
+    }
+
+    /// M1：`POST /models` 的未知字段必须明确报错（400），不能被 serde 静默丢弃
+    /// 后返回 200——用户会以为写进去了，实际值根本没进表。
+    #[test]
+    fn create_model_rejects_unknown_fields() {
+        let raw = r#"{"upstreamId":"claude-opus-9.1","origin":"builtin","enabld":true}"#;
+        let req: CreateModelRequest = serde_json::from_str(raw).unwrap();
+        let mut file = empty_file();
+        let err = create_model_in_file(&mut file, &req).unwrap_err();
+        match err {
+            AdminServiceError::InvalidModelField(msg) => {
+                assert!(msg.contains("origin"), "应点名被拒字段: {}", msg);
+                assert!(msg.contains("enabld"), "拼写错误的字段名也应被指出: {}", msg);
+            }
+            other => panic!("期望 InvalidModelField，实际 {:?}", other),
+        }
+        assert!(file.models.is_empty(), "被拒的请求不应留下任何部分写入");
+    }
+
+    fn model_sync_test_service() -> AdminService {
+        let token_manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![live_cred(1, "tok", 1)], None, None, true)
+                .unwrap(),
+        );
+        AdminService::new(token_manager, Vec::<String>::new())
+    }
+
+    /// M1：`PATCH /models/settings` 的未知字段必须明确报错，不能静默丢弃。
+    /// 实测 `allowUnknownModelPassthrough`（config.json 里的真实键名）与本接口的
+    /// `allowPassthrough` 只差一个写法，静默丢弃会让用户以为开关已打开。
+    #[tokio::test]
+    async fn set_model_sync_settings_rejects_unknown_fields() {
+        let service = model_sync_test_service();
+        let raw = r#"{"allowUnknownModelPassthrough":true}"#;
+        let req: SetModelSyncSettingsRequest = serde_json::from_str(raw).unwrap();
+        let err = service.set_model_sync_settings(req).await.unwrap_err();
+        match err {
+            AdminServiceError::InvalidModelField(msg) => {
+                assert!(msg.contains("allowUnknownModelPassthrough"), "应点名被拒字段: {}", msg)
+            }
+            other => panic!("期望 InvalidModelField，实际 {:?}", other),
+        }
+    }
+
+    /// M2：模型同步时间校验失败必须走 `InvalidModelField`，文案不得是「凭据无效」
+    /// 或提及「自动更新」——那是另一条路径（二进制自动更新时间）复用解析器的副作用，
+    /// 会把排查方向带偏到完全不相关的功能上。
+    #[tokio::test]
+    async fn set_model_sync_settings_invalid_time_uses_model_field_error_not_credential_wording() {
+        let service = model_sync_test_service();
+        let req = SetModelSyncSettingsRequest {
+            enabled: None,
+            time: Some("25:99".to_string()),
+            probe_credential_id: None,
+            probe_credential_id_set: false,
+            allow_passthrough: None,
+            extra: Default::default(),
+        };
+        let err = service.set_model_sync_settings(req).await.unwrap_err();
+        match err {
+            AdminServiceError::InvalidModelField(msg) => {
+                assert!(
+                    !msg.contains("凭据无效") && !msg.contains("自动更新"),
+                    "文案不应带偏到凭据/自动更新路径: {}",
+                    msg
+                );
+            }
+            other => panic!("期望 InvalidModelField，实际 {:?}", other),
+        }
     }
 }
 

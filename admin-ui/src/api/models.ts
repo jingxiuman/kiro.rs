@@ -27,9 +27,19 @@ export async function getModelRegistry(): Promise<ModelRegistryResponse> {
   return data
 }
 
-/** 手动触发一轮同步，返回 diff 摘要（不返回全表，需另行刷新） */
-export async function syncModels(): Promise<SyncSummary> {
-  const { data } = await api.post<SyncSummary>('/models/sync')
+/**
+ * 手动触发一轮同步，返回 diff 摘要（不返回全表，需另行刷新）。
+ *
+ * `force = true` 对应 `?force=true`：强制放行一次消失判定，只在护栏触发后由
+ * 运维显式确认「探针没配错」时才应该传 true——默认必须是 false，绝不能是
+ * 静默的默认行为（spec §6.3 第四版）。
+ */
+export async function syncModels(force = false): Promise<SyncSummary> {
+  const { data } = await api.post<SyncSummary>(
+    '/models/sync',
+    undefined,
+    force ? { params: { force: true } } : undefined,
+  )
   return data
 }
 

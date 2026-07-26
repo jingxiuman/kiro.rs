@@ -9,7 +9,7 @@
 //! 随订阅等级不同（kiro/model/available_models.rs:6），采样到低等级凭据的
 //! 轮次会把高等级独有模型误判为消失。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -66,6 +66,51 @@ pub struct SyncSummary {
     pub deprecated: usize,
     pub trusted: bool,
     pub source: String,
+    /// 本轮是否因比例护栏而**跳过了消失判定**（新增/更新照常）。
+    ///
+    /// 为什么必须透传出去：护栏是「分不出探针误配与真实大批退役时就不猜」的设计
+    /// （spec §6.3 第四版），代价是消失判定会静默停机。不把这个状态暴露到 API 与
+    /// UI，系统就会长期处于「同步天天成功、消失判定其实已停」而无人知晓的状态。
+    pub disappearance_check_skipped: bool,
+    /// 本轮缺失比例（护栏判据的实际取值，0.0~1.0）。非权威轮次恒为 0。
+    pub missing_ratio: f64,
+}
+
+/// 单轮同步的可选行为。默认全 false —— 强制放行必须是显式动作，绝不能是默认值。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SyncOptions {
+    /// **强制放行一次消失判定**：运维在 UI 上确认「探针凭据没配错、上游确实大批
+    /// 下线」之后触发。只绕过比例护栏，不绕过 `MISSING_ROUNDS_THRESHOLD`
+    /// （后者防的是另一件事：一次上游抖动，需要连续两轮观测才作数）。
+    pub force_disappearance_check: bool,
+}
+
+/// 护栏触发时写进 `syncState.source` 的机器可读后缀。
+///
+/// 为什么把状态塞进 source 而不是新开一个持久化字段：`models.json` 不做 schema
+/// 迁移（spec §2 非目标 4），而「消失判定已停机」这个状态必须在**服务重启后**、
+/// 以及**定时同步（不经 admin 层，结果不回传任何内存态）之后**仍能被 UI 看见。
+/// `source` 恰好就是「本轮同步的来源与结论」字段，每轮整体重写，语义相符。
+const SKIPPED_MARKER: &str = " [disappearance-skipped ratio=";
+
+/// 把护栏结论编码进 source。未触发时原样返回，老文件与老格式不受影响。
+fn encode_source(source: &str, skipped: bool, ratio: f64) -> String {
+    if skipped {
+        format!("{}{}{:.3}]", source, SKIPPED_MARKER, ratio)
+    } else {
+        source.to_string()
+    }
+}
+
+/// 从 source 里拆出「干净的来源」与护栏结论。无后缀（含所有老文件）→ 未跳过。
+pub fn decode_source(raw: &str) -> (String, bool, f64) {
+    match raw.split_once(SKIPPED_MARKER) {
+        Some((clean, rest)) => {
+            let ratio = rest.trim_end_matches(']').parse::<f64>().unwrap_or(0.0);
+            (clean.to_string(), true, ratio)
+        }
+        None => (raw.to_string(), false, 0.0),
+    }
 }
 
 pub struct ModelSyncService {
@@ -82,6 +127,17 @@ pub(crate) fn derive_exposed_id(upstream_id: &str) -> String {
     } else {
         upstream_id.to_string()
     }
+}
+
+/// 一行会占用的全部对外名（小写）：`exposedId` 以及开启 thinking 变体时派生的
+/// `{exposedId}-thinking`。与加载器 `ModelRegistry::from_file` 的唯一性校验同源
+/// —— 两边口径若不一致，同步就会写出一个自己加载不了的文件（I1 的根因之一）。
+fn exposed_names_of(row: &ModelRow) -> Vec<String> {
+    let mut names = vec![row.exposed_id.to_ascii_lowercase()];
+    if row.expose_thinking_variant {
+        names.push(format!("{}-thinking", row.exposed_id).to_ascii_lowercase());
+    }
+    names
 }
 
 pub(crate) fn derive_thinking_variant(upstream_id: &str) -> bool {
@@ -177,11 +233,22 @@ impl ModelSyncService {
         FetchOutcome { union, per_credential, any_nonempty, any_failed }
     }
 
-    /// 跑一轮同步。`now` 由调用方注入，便于测试。
+    /// 跑一轮同步（默认行为：比例护栏生效）。`now` 由调用方注入，便于测试。
     pub async fn sync_once(
         &self,
         probe_credential_id: Option<u64>,
         now: DateTime<Utc>,
+    ) -> Result<SyncSummary, String> {
+        self.sync_once_with(probe_credential_id, now, SyncOptions::default())
+            .await
+    }
+
+    /// 跑一轮同步，可指定 `SyncOptions`（目前只有「强制放行消失判定」）。
+    pub async fn sync_once_with(
+        &self,
+        probe_credential_id: Option<u64>,
+        now: DateTime<Utc>,
+        options: SyncOptions,
     ) -> Result<SyncSummary, String> {
         let fetch_started_at = now.to_rfc3339();
 
@@ -260,6 +327,8 @@ impl ModelSyncService {
         let mut added = 0usize;
         let mut updated = 0usize;
         let mut deprecated = 0usize;
+        let mut disappearance_check_skipped = false;
+        let mut missing_ratio = 0.0f64;
         let seen_at = now.to_rfc3339();
 
         let file = self
@@ -317,6 +386,127 @@ impl ModelSyncService {
 
                 let mut max_sort = effective.rows().iter().map(|r| r.sort_order).max().unwrap_or(0);
 
+                // ---- 消失判定的前置计算（仅权威轮次）----
+                //
+                // 顺序很重要：护栏的结论必须在写入新增/更新**之前**得出。
+                // 一是判定基线只能取本轮拉取之前的表（否则本轮新增的行会立刻
+                // 进入分母，见下面 C2 的说明）；二是护栏是否触发决定了本轮
+                // 要不要给新行写同步元数据。
+                //
+                // N2：prefix 行是 handlers 侧的家族通配符伪行（如 gpt-5），
+                // 上游返回的 modelId 永远不可能等于它（它不代表一个真实上游模型，
+                // 只是「gpt-5* 一律放行」的解析规则载体）。留在判定里的话，
+                // 它必然在第 2 个权威轮次被标 Deprecated——确定性的、每次部署
+                // 都会发生的误报。
+                let judged: Vec<ModelRow> = if round == RoundKind::Authoritative {
+                    effective
+                        .rows()
+                        .iter()
+                        .filter(|r| r.match_kind != MatchKind::Prefix)
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let missing: Vec<ModelRow> = judged
+                    .iter()
+                    .filter(|r| !union.contains_key(&r.upstream_id))
+                    .cloned()
+                    .collect();
+
+                if round == RoundKind::Authoritative {
+                    // N3：单轮标记比例护栏。与「不可信轮次」（规则 1）同级，但防的是
+                    // 另一条路径：规则 1 防网络抖动导致的空/失败返回，这里防**探针本身
+                    // 不具代表性**——spec §6.2 假设探针是最高订阅等级的凭据，但代码里
+                    // 没有任何东西保证或校验这一点。把一个低等级凭据设成探针，它能
+                    // 「成功返回非空列表」从而通过规则 1，却只覆盖上游模型集的一小部分，
+                    // 于是第 2 个权威轮次就能把整表刷成 deprecated。
+                    //
+                    // N6：比例只按 status == Active 的口径算。行永不删除，若把已经
+                    // Deprecated 的行也算进分子，护栏就成了只增不减的棘轮：每正常退役
+                    // 一批模型，分子永久多一格、分母不变，比例单调上升。
+                    //
+                    // C2：分母还必须排除**尚未被任何一轮完整判定确认过的 synced 行**。
+                    // 症状：探针指向另一个账号，每轮返回 20 个表里没有的模型、一个内置行
+                    // 都不返回 —— 第 0 轮护栏正确触发（13/13），但那 20 行照常入表，
+                    // 第 1 轮分母变成 33、13*2 < 33 护栏放行，第 2 轮 13 个内置行全被
+                    // 标记。根因是「同一个不可信探针带来的行」被拿去给这个探针自己
+                    // 背书，护栏被它自己污染的数据冲淡。
+                    // 判据：一行进入护栏基线，当且仅当它不是 synced（内置/人工是独立于
+                    // 探针的事实），或它已经有同步元数据（= 曾被一轮**没被护栏拦下的**
+                    // 同步确认过，见下面写 model_meta 的条件）。
+                    // 退化保护：基线为空（极端情况：内置行全部退役完了）时回落到
+                    // N6 的全 Active 口径，绝不因为基线空就无条件放行。
+                    let in_baseline = |r: &ModelRow| {
+                        r.origin != ModelOrigin::Synced
+                            || file.sync_state.model_meta.contains_key(&r.upstream_id)
+                    };
+                    let is_active = |r: &&ModelRow| r.status == ModelStatus::Active;
+
+                    let mut denominator = judged.iter().filter(is_active).filter(|r| in_baseline(r)).count();
+                    let mut numerator = missing.iter().filter(is_active).filter(|r| in_baseline(r)).count();
+                    if denominator == 0 {
+                        denominator = judged.iter().filter(is_active).count();
+                        numerator = missing.iter().filter(is_active).count();
+                    }
+                    missing_ratio = if denominator == 0 {
+                        0.0
+                    } else {
+                        numerator as f64 / denominator as f64
+                    };
+                    let unrepresentative = numerator * 2 > denominator;
+
+                    // 四次修正（终版）：护栏触发时**不自动放行、也不自动执行**，而是
+                    // 暂停消失判定等人确认。理由见 spec §6.3：稳定误配的探针与真实的
+                    // 大批退役在数据上完全无法区分（两者都是「连续多轮返回同一个缩小
+                    // 集合」），任何「连续 N 轮一致就放行」的规则都只是把误杀推迟 N 轮。
+                    // 出口是显式的：POST /models/sync?force=true。
+                    disappearance_check_skipped =
+                        unrepresentative && !options.force_disappearance_check;
+                    if disappearance_check_skipped {
+                        tracing::error!(
+                            "本轮权威同步的缺失比例过高（{}/{} = {:.0}%），无法区分「探针不具\
+                             代表性」与「上游真实大批退役」，已暂停本轮消失判定（新增/更新照常）。\
+                             请确认 modelSyncProbeCredentialId 指向的凭据订阅等级足够；\
+                             确认无误后在模型映射面板点「确认并强制执行」（POST /models/sync?force=true）。",
+                            numerator,
+                            denominator,
+                            missing_ratio * 100.0
+                        );
+                    } else if unrepresentative {
+                        tracing::warn!(
+                            "缺失比例过高（{}/{} = {:.0}%），但本轮由运维显式强制放行，\
+                             照常执行消失判定。",
+                            numerator,
+                            denominator,
+                            missing_ratio * 100.0
+                        );
+                    }
+                }
+
+                // 本轮的观测是否**够格给一行背书**。护栏拦下的轮次说明「这份快照
+                // 到底代不代表上游，现在说不清」，那就不该用它给新行建立同步元数据
+                // ——否则这些行下一轮就会混进护栏分母，把护栏冲淡（见上面 C2）。
+                // 已有元数据的行仍然照常刷新（清零计数、更新 lastSeenAt、复活），
+                // 那是「上游又见到它了」的好消息，与快照是否完整无关。
+                let may_confirm_new_rows = !disappearance_check_skipped;
+
+                // I1：对外名冲突不得让整轮同步失败。
+                // 症状：上游返回一行 upstreamId = "claude-opus-4-8"（恰好等于内置
+                // claude-opus-4.8 派生出的 exposedId）→ 整表校验失败 → mutate 返 Err
+                // → 此后**每一轮**同步全量停摆（新增、更新、消失判定、credentialSupport
+                // 全部不再进行），且没有自愈路径。一条上游脏数据毒化整个流程。
+                // 修法：把冲突判定提前到写入前，冲突的那一行跳过并打 error 日志。
+                // 名字集合与加载器的唯一性校验同源（exposedId + 派生的 -thinking 名 +
+                // alias.from），否则「这里放行、加载时报错」会再次锁死同步。
+                let mut taken_names: HashSet<String> = HashSet::new();
+                for r in effective.rows() {
+                    taken_names.extend(exposed_names_of(r));
+                }
+                for a in &file.aliases {
+                    taken_names.insert(a.from.to_ascii_lowercase());
+                }
+
                 for (upstream_id, m) in &union {
                     let incoming = ModelRow {
                         upstream_id: upstream_id.clone(),
@@ -351,7 +541,26 @@ impl ModelSyncService {
                     let existing_idx = file.models.iter().position(|r| &r.upstream_id == upstream_id);
                     match existing_idx {
                         Some(idx) => {
+                            // exposedId 属于同步管辖字段，更新同样可能撞名（上游改了
+                            // modelId 的写法就会）。撞名时保留旧对外名而不是整轮失败：
+                            // 对外名一旦变化，客户端本来也要改请求，保旧值更保守。
+                            let mut incoming = incoming;
+                            let own: HashSet<String> =
+                                exposed_names_of(&file.models[idx]).into_iter().collect();
+                            if let Some(dup) = exposed_names_of(&incoming)
+                                .into_iter()
+                                .find(|n| taken_names.contains(n) && !own.contains(n))
+                            {
+                                tracing::error!(
+                                    "上游模型 {} 的对外名 {} 与已有模型/别名冲突，本次保留原对外名 {}",
+                                    upstream_id,
+                                    dup,
+                                    file.models[idx].exposed_id
+                                );
+                                incoming.exposed_id = file.models[idx].exposed_id.clone();
+                            }
                             merge_synced_row(&mut file.models[idx], &incoming);
+                            taken_names.extend(exposed_names_of(&file.models[idx]));
                             updated += 1;
                         }
                         // 覆盖层里没有这一行，但它已存在于有效行集 → 是个内置行。
@@ -362,9 +571,24 @@ impl ModelSyncService {
                             updated += 1;
                         }
                         None => {
+                            // I1：对外名冲突 → 跳过这一行并 error 日志，绝不让它
+                            // 把整轮（乃至此后每一轮）同步拖成失败。
+                            if let Some(dup) = exposed_names_of(&incoming)
+                                .into_iter()
+                                .find(|n| taken_names.contains(n))
+                            {
+                                tracing::error!(
+                                    "上游新模型 {} 的对外名 {} 与已有模型或别名冲突，本轮跳过该行\
+                                     （其余模型照常同步）。如需收录，请先改掉冲突的别名/对外名。",
+                                    upstream_id,
+                                    dup
+                                );
+                                continue;
+                            }
                             let mut row = incoming;
                             max_sort += 10;
                             row.sort_order = max_sort;
+                            taken_names.extend(exposed_names_of(&row));
                             file.models.push(row);
                             added += 1;
                         }
@@ -372,94 +596,49 @@ impl ModelSyncService {
 
                     // 同步元数据统一落在 sync_state.model_meta：本轮见到 → 计数清零、
                     // 刷新 last_seen_at、若此前是 deprecated 则复活为 active。
-                    file.sync_state.model_meta.insert(
-                        upstream_id.clone(),
-                        SyncMeta {
-                            missing_sync_rounds: 0,
-                            status: ModelStatus::Active,
-                            last_seen_at: Some(seen_at.clone()),
-                        },
-                    );
+                    //
+                    // C2：护栏拦下的轮次不给**新行**建立元数据（见 may_confirm_new_rows）。
+                    if may_confirm_new_rows || file.sync_state.model_meta.contains_key(upstream_id) {
+                        file.sync_state.model_meta.insert(
+                            upstream_id.clone(),
+                            SyncMeta {
+                                missing_sync_rounds: 0,
+                                status: ModelStatus::Active,
+                                last_seen_at: Some(seen_at.clone()),
+                            },
+                        );
+                    }
                 }
 
-                // 消失判定：仅权威轮次。遍历有效行集（内置 ∪ 覆盖层），而非仅覆盖层。
-                if round == RoundKind::Authoritative {
-                    // N2：prefix 行是 handlers 侧的家族通配符伪行（如 gpt-5），
-                    // 上游返回的 modelId 永远不可能等于它（它不代表一个真实上游模型，
-                    // 只是「gpt-5* 一律放行」的解析规则载体）。留在判定里的话，
-                    // 它必然在第 2 个权威轮次被标 Deprecated——确定性的、每次部署
-                    // 都会发生的误报。
-                    let judged: Vec<&ModelRow> = effective
-                        .rows()
-                        .iter()
-                        .filter(|r| r.match_kind != MatchKind::Prefix)
-                        .collect();
-                    let missing: Vec<&ModelRow> = judged
-                        .iter()
-                        .copied()
-                        .filter(|r| !union.contains_key(&r.upstream_id))
-                        .collect();
-
-                    // N3：单轮标记比例护栏。与「不可信轮次」（规则 1）同级，但防的是
-                    // 另一条路径：规则 1 防网络抖动导致的空/失败返回，这里防**探针本身
-                    // 不具代表性**——spec §6.2 假设探针是最高订阅等级的凭据，但代码里
-                    // 没有任何东西保证或校验这一点。把一个低等级凭据设成探针，它能
-                    // 「成功返回非空列表」从而通过规则 1，却只覆盖上游模型集的一小部分，
-                    // 于是第 2 个权威轮次就能把整表刷成 deprecated。
-                    // 处理方式：只跳过消失判定，本轮的新增/更新照常写入（数据本身没错，
-                    // 错的是「把它当成完整快照」）。日志用 error 级别——这是需要人介入
-                    // 修改探针配置的问题，不是可以忽略的抖动。
-                    //
-                    // N6：比例**只按 status == Active 的口径算**。行永不删除，若把已经
-                    // Deprecated 的行也算进分子，护栏就成了只增不减的棘轮：每正常退役
-                    // 一批模型，分子永久多一格、分母不变，比例单调上升，越过 50% 后消失
-                    // 判定永久锁死，只剩每轮重复的 error 日志——部署跑得越久越容易踩中。
-                    // 已经不在上游的行本来就不该参与「探针是否具代表性」的判断：护栏问的是
-                    // 「本轮新缺失的在服役模型占比是否高到不像真实退役」，而不是
-                    // 「表里有多少行不在上游」。
-                    //
-                    // 注意：只有**护栏判据**换口径，下面的计数循环仍遍历完整的 missing 集
-                    // （对已 Deprecated 的行继续累加 missing_sync_rounds 无害，且保留了
-                    // 「连续多少轮没见过」这个信息）。
-                    let active_judged =
-                        judged.iter().filter(|r| r.status == ModelStatus::Active).count();
-                    let active_missing =
-                        missing.iter().filter(|r| r.status == ModelStatus::Active).count();
-                    let unrepresentative = active_missing * 2 > active_judged;
-                    if unrepresentative {
-                        tracing::error!(
-                            "本轮权威同步的探针可能不具代表性：仍在服役（active）的 {} 行中有 {} 行\
-                             未被上游返回（超过 50%）。已跳过本轮消失判定（新增/更新照常）。\
-                             请确认 modelSyncProbeCredentialId 指向的是最高订阅等级的凭据。",
-                            active_judged,
-                            active_missing
-                        );
-                    } else {
-                        for row in missing {
-                            // 元数据的起点取有效行集上的当前值（from_file 已把
-                            // model_meta 叠加上去；老格式的行内联字段也在这里体现），
-                            // 因此老文件不需要迁移就能接着累计。
-                            let meta = file
-                                .sync_state
-                                .model_meta
-                                .entry(row.upstream_id.clone())
-                                .or_insert_with(|| SyncMeta {
-                                    missing_sync_rounds: row.missing_sync_rounds,
-                                    status: row.status,
-                                    last_seen_at: row.last_seen_at.clone(),
-                                });
-                            meta.missing_sync_rounds += 1;
-                            if meta.missing_sync_rounds >= MISSING_ROUNDS_THRESHOLD
-                                && meta.status == ModelStatus::Active
-                            {
-                                meta.status = ModelStatus::Deprecated;
-                                deprecated += 1;
-                                tracing::warn!(
-                                    "模型 {} 连续 {} 轮权威同步未出现于上游，标记为 deprecated（保留可用）",
-                                    row.upstream_id,
-                                    meta.missing_sync_rounds
-                                );
-                            }
+                // 消失判定：仅权威轮次，且护栏未把本轮拦下（判据在上面算好）。
+                if round == RoundKind::Authoritative && !disappearance_check_skipped {
+                    // 计数循环遍历完整的 missing 集：对已 Deprecated 的行继续累加
+                    // missing_sync_rounds 无害，且保留了「连续多少轮没见过」的信息。
+                    // 只有护栏判据用收窄后的口径（Active + 基线行）。
+                    for row in &missing {
+                        // 元数据的起点取有效行集上的当前值（from_file 已把
+                        // model_meta 叠加上去；老格式的行内联字段也在这里体现），
+                        // 因此老文件不需要迁移就能接着累计。
+                        let meta = file
+                            .sync_state
+                            .model_meta
+                            .entry(row.upstream_id.clone())
+                            .or_insert_with(|| SyncMeta {
+                                missing_sync_rounds: row.missing_sync_rounds,
+                                status: row.status,
+                                last_seen_at: row.last_seen_at.clone(),
+                            });
+                        meta.missing_sync_rounds += 1;
+                        if meta.missing_sync_rounds >= MISSING_ROUNDS_THRESHOLD
+                            && meta.status == ModelStatus::Active
+                        {
+                            meta.status = ModelStatus::Deprecated;
+                            deprecated += 1;
+                            tracing::warn!(
+                                "模型 {} 连续 {} 轮权威同步未出现于上游，标记为 deprecated（保留可用）",
+                                row.upstream_id,
+                                meta.missing_sync_rounds
+                            );
                         }
                     }
                 }
@@ -469,7 +648,13 @@ impl ModelSyncService {
                 }
                 file.sync_state.last_sync_at = Some(now.to_rfc3339());
                 file.sync_state.last_fetch_started_at = Some(fetch_started_at.clone());
-                file.sync_state.source = Some(source.clone());
+                // 护栏结论随 source 落盘：定时同步不经 admin 层，重启后内存态也没了，
+                // 只有写进文件，UI 才能持续看见「消失判定已停机」。
+                file.sync_state.source = Some(encode_source(
+                    &source,
+                    disappearance_check_skipped,
+                    missing_ratio,
+                ));
                 Ok(())
             })
             .await?;
@@ -482,7 +667,16 @@ impl ModelSyncService {
             }
         }
 
-        Ok(SyncSummary { round, added, updated, deprecated, trusted: true, source })
+        Ok(SyncSummary {
+            round,
+            added,
+            updated,
+            deprecated,
+            trusted: true,
+            source,
+            disappearance_check_skipped,
+            missing_ratio,
+        })
     }
 }
 
@@ -1300,6 +1494,165 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// C1（spec §6.3 终版）症状复现：探针稳定只保留 5/13（缺失比例 62%，
+    /// 远超 50% 护栏阈值），连跑 20 个权威轮。因为护栏每轮都触发，消失判定
+    /// 被暂停，**计数器必须一次都不递增**——这是设计意图，不是缺陷：分不清
+    /// 「探针误配」与「上游真退役」时，任何悄悄推进计数的做法都等于在第
+    /// 21 轮突然、无人知晓地把 8 个模型标记为 Deprecated。
+    ///
+    /// 随后运维显式带 `force=true` 确认「探针没配错」。force 只绕过比例护栏，
+    /// **不绕过** `MISSING_ROUNDS_THRESHOLD=2`（见 `SyncOptions` 上的注释：
+    /// 防的是另一件事——一次抖动需要连续两轮观测才作数），所以要连续两轮
+    /// force 才能看到真正的 Deprecated；第一轮只是恢复正常累计。
+    #[tokio::test]
+    async fn force_override_resumes_disappearance_check_after_guard_pause() {
+        let _registry_guard =
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("c1-force-override");
+
+        let all_builtin = builtin_upstream_models();
+        assert_eq!(all_builtin.len(), 13, "前置条件：内置 exact 行应为 13 个");
+        let kept: Vec<UpstreamModel> = all_builtin.iter().take(5).cloned().collect();
+        let missing_ids: Vec<String> =
+            all_builtin[5..].iter().map(|m| m.model_id.clone()).collect();
+        assert_eq!(missing_ids.len(), 8);
+
+        let fetcher = || Arc::new(FakeFetcher::new(vec![(3, Ok(kept.clone()))]));
+
+        for round in 0..20 {
+            let summary = ModelSyncService::new(store.clone(), fetcher())
+                .sync_once(Some(3), now())
+                .await
+                .unwrap();
+            assert!(
+                summary.disappearance_check_skipped,
+                "第 {} 轮缺失比例 8/13=62% 应触发护栏、暂停消失判定",
+                round
+            );
+            assert!(summary.missing_ratio > 0.5);
+            assert_eq!(summary.deprecated, 0);
+        }
+        let after_20 = store.load();
+        for id in &missing_ids {
+            let row = after_20.registry.rows().iter().find(|r| &r.upstream_id == id).unwrap();
+            assert_eq!(
+                row.missing_sync_rounds, 0,
+                "{} 的 missingSyncRounds 连跑 20 轮也不得递增（护栏一直在拦）",
+                id
+            );
+            assert_eq!(row.status, ModelStatus::Active);
+        }
+
+        // 强制放行第一轮：比例护栏被绕过，消失判定开始正常累计（阈值仍是 2）。
+        let s1 = ModelSyncService::new(store.clone(), fetcher())
+            .sync_once_with(Some(3), now(), SyncOptions { force_disappearance_check: true })
+            .await
+            .unwrap();
+        assert!(!s1.disappearance_check_skipped, "强制放行的这一轮不应再报告跳过");
+        assert_eq!(s1.deprecated, 0, "阈值为 2，强制放行的第一轮只累计");
+        let mid = store.load();
+        for id in &missing_ids {
+            let row = mid.registry.rows().iter().find(|r| &r.upstream_id == id).unwrap();
+            assert_eq!(row.missing_sync_rounds, 1, "强制放行后应正常累计到 1");
+        }
+
+        // 第二轮强制放行：达到阈值，消失判定正常执行，模型被标 Deprecated。
+        let s2 = ModelSyncService::new(store.clone(), fetcher())
+            .sync_once_with(Some(3), now(), SyncOptions { force_disappearance_check: true })
+            .await
+            .unwrap();
+        assert_eq!(s2.deprecated, missing_ids.len(), "第二轮强制放行应把 8 个模型标记为 Deprecated");
+        let out = store.load();
+        for id in &missing_ids {
+            let row = out.registry.rows().iter().find(|r| &r.upstream_id == id).unwrap();
+            assert_eq!(row.status, ModelStatus::Deprecated, "{} 应在强制放行两轮后正常退役", id);
+        }
+    }
+
+    /// C2：护栏分母不得被「同一个不可信探针带来的新增行」冲淡。
+    ///
+    /// 评审实测的三轮序列：探针一个内置模型都不返回，只返回 20 个表里没有的
+    /// 全新 id。旧实现：r0 护栏正确触发（13/13=100%），但那 20 行照常入表且
+    /// 立刻拿到同步元数据；r1 判据分母被这 20 行撑大到 33（13/33=39%<50%），
+    /// 护栏失效，13 个内置行被计数一次；r2 判据依旧失效，13 个内置行被
+    /// 误标为 Deprecated——护栏被它自己污染的数据冲淡。
+    ///
+    /// 修后：只有「非 synced，或已经被一轮**没被护栏拦下**的同步确认过」的行
+    /// 才计入分母/分子（见 `in_baseline` / `may_confirm_new_rows`）。这 20 行
+    /// 是在护栏触发的轮次里新增的，从未被无护栏地确认过，因此永远不进分母：
+    /// 护栏必须在 r1、r2 持续触发，内置行不得被误杀。
+    #[tokio::test]
+    async fn guard_denominator_not_diluted_by_rows_added_under_paused_guard() {
+        let _registry_guard =
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("c2-denominator-dilution");
+
+        let strangers: Vec<UpstreamModel> =
+            (0..20).map(|i| upstream(&format!("claude-stranger-{i}"), Some(200_000))).collect();
+        let fetcher = || Arc::new(FakeFetcher::new(vec![(3, Ok(strangers.clone()))]));
+
+        // r0：探针一个内置行都没返回，护栏触发；20 个陌生行照常新增。
+        let r0 = ModelSyncService::new(store.clone(), fetcher()).sync_once(Some(3), now()).await.unwrap();
+        assert!(r0.disappearance_check_skipped, "r0：探针零命中内置行，护栏应触发");
+        assert_eq!(r0.added, 20, "r0：新增照常进行，只跳过消失判定");
+        assert_eq!(r0.deprecated, 0);
+
+        // r1：旧实现分母被撑大到 33（13 内置 + 20 陌生行）而失效；
+        // 修后陌生行不进分母，护栏必须继续触发，不得误杀。
+        let r1 = ModelSyncService::new(store.clone(), fetcher()).sync_once(Some(3), now()).await.unwrap();
+        assert!(r1.disappearance_check_skipped, "r1：护栏不得被 r0 新增的陌生行冲淡");
+        assert_eq!(r1.deprecated, 0, "r1 不得误杀（评审实测的旧 bug 会在这里计一次数）");
+
+        // r2：评审实测中旧实现会在这一轮把 13 个内置行整表误杀。
+        let r2 = ModelSyncService::new(store.clone(), fetcher()).sync_once(Some(3), now()).await.unwrap();
+        assert!(r2.disappearance_check_skipped, "r2：护栏仍应触发");
+        assert_eq!(r2.deprecated, 0, "r2：13 个内置行不得被整表误杀");
+
+        let out = store.load();
+        for m in builtin_upstream_models() {
+            let row = out.registry.rows().iter().find(|r| r.upstream_id == m.model_id).unwrap();
+            assert_eq!(row.status, ModelStatus::Active, "{} 不得被误杀", m.model_id);
+            assert_eq!(row.missing_sync_rounds, 0, "{} 的计数不得被冲淡后的护栏放行", m.model_id);
+        }
+    }
+
+    /// I1：上游行的派生 exposedId 与既有行/别名冲突时，应跳过该行并打 error，
+    /// 不得让整轮同步失败。旧实现：整表校验失败 → mutate 返回 Err → 此后
+    /// **每一轮**同步全量停摆（新增、更新、消失判定、credentialSupport 全部
+    /// 不再进行），且没有自愈路径——一条上游脏数据就能毒化整个流程。
+    #[tokio::test]
+    async fn conflicting_exposed_id_is_skipped_not_fatal() {
+        let _registry_guard =
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("i1-conflict");
+
+        // "claude-dup-a-b" 与 "claude-dup-a.b" 都会派生出同一个 exposedId
+        // "claude-dup-a-b"（claude 家族点号转连字符）。搭配全部内置行保持护栏
+        // 不触发，证明冲突只影响撞名的这一行，其余模型（含消失判定）照常进行。
+        let mut models = builtin_upstream_models();
+        models.push(upstream("claude-dup-a-b", Some(200_000)));
+        models.push(upstream("claude-dup-a.b", Some(200_000)));
+
+        let svc =
+            ModelSyncService::new(store.clone(), Arc::new(FakeFetcher::new(vec![(3, Ok(models))])));
+        let summary = svc.sync_once(Some(3), now()).await.unwrap();
+        assert!(summary.trusted, "撞名的一行不该拖累整轮的可信性判定");
+
+        let out = store.load();
+        let winners: Vec<_> = out
+            .registry
+            .rows()
+            .iter()
+            .filter(|r| r.upstream_id == "claude-dup-a-b" || r.upstream_id == "claude-dup-a.b")
+            .collect();
+        assert_eq!(winners.len(), 1, "撞名的两行只应有一行被写入，另一行必须被跳过而不是让整轮失败");
+        assert_eq!(winners[0].exposed_id, "claude-dup-a-b");
+
+        // 自愈路径：下一轮同步必须仍能正常进行，不会因为上一轮的脏数据永久停摆。
+        let s2 = svc.sync_once(Some(3), now()).await.unwrap();
+        assert!(s2.trusted, "上一轮的冲突不应导致后续轮次失败（旧实现会在此处永久停摆）");
     }
 
     /// MN1：`origin=builtin` 的行本就不该出现在覆盖层（人工编辑产生 manual、

@@ -486,6 +486,12 @@ pub struct SetModelSyncSettingsRequest {
     pub probe_credential_id_set: bool,
     #[serde(default)]
     pub allow_passthrough: Option<bool>,
+    /// 白名单之外的键，一律拒绝。与 `PatchModelRequest::extra` 同一个理由：
+    /// serde 默认**静默丢弃**未知字段。实测 `{"allowUnknownModelPassthrough":true}`
+    /// （config.json 里的真实键名，与这里的 `allowPassthrough` 只差一个写法）
+    /// 会返回 200 却什么都没改，用户以为开关打开了。
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 // ============ 模型注册表 ============
@@ -531,6 +537,10 @@ pub struct CreateModelRequest {
     pub enabled: Option<bool>,
     pub sort_order: Option<i32>,
     pub match_kind: Option<crate::anthropic::model_registry::MatchKind>,
+    /// 白名单之外的键，一律拒绝。理由同 `PatchModelRequest::extra`：静默丢弃
+    /// 未知字段会让「写错字段名」表现为 200 成功，而值根本没进表。
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// `GET /models` 里的一行。在 `ModelRow` 之外附加只读的响应期派生字段。
@@ -562,6 +572,12 @@ pub struct ModelRegistryResponse {
     /// 已记录可用模型的凭据数 / 启用凭据总数，用于 UI 提示覆盖率
     pub credential_support_covered: usize,
     pub credential_total: usize,
+    /// **最近一轮同步**是否因比例护栏暂停了消失判定。
+    /// 从 `syncState.source` 解码而来（定时同步不经 admin 层，重启也会丢内存态，
+    /// 所以这个状态必须落盘才看得见），UI 据此常驻显示确认横幅。
+    pub disappearance_check_skipped: bool,
+    /// 最近一轮的缺失比例（0.0~1.0）。未跳过时为 0。
+    pub missing_ratio: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -582,6 +598,22 @@ pub struct SyncSummaryResponse {
     pub deprecated: usize,
     pub trusted: bool,
     pub source: String,
+    /// 本轮是否因比例护栏暂停了消失判定（新增/更新照常）。见 spec §6.3 第四版。
+    pub disappearance_check_skipped: bool,
+    /// 护栏判据的实际缺失比例（0.0~1.0）。
+    pub missing_ratio: f64,
+}
+
+/// `POST /models/sync` 的查询参数。
+///
+/// 风格对齐既有的 `DELETE /groups/{name}?force=true`（`DeleteGroupQuery`）：
+/// 「明知有保护、仍要执行」在本项目里就是一个 `force` 查询参数。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncModelsQuery {
+    /// **强制放行一次消失判定**。缺省 false —— 必须由人显式带上，绝不是默认行为。
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Deserialize)]

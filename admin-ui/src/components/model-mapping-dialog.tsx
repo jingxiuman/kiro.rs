@@ -127,16 +127,22 @@ export function ModelMappingDialog({ open, onOpenChange }: ModelMappingDialogPro
   )
 }
 
-/** 顶部状态区：降级横幅、同步时间与「立即同步」、凭据覆盖率提示 */
+/** 顶部状态区：降级横幅、护栏横幅、同步时间与「立即同步」、凭据覆盖率提示 */
 function RegistryBanners({ data }: { data: ModelRegistryResponse }) {
   const { mutate: sync, isPending } = useSyncModels()
 
-  const runSync = () => {
-    sync(undefined, {
+  const runSync = (force = false) => {
+    sync(force, {
       onSuccess: (s) => {
         if (!s.trusted) {
           toast.warning(
             `本轮同步结果不可信（${s.round}），未写入模型表。来源：${s.source}`,
+          )
+          return
+        }
+        if (s.disappearanceCheckSkipped) {
+          toast.warning(
+            `同步完成，但缺失比例达 ${(s.missingRatio * 100).toFixed(0)}%，本轮消失判定已暂停（新增 ${s.added}，更新 ${s.updated}）`,
           )
           return
         }
@@ -164,6 +170,32 @@ function RegistryBanners({ data }: { data: ModelRegistryResponse }) {
         </div>
       )}
 
+      {data.disappearanceCheckSkipped && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+          <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <div className="space-y-1.5">
+            <div className="font-medium">
+              最近一轮同步的缺失比例达 {(data.missingRatio * 100).toFixed(0)}%，已暂停消失判定
+            </div>
+            <div className="opacity-90">
+              可能是①「同步设置」里的探针凭据配置有误（订阅等级过低，看不到完整
+              模型集），也可能是②上游确实批量下线了这些模型——两者在数据上无法
+              区分，因此系统选择暂停而不是自动猜测。请先确认探针凭据无误，再点击
+              下方按钮强制放行本轮消失判定；此后新一轮的护栏判据不受影响。
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs"
+              disabled={isPending}
+              onClick={() => runSync(true)}
+            >
+              确认探针无误，本轮放行消失判定
+            </Button>
+          </div>
+        </div>
+      )}
+
       <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-secondary/40 px-3 py-2">
         <div className="text-xs text-muted-foreground">
           上次同步：
@@ -174,7 +206,7 @@ function RegistryBanners({ data }: { data: ModelRegistryResponse }) {
             <span className="ml-2">来源：{data.syncState.source}</span>
           )}
         </div>
-        <Button size="sm" variant="outline" disabled={isPending} onClick={runSync}>
+        <Button size="sm" variant="outline" disabled={isPending} onClick={() => runSync(false)}>
           <RefreshCw className={'h-3.5 w-3.5 ' + (isPending ? 'animate-spin' : '')} />
           {isPending ? '同步中…' : '立即同步'}
         </Button>
@@ -231,12 +263,19 @@ function ModelRowCard({ row }: { row: ModelRow }) {
   const { mutate: remove, isPending: isRemoving } = useDeleteModel()
   const confirm = useConfirm()
 
-  const apply = (p: PatchModelRequest) => {
+  // M3：服务端拒绝（如超出 i32 上界、非法字段值）时必须回滚输入框。此前只有
+  // 本地校验分支（空值/非正整数）会 setDraft 回滚，服务端 4xx 落地后草稿
+  // 仍停在用户刚输入的非法值上，界面显示的值与后端实际保存的值不一致。
+  // `onRejected` 由调用方（TextField / NumberField）传入，用于重置各自的草稿。
+  const apply = (p: PatchModelRequest, onRejected?: () => void) => {
     patch(
       { upstreamId: row.upstreamId, patch: p },
       {
         onSuccess: () => toast.success('已保存'),
-        onError: (e) => toast.error(`保存失败：${extractErrorMessage(e)}`),
+        onError: (e) => {
+          toast.error(`保存失败：${extractErrorMessage(e)}`)
+          onRejected?.()
+        },
       },
     )
   }
@@ -436,7 +475,7 @@ function TextField({
   disabled?: boolean
   className?: string
   mono?: boolean
-  onApply: (patch: PatchModelRequest) => void
+  onApply: (patch: PatchModelRequest, onRejected?: () => void) => void
 }) {
   const [draft, setDraft] = useState(value)
   useEffect(() => setDraft(value), [value])
@@ -449,7 +488,9 @@ function TextField({
       return
     }
     if (next === value) return
-    onApply({ [field]: next })
+    // 服务端拒绝（如与既有 exposedId/别名撞名）时把草稿回滚到保存前的值，
+    // 而不是让输入框停在一个后端其实没接受的值上。
+    onApply({ [field]: next }, () => setDraft(value))
   }
 
   return (
@@ -497,10 +538,14 @@ function NumberField({
   row: ModelRow
   value: number
   disabled?: boolean
-  onApply: (patch: PatchModelRequest) => void
+  onApply: (patch: PatchModelRequest, onRejected?: () => void) => void
 }) {
   const [draft, setDraft] = useState(String(value))
   useEffect(() => setDraft(String(value)), [value])
+
+  // 后端字段是 i32（src/admin/types.rs），超出上界会被服务端拒绝；
+  // 提前在本地挡住，避免一次多余的往返请求才发现越界。
+  const I32_MAX = 2147483647
 
   const commit = () => {
     const next = Number(draft.trim())
@@ -509,8 +554,14 @@ function NumberField({
       toast.error(`${label}必须是正整数`)
       return
     }
+    if (next > I32_MAX) {
+      setDraft(String(value))
+      toast.error(`${label}不能超过 ${I32_MAX}`)
+      return
+    }
     if (next === value) return
-    onApply({ [field]: next })
+    // 服务端仍可能拒绝（例如校验规则比本地更严），失败时把草稿回滚到保存前的值。
+    onApply({ [field]: next }, () => setDraft(String(value)))
   }
 
   return (
