@@ -3661,11 +3661,9 @@ fn delete_model_in_file(
     // 删除保护对照的是**代码里的内置集**，不是覆盖层行上的 origin：
     // PATCH 一个内置行会在覆盖层落一条 manual 行（覆盖层不允许 builtin），
     // 若只看 origin，「先改一下再删」就绕过了保护，而且删掉后内置行会重新
-    // 出现在列表里——用户看到的是「删除按钮没用」。
-    if crate::anthropic::model_registry::builtin_rows()
-        .iter()
-        .any(|r| r.upstream_id == upstream_id)
-    {
+    // 出现在列表里——用户看到的是「删除按钮没用」。同源判据见
+    // `is_builtin_upstream_id`（响应里的 `deletable` 字段也调它）。
+    if crate::anthropic::model_registry::is_builtin_upstream_id(upstream_id) {
         return Err(AdminServiceError::InvalidModelField(format!(
             "内置模型不可删除: {}",
             upstream_id
@@ -3750,7 +3748,8 @@ fn build_model_registry_response(
     settings: ModelSyncSettings,
     enabled_credential_ids: &[u64],
 ) -> crate::admin::types::ModelRegistryResponse {
-    use crate::admin::types::{ModelRegistryResponse, ModelSyncSettingsResponse};
+    use crate::admin::types::{ModelRegistryResponse, ModelRowResponse, ModelSyncSettingsResponse};
+    use crate::anthropic::model_registry::is_builtin_upstream_id;
 
     let out = store.load();
     // rows() 已经叠加了 syncState.modelMeta（status / missingSyncRounds /
@@ -3761,6 +3760,15 @@ fn build_model_registry_response(
             .cmp(&b.sort_order)
             .then_with(|| a.upstream_id.cmp(&b.upstream_id))
     });
+    // deletable 与 delete_model_in_file 同源判据，不能看 row.origin（见
+    // ModelRowResponse 文档）。
+    let models: Vec<ModelRowResponse> = models
+        .into_iter()
+        .map(|row| ModelRowResponse {
+            deletable: !is_builtin_upstream_id(&row.upstream_id),
+            row,
+        })
+        .collect();
 
     let credential_support_covered = enabled_credential_ids
         .iter()
@@ -3910,6 +3918,47 @@ mod model_registry_tests {
         let err = delete_model_in_file(&mut file, "claude-opus-4.8").unwrap_err();
         assert!(matches!(err, AdminServiceError::InvalidModelField(_)));
         assert_eq!(file.models.len(), 1, "删除失败不应改动文件");
+    }
+
+    /// 回归用例：PATCH 过的内置模型在覆盖层落成 origin=Manual，但响应里的
+    /// `deletable` 必须仍然是 false —— 它对照的是 `is_builtin_upstream_id`，
+    /// 不是行上的 origin。否则前端会照 origin 显示删除按钮，点击后端却拒绝。
+    #[test]
+    fn patched_builtin_row_stays_non_deletable_in_response() {
+        let mut file = empty_file();
+        let req = PatchModelRequest {
+            context_window: Some(800_000),
+            ..Default::default()
+        };
+        patch_model_in_file(&mut file, "claude-opus-4.8", &req).unwrap();
+
+        // 落盘后走响应组装路径（与 GET /models 完全一致的代码路径）
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "kiro-admin-models-patched-deletable-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let store = ModelRegistryStore::new(path.clone());
+        let settings = ModelSyncSettings {
+            enabled: false,
+            time: "04:00".to_string(),
+            probe_credential_id: None,
+            allow_passthrough: false,
+        };
+        let resp = build_model_registry_response(&store, settings, &[]);
+        let _ = std::fs::remove_file(&path);
+
+        let row = resp
+            .models
+            .iter()
+            .find(|r| r.row.upstream_id == "claude-opus-4.8")
+            .expect("PATCH 过的行应出现在响应里");
+        assert_eq!(row.row.origin, ModelOrigin::Manual, "覆盖层落地后 origin 应为 Manual");
+        assert!(
+            !row.deletable,
+            "origin 已变成 Manual，但该行本质仍是内置模型，deletable 必须仍为 false"
+        );
     }
 
     #[test]

@@ -634,6 +634,13 @@ export interface ModelRow {
   lastSeenAt: string | null
   /** 额外的子串匹配关键字（只读，后端内置） */
   matchSubstrings?: string[]
+  /**
+   * 这一行能否被删除，只读，响应期计算。与后端 `DELETE /models/{upstreamId}`
+   * 的判据同源，不与 `origin` 等价：PATCH 一个内置模型会在覆盖层落一条
+   * `origin = 'manual'` 的行，但它本质仍是内置模型、仍不可删。删除按钮的
+   * 显隐必须看这个字段，不能看 `origin === 'builtin'`。
+   */
+  deletable: boolean
 }
 
 /** 手动别名：from → to（to 必须是某个存在的 upstreamId） */

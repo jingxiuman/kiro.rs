@@ -278,7 +278,7 @@ function ModelRowCard({ row }: { row: ModelRow }) {
             onCheckedChange={(v) => apply({ enabled: v })}
           />
         </div>
-        {row.origin !== 'builtin' && (
+        {row.deletable && (
           <Button
             size="icon"
             variant="ghost"

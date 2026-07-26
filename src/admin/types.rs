@@ -533,10 +533,27 @@ pub struct CreateModelRequest {
     pub match_kind: Option<crate::anthropic::model_registry::MatchKind>,
 }
 
+/// `GET /models` 里的一行。在 `ModelRow` 之外附加只读的响应期派生字段。
+///
+/// `deletable` 不是 `ModelRow` 自身的字段：`ModelRow` 同时也是 models.json
+/// 的持久化类型（见 `ModelRegistryFile.models`），若把 `deletable` 加进
+/// `ModelRow`，它会跟着 `pinned`/`origin` 一起被写进磁盘——而它其实是每次
+/// 响应时现算的派生值（同源判据见 `is_builtin_upstream_id`），不该落盘。
+/// 用外层包一层的方式把「持久化字段」与「响应期派生字段」分开。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRowResponse {
+    #[serde(flatten)]
+    pub row: crate::anthropic::model_registry::ModelRow,
+    /// 这一行能否被删除。与 `DELETE /models/{upstreamId}` 的判据
+    /// （`is_builtin_upstream_id`）同源，前端应据此而非 `origin` 决定删除按钮。
+    pub deletable: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRegistryResponse {
-    pub models: Vec<crate::anthropic::model_registry::ModelRow>,
+    pub models: Vec<ModelRowResponse>,
     pub aliases: Vec<crate::anthropic::model_registry::ModelAlias>,
     pub sync_state: crate::anthropic::model_registry::SyncState,
     pub settings: ModelSyncSettingsResponse,

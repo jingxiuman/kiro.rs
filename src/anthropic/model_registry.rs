@@ -214,6 +214,17 @@ pub fn builtin_rows() -> Vec<ModelRow> {
     ]
 }
 
+/// `upstream_id` 是否属于编译内置集——**删除保护与「能否删除」展示的唯一判据**。
+///
+/// 不对照行上的 `origin`：PATCH 一个内置行会在覆盖层落一条 `origin=Manual`
+/// 的行（覆盖层不允许出现 `origin=Builtin`），此时行上的 origin 已经不再等于
+/// 「这一行能不能删」。`admin::service::delete_model_in_file` 与
+/// `admin::service::build_model_registry_response`（响应里的 `deletable` 字段）
+/// 都必须调用这一个函数，不得各自照抄一份 `builtin_rows()` 比对逻辑。
+pub fn is_builtin_upstream_id(upstream_id: &str) -> bool {
+    builtin_rows().iter().any(|r| r.upstream_id == upstream_id)
+}
+
 /// 同步服务会写入的字段，用 pinned 数组里的 camelCase 名字。
 ///
 /// **这是「哪些字段归同步管」的唯一定义处**，三个消费方全部由它派生，不再各写一份：
