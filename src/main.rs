@@ -255,6 +255,50 @@ async fn main() {
     )));
     cache_meter.clone().spawn_background();
 
+    // ---- 模型注册表：必须在建 router 之前装好 ----
+    // 位置：凭据目录（与既有 registry / cache 同级，spec §4.2）。
+    // 放在 admin 分支之外：AdminService 仅在 adminApiKey 非空时创建，
+    // 挂在其内会让未配管理密钥的部署既没有模型表也没有自动同步（spec §3.2 / §6.1）。
+    let model_store = std::sync::Arc::new(
+        anthropic::model_registry_store::ModelRegistryStore::new(cache_dir.join("models.json")),
+    );
+    // 同步运行时配置的唯一 holder：调度器（本分支）与 AdminService（admin 分支）共用同一份，
+    // 这样 PATCH /models/settings 才能热生效，不必重启。
+    let model_sync_settings = std::sync::Arc::new(parking_lot::RwLock::new(
+        admin::ModelSyncSettings::from_config(&config),
+    ));
+    {
+        let outcome = model_store.load();
+        if let Some(reason) = &outcome.degraded_reason {
+            tracing::error!("模型表降级运行（使用内置默认）: {}", reason);
+        }
+        // 调度层的凭据过滤靠这份记录；不灌就永远走「无记录 → 放行」，等于没生效。
+        token_manager.set_credential_support(outcome.file.credential_support);
+        anthropic::model_registry::install_registry(outcome.registry);
+        anthropic::model_registry::set_allow_passthrough(
+            model_sync_settings.read().allow_passthrough,
+        );
+        // 回读而非回显入参：证明确实写进了运行时状态，而不是"调用过写入口"。
+        tracing::info!(
+            "模型表已装载: {} 行有效模型, credentialSupport 覆盖 {} 个凭据, 未知模型透传={}",
+            anthropic::model_registry::current_registry().rows().len(),
+            token_manager.credential_support().len(),
+            anthropic::model_registry::allow_passthrough()
+        );
+    }
+
+    // 同步服务：定时调度器与 admin 的手动触发端点共用同一个实例（同一把写锁串行化）。
+    let model_sync_service = std::sync::Arc::new(anthropic::model_sync::ModelSyncService::new(
+        model_store.clone(),
+        token_manager.clone() as std::sync::Arc<dyn anthropic::model_sync::ModelListFetcher>,
+    ));
+    spawn_model_sync_scheduler(
+        model_sync_service.clone(),
+        model_store.clone(),
+        token_manager.clone(),
+        model_sync_settings.clone(),
+    );
+
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider),
         config.extract_thinking,
@@ -285,7 +329,14 @@ async fn main() {
                     .with_log_governance(
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),
-                    );
+                    )
+                    // /models* 全部 7 组端点依赖这两个注入；不注入则返回「未初始化」。
+                    .with_model_registry(
+                        Some(model_store.clone()),
+                        Some(model_sync_service.clone()),
+                    )
+                    // 与调度器共用 holder，见上面 model_sync_settings 的注释。
+                    .with_model_sync_settings(model_sync_settings.clone());
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,
@@ -342,6 +393,66 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+/// 每日模型同步调度器（spec §6.1）。
+///
+/// 三点说明：
+/// 1. **建在 admin 分支之外**。`AdminService` 仅在 `adminApiKey` 非空时创建，
+///    调度器若挂在其内，没配管理密钥的部署就完全没有自动同步。
+/// 2. **无论开关是否打开都启动**，循环内每 30 秒读一次共享 holder。关闭时纯空转，
+///    不发任何上游请求、不写任何文件 —— 零行为回归照样成立；打开开关则立即
+///    热生效，不必重启。
+/// 3. **没有「启动后跑一次」**：那会让首次启动就改写 models.json，与零行为回归矛盾。
+fn spawn_model_sync_scheduler(
+    service: Arc<anthropic::model_sync::ModelSyncService>,
+    store: Arc<anthropic::model_registry_store::ModelRegistryStore>,
+    token_manager: Arc<MultiTokenManager>,
+    settings: Arc<parking_lot::RwLock<admin::ModelSyncSettings>>,
+) {
+    use chrono::Timelike;
+
+    tokio::spawn(async move {
+        tracing::info!("模型同步调度器已启动（开关状态在每轮循环中读取）");
+        // 同一分钟内避免重复触发：记录最近一次跑过的「日期 + 时:分」
+        let mut last_run_marker: Option<String> = None;
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+            let current = settings.read().clone();
+            if !current.enabled {
+                continue;
+            }
+            let Ok((target_hour, target_minute)) = admin::parse_auto_apply_time(&current.time)
+            else {
+                tracing::warn!("modelSyncTime 配置无效: {}，跳过本轮检查", current.time);
+                continue;
+            };
+
+            let now = chrono::Local::now();
+            let marker = format!("{}-{:02}:{:02}", now.format("%Y-%m-%d"), now.hour(), now.minute());
+            if now.hour() != target_hour || now.minute() != target_minute {
+                continue;
+            }
+            if last_run_marker.as_deref() == Some(marker.as_str()) {
+                continue;
+            }
+            last_run_marker = Some(marker);
+
+            match service.sync_once(current.probe_credential_id, chrono::Utc::now()).await {
+                Ok(s) => {
+                    tracing::info!(
+                        "模型同步完成: 轮次={:?} 新增={} 更新={} 标记deprecated={} 可信={} 来源={}",
+                        s.round, s.added, s.updated, s.deprecated, s.trusted, s.source
+                    );
+                    // 本轮顺带记录的 credentialSupport 要灌回调度层才生效。
+                    token_manager.set_credential_support(store.load().file.credential_support);
+                }
+                Err(e) => tracing::warn!("模型同步跳过: {}", e),
+            }
+        }
+    });
 }
 
 /// 文件不存在时初始化配置/凭证文件

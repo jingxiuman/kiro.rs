@@ -27,6 +27,18 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// 创建带有 KiroProvider 的 Anthropic API 路由
 ///
 /// 给嵌入到其他 Rust 项目的下游使用者预留的扩展点。
+///
+/// # 模型注册表契约（spec §3.2）
+///
+/// 本函数不接受配置，模型解析走进程级注册表
+/// （`crate::anthropic::model_registry` 的 `REGISTRY` holder）。
+///
+/// - **要用自定义模型表的调用方，必须在调用本函数之前**完成
+///   `model_registry::install_registry()` / `set_allow_passthrough()`
+///   （参见 `main.rs` 的启动接线）。router 建好之后再装，已经在途的请求
+///   可能用的还是旧表。
+/// - **不装也不会 panic**：holder 的初值就是 `ModelRegistry::builtin()`，
+///   未初始化时行为等同于改造前的硬编码模型表。
 #[allow(dead_code)]
 pub fn create_router_with_provider(
     kiro_provider: Option<KiroProvider>,

@@ -34,5 +34,9 @@ pub use groups::GroupManager;
 pub use middleware::AdminState;
 pub use router::create_admin_router;
 pub use service::AdminService;
+// 模型同步的运行时配置持有者由 main.rs 创建并与 AdminService 共享 ——
+// 调度器必须活在 admin 分支之外，但改开关的入口在 admin 里，两边得看同一份。
+pub use service::ModelSyncSettings;
+pub(crate) use service::parse_auto_apply_time;
 pub use usage_stats::{UsageAggregator, UsageRecorder};
 pub use trace_db::{SharedTraceStore, TraceStore};

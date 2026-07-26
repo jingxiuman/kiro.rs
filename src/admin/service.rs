@@ -158,7 +158,8 @@ pub struct ModelSyncSettings {
 }
 
 impl ModelSyncSettings {
-    fn from_config(config: &Config) -> Self {
+    /// pub(crate)：main.rs 需要在 admin 分支之外先建出共享 holder 给调度器用。
+    pub(crate) fn from_config(config: &Config) -> Self {
         Self {
             enabled: config.model_sync_enabled,
             time: config.model_sync_time.clone(),
@@ -191,8 +192,10 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
-    /// 模型同步运行时配置（可热改）
-    model_sync: parking_lot::RwLock<ModelSyncSettings>,
+    /// 模型同步运行时配置（可热改）。
+    /// `Arc` 是因为同步调度器创建在 admin 分支之外（spec §6.1），它和这里必须
+    /// 读同一份 holder，否则 UI 改了开关调度器看不到，得重启才生效。
+    model_sync: Arc<parking_lot::RwLock<ModelSyncSettings>>,
     /// config.json 写锁。既有的 `update_config_file` 是无保护的
     /// load-modify-save，本锁用于串行化本任务新增的写路径，避免并发丢失更新。
     config_write_lock: tokio::sync::Mutex<()>,
@@ -239,7 +242,8 @@ struct IdcAuthSession {
 
 /// 解析自动更新触发时间（`HH:MM`，本地 24 小时制）。允许 `H:M` 简写，
 /// 例如 `3:0`；解析失败时返回原字符串，便于错误信息提示。
-fn parse_auto_apply_time(value: &str) -> Result<(u32, u32), AdminServiceError> {
+/// pub(crate)：模型同步调度器建在 admin 分支之外（main.rs），需要同一套 HH:MM 解析。
+pub(crate) fn parse_auto_apply_time(value: &str) -> Result<(u32, u32), AdminServiceError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(AdminServiceError::InvalidCredential(
@@ -522,7 +526,7 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
-            model_sync: parking_lot::RwLock::new(model_sync),
+            model_sync: Arc::new(parking_lot::RwLock::new(model_sync)),
             config_write_lock: tokio::sync::Mutex::new(()),
             model_registry_store: None,
             model_sync_service: None,
@@ -1305,6 +1309,19 @@ impl AdminService {
         self
     }
 
+    /// 采用启动流程创建的共享同步配置 holder。
+    ///
+    /// 不这样做的话，`AdminService::new` 会自己从 config 复制一份，
+    /// `set_model_sync_settings` 只改到自己那份，admin 分支之外的调度器
+    /// 永远看的是启动瞬间的快照 —— 开关/时间/探针的修改都得重启才生效。
+    pub fn with_model_sync_settings(
+        mut self,
+        settings: Arc<parking_lot::RwLock<ModelSyncSettings>>,
+    ) -> Self {
+        self.model_sync = settings;
+        self
+    }
+
     fn registry_store(
         &self,
     ) -> Result<&Arc<crate::anthropic::model_registry_store::ModelRegistryStore>, AdminServiceError>
@@ -1426,6 +1443,13 @@ impl AdminService {
             .sync_once(probe, Utc::now())
             .await
             .map_err(|e| AdminServiceError::InternalError(format!("模型同步失败: {}", e)))?;
+
+        // 同步顺带刷新了 credentialSupport，落盘后要灌回调度层，否则手动同步之后
+        // 凭据过滤仍按上一份记录走（新记录到下次重启才生效）。
+        if let Some(store) = &self.model_registry_store {
+            self.token_manager
+                .set_credential_support(store.load().file.credential_support);
+        }
 
         Ok(crate::admin::types::SyncSummaryResponse {
             round: match summary.round {

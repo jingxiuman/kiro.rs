@@ -1032,9 +1032,8 @@ pub struct MultiTokenManager {
     stats_dirty: AtomicBool,
     /// 凭据可用模型集缓存：凭据 id 字符串 → upstream_id 列表。
     /// 来自 `ModelRegistryStore` 的 `credential_support` 字段（models.json）。
-    /// 注意：本字段目前无人填充/更新 —— 启动时的初始加载与同步后的刷新由
-    /// T12（启动接线）负责，此处只提供读取（`credential_matches_request`）与
-    /// 写入入口（`set_credential_support`）。
+    /// 填充时机：启动时由 `main.rs` 从 `models.json` 灌入，之后每轮同步
+    /// （定时调度器 / `POST /models/sync`）落盘成功后刷新。
     credential_support: parking_lot::RwLock<std::collections::HashMap<String, Vec<String>>>,
 }
 
@@ -1301,6 +1300,12 @@ impl MultiTokenManager {
     /// `file.credential_support` 做初始填充；模型同步完成后用最新数据整体替换。
     pub fn set_credential_support(&self, map: std::collections::HashMap<String, Vec<String>>) {
         *self.credential_support.write() = map;
+    }
+
+    /// 回读当前生效的凭据可用模型集。启动日志用它做"确实灌进来了"的回读校验，
+    /// 避免只凭"调用过 set_ 了"就宣称接线完成。
+    pub fn credential_support(&self) -> std::collections::HashMap<String, Vec<String>> {
+        self.credential_support.read().clone()
     }
 
     pub fn available_count(&self) -> usize {
