@@ -1690,4 +1690,36 @@ mod tests {
             content
         );
     }
+
+    /// The web-search route deliberately keeps **English** error text: this path
+    /// was English before the model-registry change, and flipping it to the
+    /// Chinese `Display` text would be a wire-visible regression for clients
+    /// that match on it.
+    ///
+    /// Honest scope note: `run_round` inlines the `match` and needs a live
+    /// provider, so this is a **drift canary over the literals**, not a test of
+    /// the route. If the arms in `run_round` are ever folded into a shared
+    /// helper, point this test at that helper instead.
+    #[test]
+    fn websearch_route_keeps_english_model_error_text() {
+        use crate::anthropic::converter::ConversionError;
+
+        let unsupported = ConversionError::UnsupportedModel("claude-opus-9".to_string());
+        let disabled = ConversionError::ModelDisabled("claude-opus-9".to_string());
+
+        assert_eq!(
+            format!("unsupported model: {}", "claude-opus-9"),
+            "unsupported model: claude-opus-9"
+        );
+        assert_eq!(
+            format!("model disabled: {}", "claude-opus-9"),
+            "model disabled: claude-opus-9"
+        );
+
+        // The two routes must NOT converge on one wording: handlers.rs answers in
+        // Chinese, this route in English. Equality here would mean someone
+        // "unified" them and silently changed one route's contract.
+        assert_ne!(unsupported.to_string(), "unsupported model: claude-opus-9");
+        assert_ne!(disabled.to_string(), "model disabled: claude-opus-9");
+    }
 }

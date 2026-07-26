@@ -1811,4 +1811,280 @@ mod tests {
         assert!(ids.contains(&"claude-sonnet-4-8"));
         assert!(ids.contains(&"claude-sonnet-4-8-thinking"));
     }
+
+    // ================= 模型注册表：端到端接缝（Task 14） =================
+    //
+    // 这一组测试的对象是**接缝**，不是解析/校验逻辑本身（后者由
+    // model_registry.rs / model_registry_store.rs 的单测覆盖）。这里只验证
+    // 「注册表 → 全局 holder → handlers → HTTP 响应」这条链真的通着：
+    // 单测里 `registry.exposed_models()` 全绿，不代表 `/v1/models` 端点
+    // 也读的是同一份表。
+    //
+    // **全局状态纪律**（本分支出过一次污染事故，务必遵守）：
+    // 1. 任何 `install_registry()` 的测试都先取 `REGISTRY_TEST_LOCK`。
+    //    仅靠「末尾复原」不够 —— 复原只保证测试**结束后**干净，不保证
+    //    执行期间另一个同样在改全局表的测试不会读到我的中间态，更糟的是
+    //    对方的「复原成 builtin」会直接抹掉我刚装上的表，让断言随机失败。
+    //    这把锁把所有写全局表的测试串成一条线。
+    // 2. 末尾一律 `install_registry(ModelRegistry::builtin())` 复原。
+    // 3. **只往 builtin 上追加合成行，绝不改动既有 builtin 行的标志位。**
+    //    这条是关键：converter.rs 与本文件里还有大量**不取锁**的测试
+    //    （`available_models_include_4_8_variants`、各种 `map_model` 断言）
+    //    在并行读全局表，锁管不到它们。追加一行谁也不认识的合成模型，
+    //    则无论怎样交错，它们的断言对象都没被动过。
+    use crate::anthropic::model_registry::{
+        builtin_rows, install_registry, ModelOrigin, ModelRegistry, ModelRow, ModelStatus,
+        REGISTRY_TEST_LOCK,
+    };
+
+    /// 以 opus-4.8 为模板造一行「谁也不认识」的合成模型，
+    /// 用于在不触碰任何既有 builtin 行的前提下测可见性规则。
+    fn t14_row(upstream: &str, sort: i32) -> ModelRow {
+        let mut row = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .expect("builtin 必须含 claude-opus-4.8");
+        row.upstream_id = upstream.to_string();
+        row.exposed_id = upstream.replace('.', "-");
+        row.display_name = format!("T14 {}", upstream);
+        row.origin = ModelOrigin::Synced;
+        row.sort_order = sort;
+        row.status = ModelStatus::Active;
+        row.enabled = true;
+        row.listed = true;
+        row.expose_thinking_variant = true;
+        row
+    }
+
+    /// `/v1/models` 的可见性规则必须跟随**当前装载的注册表**，而不是编译期常量。
+    ///
+    /// 三条规则一起断言（它们共用同一个 filter，分开写只会重复搭建成本）：
+    /// - `deprecated` 仍然出现 —— 上游下线不该让在用客户端的模型列表突然缺项；
+    /// - `enabled == false` 连同其 `-thinking` 变体一起移除 —— 人工下线要彻底；
+    /// - `listed == false` 不出现，但**仍可解析** —— 这是 gpt-5 prefix 行的语义。
+    #[test]
+    fn models_endpoint_visibility_follows_installed_registry() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut r = ModelRegistry::builtin();
+        {
+            let rows = r.rows_mut();
+            let mut dep = t14_row("t14-deprecated", 9001);
+            dep.status = ModelStatus::Deprecated;
+            rows.push(dep);
+
+            let mut off = t14_row("t14-disabled", 9002);
+            off.enabled = false;
+            rows.push(off);
+
+            let mut hidden = t14_row("t14-unlisted", 9003);
+            hidden.listed = false;
+            rows.push(hidden);
+        }
+        install_registry(r);
+
+        let ids: Vec<String> = available_models().into_iter().map(|m| m.id).collect();
+        let resolves = |name: &str| {
+            crate::anthropic::model_registry::current_registry().resolve(name, false)
+        };
+        let deprecated_still_resolves = matches!(
+            resolves("t14-deprecated"),
+            crate::anthropic::model_registry::Resolution::Mapped { .. }
+        );
+        let unlisted_still_resolves = matches!(
+            resolves("t14-unlisted"),
+            crate::anthropic::model_registry::Resolution::Mapped { .. }
+        );
+        let disabled_reason = resolves("t14-disabled");
+
+        // 断言前先复原，避免 panic 时把污染留给后续测试
+        install_registry(ModelRegistry::builtin());
+
+        assert!(ids.contains(&"t14-deprecated".to_string()), "deprecated 应保留在 /v1/models");
+        assert!(
+            ids.contains(&"t14-deprecated-thinking".to_string()),
+            "deprecated 行的 thinking 变体同样保留"
+        );
+        assert!(deprecated_still_resolves, "deprecated 仍必须可解析（不打断在用客户端）");
+
+        assert!(!ids.contains(&"t14-disabled".to_string()), "enabled=false 应从列表移除");
+        assert!(
+            !ids.contains(&"t14-disabled-thinking".to_string()),
+            "enabled=false 的 thinking 变体也要移除"
+        );
+        assert!(
+            matches!(
+                disabled_reason,
+                crate::anthropic::model_registry::Resolution::Rejected(
+                    crate::anthropic::model_registry::RejectReason::Disabled
+                )
+            ),
+            "禁用行应报 Disabled 而非 Unknown"
+        );
+
+        assert!(!ids.contains(&"t14-unlisted".to_string()), "listed=false 不应出现在列表");
+        assert!(unlisted_still_resolves, "listed=false 只影响列表，不影响解析");
+    }
+
+    /// `GET /v1/models` 的**响应报文**必须由注册表行逐字段派生。
+    ///
+    /// 单测 `exposed_models()` 断言的是 Vec<Model>，覆盖不到序列化这一层：
+    /// 字段名（`max_tokens` / `display_name` / `type`）走的是 serde 重命名，
+    /// 改错一个名字所有单测照样全绿、客户端却直接读不到。
+    ///
+    /// 同时钉死 `max_tokens` 取的是 `maxOutputTokens` 而**不是** contextWindow
+    /// —— 这两个量在改造前的硬编码里恰好都存在，混淆一次就会把 64K 输出上限
+    /// 报成 1M。这里刻意让两者取互不相同的值，混淆即失败。
+    #[tokio::test]
+    async fn get_models_endpoint_serializes_registry_rows() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut r = ModelRegistry::builtin();
+        {
+            let mut row = t14_row("t14-shape", 9004);
+            row.display_name = "T14 Shape".to_string();
+            row.owned_by = "t14-owner".to_string();
+            row.model_type = "t14-type".to_string();
+            row.created = 1_700_000_000;
+            row.context_window = 987_654; // 与下面的输出上限刻意不同
+            row.max_output_tokens = 12_345;
+            r.rows_mut().push(row);
+        }
+        install_registry(r);
+
+        let resp = get_models().await.into_response();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        install_registry(ModelRegistry::builtin());
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["object"], "list");
+
+        let data = json["data"].as_array().expect("data 必须是数组");
+        let base = data
+            .iter()
+            .find(|m| m["id"] == "t14-shape")
+            .expect("装载的行必须出现在 /v1/models 报文里");
+        assert_eq!(base["object"], "model");
+        assert_eq!(base["display_name"], "T14 Shape");
+        assert_eq!(base["owned_by"], "t14-owner");
+        assert_eq!(base["type"], "t14-type");
+        assert_eq!(base["created"], 1_700_000_000i64);
+        assert_eq!(base["max_tokens"], 12_345, "max_tokens 必须取 maxOutputTokens");
+        assert_ne!(base["max_tokens"], 987_654, "max_tokens 不得取 contextWindow");
+
+        let thinking = data
+            .iter()
+            .find(|m| m["id"] == "t14-shape-thinking")
+            .expect("thinking 变体应由 exposeThinkingVariant 派生");
+        assert_eq!(thinking["display_name"], "T14 Shape (Thinking)");
+        assert_eq!(thinking["max_tokens"], 12_345, "变体与基行共用同一组窗口值");
+    }
+
+    /// 零回归底线（spec §11.1）：**没有 `models.json` 时，`/v1/models` 的报文
+    /// 必须与纯内置默认逐字节一致。**
+    ///
+    /// 这条串起 store 的「文件缺失 → builtin 且不算降级」与 handlers 的
+    /// 「列表读全局表」两段。分开测都绿、接错线（比如启动时忘了 install、
+    /// 或 store 把 builtin 丢了）却发现不了，只有走完整条链才能钉住。
+    #[test]
+    fn absent_models_json_serves_byte_identical_builtin_listing() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("kiro-t14-absent-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let outcome = crate::anthropic::model_registry_store::ModelRegistryStore::new(path).load();
+        assert!(outcome.degraded_reason.is_none(), "文件不存在不是降级状态");
+
+        install_registry(outcome.registry);
+        let served = serde_json::to_string(&available_models()).unwrap();
+        install_registry(ModelRegistry::builtin());
+
+        let expected = serde_json::to_string(&ModelRegistry::builtin().exposed_models()).unwrap();
+        assert_eq!(served, expected, "无 models.json 时列表必须与内置默认逐字节一致");
+    }
+
+    /// 覆盖层的完整链路：`models.json` 落盘 → store 加载 → 装载全局 →
+    /// `/v1/models` 与请求解析同时反映它。
+    ///
+    /// 覆盖三件事：
+    /// - 覆盖层对**内置行**是叠加而非替换（不在文件里的内置行必须还在）；
+    /// - 被覆盖的字段真的走到了对外报文（displayName / maxOutputTokens）；
+    /// - `aliases` 只存在于文件里、不在内置默认中，能被 `map_model` 解析到。
+    #[tokio::test]
+    async fn overlay_file_flows_through_store_into_listing_and_resolution() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("kiro-t14-overlay-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store =
+            crate::anthropic::model_registry_store::ModelRegistryStore::new(path.clone());
+
+        store
+            .mutate(|f| {
+                let mut row = t14_row("t14-overlay", 9005);
+                row.display_name = "覆盖层名字".to_string();
+                row.max_output_tokens = 4_242;
+                f.models.push(row);
+                f.aliases.push(crate::anthropic::model_registry::ModelAlias {
+                    from: "t14-alias".to_string(),
+                    to: "t14-overlay".to_string(),
+                });
+                Ok(())
+            })
+            .await
+            .expect("覆盖层应通过校验并落盘");
+
+        let outcome = store.load();
+        let degraded = outcome.degraded_reason.clone();
+        install_registry(outcome.registry);
+
+        let models = available_models();
+        let alias_target = crate::anthropic::converter::map_model("t14-alias");
+        let builtin_still_there = models.iter().any(|m| m.id == "claude-opus-4-8");
+
+        install_registry(ModelRegistry::builtin());
+        let _ = std::fs::remove_file(&path);
+
+        assert!(degraded.is_none(), "合法覆盖层不应触发降级: {:?}", degraded);
+        assert!(builtin_still_there, "覆盖层必须叠加在内置默认之上，而不是替换掉它");
+
+        let row = models
+            .iter()
+            .find(|m| m.id == "t14-overlay")
+            .expect("覆盖层新增的行应出现在 /v1/models");
+        assert_eq!(row.display_name, "覆盖层名字");
+        assert_eq!(row.max_tokens, 4_242);
+
+        assert_eq!(
+            alias_target.as_deref(),
+            Some("t14-overlay"),
+            "只存在于 models.json 的 alias 必须能被请求解析用到"
+        );
+    }
+
+    /// 三条路由各自的未知/禁用模型文案。
+    ///
+    /// **这条只是文案漂移的哨兵，不是行为测试**：handlers 的两处（`post_messages`
+    /// 与 OpenAI 兼容层）与 websearch_loop 各自内联了一份 `format!`，无法在不
+    /// 起完整 handler 的前提下直接调用。这里断言的是它们各自参照的基准 ——
+    /// `ConversionError` 的 `Display`（中文）。websearch 路径的英文文案在
+    /// `websearch_loop.rs` 的同名测试里。
+    #[test]
+    fn unknown_model_messages_per_route_unchanged() {
+        use crate::anthropic::converter::ConversionError;
+
+        let e = ConversionError::UnsupportedModel("claude-opus-9".to_string());
+        assert_eq!(e.to_string(), "模型不支持: claude-opus-9");
+        assert_eq!(format!("模型不支持: {}", "claude-opus-9"), e.to_string());
+
+        let e = ConversionError::ModelDisabled("claude-opus-9".to_string());
+        assert_eq!(e.to_string(), "模型已禁用: claude-opus-9");
+        assert_eq!(format!("模型已禁用: {}", "claude-opus-9"), e.to_string());
+    }
 }
