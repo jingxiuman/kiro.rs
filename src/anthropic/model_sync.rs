@@ -265,6 +265,14 @@ impl ModelSyncService {
         let file = self
             .store
             .mutate(|file| {
+                // MN1：不变量维护——`origin=builtin` 的行本来就不该出现在覆盖层里
+                // （人工编辑产生 manual，同步产生 synced；builtin 只属于代码里的
+                // builtin_rows()）。这不是一次性迁移逻辑，而是每次写盘都维持的不变量。
+                // 必要性：跑过中间版本的开发环境，models.json 里躺着内置行的整行快照，
+                // N1 修掉的「冻结」bug 在这些文件上会继续生效——覆盖层里的快照会把代码
+                // 里的新定义挡掉。清掉它们即可让这些行回落到内置默认。
+                file.models.retain(|r| r.origin != ModelOrigin::Builtin);
+
                 // 乱序保护：已有更新的结果落盘则丢弃本轮。
                 //
                 // I2 修复：此前用 RFC3339 字符串字典序比较（`last > fetch_started_at.as_str()`），
@@ -401,14 +409,30 @@ impl ModelSyncService {
                     // 处理方式：只跳过消失判定，本轮的新增/更新照常写入（数据本身没错，
                     // 错的是「把它当成完整快照」）。日志用 error 级别——这是需要人介入
                     // 修改探针配置的问题，不是可以忽略的抖动。
-                    let unrepresentative = missing.len() * 2 > judged.len();
+                    //
+                    // N6：比例**只按 status == Active 的口径算**。行永不删除，若把已经
+                    // Deprecated 的行也算进分子，护栏就成了只增不减的棘轮：每正常退役
+                    // 一批模型，分子永久多一格、分母不变，比例单调上升，越过 50% 后消失
+                    // 判定永久锁死，只剩每轮重复的 error 日志——部署跑得越久越容易踩中。
+                    // 已经不在上游的行本来就不该参与「探针是否具代表性」的判断：护栏问的是
+                    // 「本轮新缺失的在服役模型占比是否高到不像真实退役」，而不是
+                    // 「表里有多少行不在上游」。
+                    //
+                    // 注意：只有**护栏判据**换口径，下面的计数循环仍遍历完整的 missing 集
+                    // （对已 Deprecated 的行继续累加 missing_sync_rounds 无害，且保留了
+                    // 「连续多少轮没见过」这个信息）。
+                    let active_judged =
+                        judged.iter().filter(|r| r.status == ModelStatus::Active).count();
+                    let active_missing =
+                        missing.iter().filter(|r| r.status == ModelStatus::Active).count();
+                    let unrepresentative = active_missing * 2 > active_judged;
                     if unrepresentative {
                         tracing::error!(
-                            "本轮权威同步的探针可能不具代表性：有效行集 {} 行中有 {} 行未被上游返回\
-                             （超过 50%）。已跳过本轮消失判定（新增/更新照常）。\
+                            "本轮权威同步的探针可能不具代表性：仍在服役（active）的 {} 行中有 {} 行\
+                             未被上游返回（超过 50%）。已跳过本轮消失判定（新增/更新照常）。\
                              请确认 modelSyncProbeCredentialId 指向的是最高订阅等级的凭据。",
-                            judged.len(),
-                            missing.len()
+                            active_judged,
+                            active_missing
                         );
                     } else {
                         for row in missing {
@@ -1133,6 +1157,186 @@ mod tests {
         let out = store.load();
         let opus = out.registry.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
         assert_eq!(opus.status, ModelStatus::Deprecated);
+    }
+
+    /// N6：护栏比例若把已 Deprecated 的行算进分子，就成了只增不减的棘轮 ——
+    /// 行永不删除，每正常退役一批模型分子就永久多一格、分母不变，越过 50% 后
+    /// 消失判定**再也回不去**，Task 9 存在的全部理由静默失效。
+    ///
+    /// 这里分两批退役，断言第二批仍能正常走到 Deprecated。
+    /// 按旧口径第二批的比例是 8/13 = 62%（含第一批已 Deprecated 的 4 个）→ 永久卡死；
+    /// 按 Active 口径是 4/9 = 44% → 正确放行。
+    #[tokio::test]
+    async fn guard_ratio_does_not_ratchet_after_normal_retirements() {
+        let _registry_guard =
+            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("n6-ratchet");
+
+        const BATCH_1: [&str; 4] =
+            ["claude-opus-4.5", "claude-sonnet-4.5", "claude-haiku-4.5", "gpt-5.6-luna"];
+        const BATCH_2: [&str; 4] =
+            ["claude-opus-4.6", "claude-sonnet-4.6", "claude-opus-4.7", "gpt-5.6-terra"];
+
+        let probe = |missing: Vec<&str>| {
+            Arc::new(FakeFetcher::new(vec![(3, Ok(builtin_upstream_models_without(&missing)))]))
+        };
+
+        // 第一批退役：4/13 = 31%，护栏放行，两轮后标记
+        for _ in 0..2 {
+            ModelSyncService::new(store.clone(), probe(BATCH_1.to_vec()))
+                .sync_once(Some(3), now())
+                .await
+                .unwrap();
+        }
+        let after_batch1 = store.load();
+        for id in BATCH_1 {
+            let row = after_batch1.registry.rows().iter().find(|r| r.upstream_id == id).unwrap();
+            assert_eq!(row.status, ModelStatus::Deprecated, "第一批 {} 应已退役", id);
+        }
+
+        // 第二批退役：原始缺失 8/13 = 62%（旧口径会永久卡死），
+        // 但其中 4 个早已 Deprecated，Active 口径是 4/9 = 44% → 必须放行
+        let both: Vec<&str> = BATCH_1.iter().chain(BATCH_2.iter()).copied().collect();
+        let s1 = ModelSyncService::new(store.clone(), probe(both.clone()))
+            .sync_once(Some(3), now())
+            .await
+            .unwrap();
+        assert_eq!(s1.deprecated, 0, "第二批第一轮只累计");
+        let mid = store.load();
+        for id in BATCH_2 {
+            let row = mid.registry.rows().iter().find(|r| r.upstream_id == id).unwrap();
+            assert_eq!(row.missing_sync_rounds, 1, "{} 的计数必须递增，护栏不该触发", id);
+        }
+
+        let s2 = ModelSyncService::new(store.clone(), probe(both))
+            .sync_once(Some(3), now())
+            .await
+            .unwrap();
+        assert_eq!(s2.deprecated, BATCH_2.len(), "第二批达阈值应被标记");
+        let out = store.load();
+        for id in BATCH_2 {
+            let row = out.registry.rows().iter().find(|r| r.upstream_id == id).unwrap();
+            assert_eq!(row.status, ModelStatus::Deprecated, "第二批 {} 应能正常退役", id);
+        }
+    }
+
+    /// N6 语义边界：护栏码路要区分**两种缺失比例相同、结论相反**的场景。
+    ///
+    /// 两个场景的「原始缺失比例」都是 8/13 = 62%，但：
+    /// - 场景 A「探针不具代表性」：13 行全是 Active，探针只返回 5 个 → 必须拦。
+    ///   探针看不到的那 8 个模型在上游是存在的，把它们标 deprecated 就是误报。
+    /// - 场景 B「上游合法批量退役」：其中 4 个早已 Deprecated（上一批正常退役），
+    ///   本轮真正新消失的只有 4 个 → 必须放行。已经不在上游的行不该再参与
+    ///   「探针是否具代表性」的判断。
+    ///
+    /// 这条测试把护栏的语义钉死：判据是「**本轮新缺失的 Active 行**占
+    /// **仍在服役的 Active 行**的比例」，不是「缺失行占全部行的比例」。
+    #[tokio::test]
+    async fn guard_distinguishes_unrepresentative_probe_from_bulk_retirement() {
+        let _registry_guard =
+            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        const FIRST_WAVE: [&str; 4] =
+            ["claude-opus-4.5", "claude-sonnet-4.5", "claude-haiku-4.5", "gpt-5.6-luna"];
+        const SECOND_WAVE: [&str; 4] =
+            ["claude-opus-4.6", "claude-sonnet-4.6", "claude-opus-4.7", "gpt-5.6-terra"];
+        let all_missing: Vec<&str> =
+            FIRST_WAVE.iter().chain(SECOND_WAVE.iter()).copied().collect();
+        // 前置检查：两个场景的原始缺失比例确实相同，否则这条对照就不成立
+        let exact_rows = crate::anthropic::model_registry::builtin_rows()
+            .into_iter()
+            .filter(|r| r.match_kind != MatchKind::Prefix)
+            .count();
+        assert_eq!(exact_rows, 13);
+        assert!(all_missing.len() * 2 > exact_rows, "两个场景的原始缺失比例都应超过 50%");
+
+        let probe = |missing: Vec<&str>| {
+            Arc::new(FakeFetcher::new(vec![(3, Ok(builtin_upstream_models_without(&missing)))]))
+        };
+
+        // ---- 场景 A：探针不具代表性 → 拦 ----
+        {
+            let store = tmp_store("n6-boundary-unrepresentative");
+            for _ in 0..2 {
+                let s = ModelSyncService::new(store.clone(), probe(all_missing.clone()))
+                    .sync_once(Some(3), now())
+                    .await
+                    .unwrap();
+                assert_eq!(s.deprecated, 0);
+            }
+            let out = store.load();
+            for id in all_missing.iter() {
+                let row = out.registry.rows().iter().find(|r| &r.upstream_id == id).unwrap();
+                assert_eq!(row.missing_sync_rounds, 0, "{} 不该被计数：探针不具代表性", id);
+                assert_eq!(row.status, ModelStatus::Active);
+            }
+        }
+
+        // ---- 场景 B：上游合法批量退役 → 放行 ----
+        {
+            let store = tmp_store("n6-boundary-bulk-retirement");
+            // 先让 FIRST_WAVE 正常退役（4/13 = 31%，护栏不触发）
+            for _ in 0..2 {
+                ModelSyncService::new(store.clone(), probe(FIRST_WAVE.to_vec()))
+                    .sync_once(Some(3), now())
+                    .await
+                    .unwrap();
+            }
+            // 此刻缺失集与场景 A 完全相同（8/13），但 4 个已 Deprecated
+            for _ in 0..2 {
+                ModelSyncService::new(store.clone(), probe(all_missing.clone()))
+                    .sync_once(Some(3), now())
+                    .await
+                    .unwrap();
+            }
+            let out = store.load();
+            for id in SECOND_WAVE {
+                let row = out.registry.rows().iter().find(|r| r.upstream_id == id).unwrap();
+                assert_eq!(
+                    row.status,
+                    ModelStatus::Deprecated,
+                    "{}：缺失比例与场景 A 相同，但这是合法批量退役，必须放行",
+                    id
+                );
+            }
+        }
+    }
+
+    /// MN1：`origin=builtin` 的行本就不该出现在覆盖层（人工编辑产生 manual、
+    /// 同步产生 synced）。跑过中间版本的开发环境里躺着 14 行 builtin 快照，
+    /// N1 修掉的冻结 bug 在这些文件上继续生效，所以每次写盘顺手清理。
+    #[tokio::test]
+    async fn mutate_drops_stale_builtin_snapshot_rows_from_overlay() {
+        use crate::anthropic::model_registry::{builtin_rows, ModelOrigin};
+        let _registry_guard =
+            crate::anthropic::model_registry::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("mn1-drop-builtin-snapshot");
+
+        // 模拟老文件：覆盖层里躺着一份内置行的整行快照，窗口是写入那一刻的旧值
+        store
+            .mutate(|file| {
+                let mut stale = builtin_rows()
+                    .into_iter()
+                    .find(|r| r.upstream_id == "claude-opus-4.8")
+                    .unwrap();
+                stale.context_window = 111_000;
+                file.models.push(stale);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let fetcher = || Arc::new(FakeFetcher::new(vec![(3, Ok(builtin_upstream_models()))]));
+        ModelSyncService::new(store.clone(), fetcher()).sync_once(Some(3), now()).await.unwrap();
+
+        let out = store.load();
+        assert!(
+            !out.file.models.iter().any(|r| r.origin == ModelOrigin::Builtin),
+            "覆盖层里不该残留 origin=builtin 的行"
+        );
+        // 冻结的旧值随之消失，解析结果回到代码里的内置定义
+        let row = out.registry.rows().iter().find(|r| r.upstream_id == "claude-opus-4.8").unwrap();
+        assert_eq!(row.context_window, 1_000_000, "清理后应回到代码里的内置定义");
     }
 
     /// N4：探针失败后的降级采样不得再把刚失败的探针 id 选进来 ——

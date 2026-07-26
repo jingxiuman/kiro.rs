@@ -655,8 +655,9 @@ impl ModelRegistry {
     /// `from_file` 的可注入内置集版本。**存在的唯一理由是可测性**：
     /// 「代码里的内置行定义变了、已有部署必须跟着变」这条回归无法用固定的
     /// `builtin_rows()` 表达，需要注入一份「新版代码」的内置集来断言。
-    /// 生产代码只应调用 `from_file`。
-    pub fn from_file_with_builtin(
+    /// 生产代码只应调用 `from_file` —— 收窄为 `pub(crate)` 把这条约定从注释
+    /// 变成编译器保证。
+    pub(crate) fn from_file_with_builtin(
         builtin: Vec<ModelRow>,
         file: ModelRegistryFile,
     ) -> Result<Self, String> {
