@@ -1323,6 +1323,22 @@ pub async fn list_traces(
                     })
                 })
                 .collect();
+            // 流生命周期分段；非流式请求为空数组（前端据此渲染「非流式请求，无流生命周期分段」）
+            let phases: Vec<serde_json::Value> = r
+                .phases
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "seq": p.seq,
+                        "phase": p.phase,
+                        "startedMs": p.started_ms,
+                        "durationMs": p.duration_ms,
+                        "outcome": p.outcome,
+                        "bytes": p.bytes,
+                        "detail": p.detail,
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "traceId": r.trace_id,
                 "ts": r.ts,
@@ -1346,7 +1362,9 @@ pub async fn list_traces(
                 "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
                 "credits": r.credits,
                 "firstTokenMs": r.first_token_ms,
+                "sessionId": r.session_id,
                 "attempts": attempts,
+                "phases": phases,
             })
         })
         .collect();
@@ -1793,4 +1811,16 @@ pub async fn ops_events(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100);
     Json(ops.events().recent_events(limit)).into_response()
+}
+
+/// GET /api/admin/ops/phase-baseline?hours=24
+/// 按 (段, 出口) 的窗口失败率——错误详情里对照「这个出口平时就这样吗」的基线
+pub async fn ops_phase_baseline(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(ops) = state.service.ops() else {
+        return ops_unavailable();
+    };
+    Json(ops.events().phase_baseline(parse_ops_hours(&params))).into_response()
 }

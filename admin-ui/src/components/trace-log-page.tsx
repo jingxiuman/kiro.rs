@@ -43,7 +43,10 @@ import {
   useSetLogGovernanceConfig,
 } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { TraceAttempt, TraceQuery, TraceRecord } from '@/types/api'
+import { formatDuration } from '@/lib/format'
+import { TracePhaseLane } from '@/components/trace-phase-lane'
+import { usePhaseBaseline } from '@/hooks/use-ops'
+import type { PhaseBaselineRow, TraceAttempt, TraceQuery, TraceRecord } from '@/types/api'
 
 /** 失败分类 → 中文标签 + Badge 颜色 */
 function outcomeStyle(outcome: string): {
@@ -106,11 +109,6 @@ function formatTime(ts: string): string {
   return d.toLocaleString('zh-CN', { hour12: false })
 }
 
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`
-  return `${(ms / 1000).toFixed(2)}s`
-}
-
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
   if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
@@ -153,6 +151,23 @@ const ERROR_TYPE_OPTIONS = [
   { value: 'unknown', label: '未知' },
 ]
 
+/** 出口三态：direct = 直连；null/undefined = 未知（该列存在前的历史行）；其余 = 代理 URL */
+function ProxyLabel({ url }: { url?: string | null }) {
+  if (url == null) {
+    return (
+      <span className="font-mono text-[12px] text-muted-foreground/60" title="该记录早于出口埋点，真实出口不可知">
+        未知
+      </span>
+    )
+  }
+  const text = url === 'direct' ? '直连' : url
+  return (
+    <span className="max-w-[220px] truncate font-mono text-[12px]" title={text}>
+      {text}
+    </span>
+  )
+}
+
 /** 单跳明细行 */
 function AttemptRow({ a }: { a: TraceAttempt }) {
   const style = outcomeStyle(a.outcome)
@@ -167,9 +182,7 @@ function AttemptRow({ a }: { a: TraceAttempt }) {
         <span className="text-muted-foreground">HTTP</span>
         <span className="font-mono">{a.httpStatus ?? '—'}</span>
         <span className="text-muted-foreground">出口</span>
-        <span className="max-w-[220px] truncate font-mono text-[12px]" title={a.proxyUrl ?? '直连'}>
-          {a.proxyUrl ?? '直连'}
-        </span>
+        <ProxyLabel url={a.proxyUrl} />
         <span className="ml-auto font-mono text-muted-foreground">
           {formatDuration(a.durationMs)}
         </span>
@@ -238,7 +251,7 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   )
 }
 
-function TraceRow({ rec }: { rec: TraceRecord }) {
+function TraceRow({ rec, baseline }: { rec: TraceRecord; baseline: PhaseBaselineRow[] | undefined }) {
   const [open, setOpen] = useState(false)
   const errStyle = rec.errorType ? outcomeStyle(rec.errorType) : null
   return (
@@ -287,7 +300,7 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
           {formatDuration(rec.durationMs)}
         </td>
       </tr>
-      {open && <ExpandedTraceRow rec={rec} />}
+      {open && <ExpandedTraceRow rec={rec} baseline={baseline} />}
     </>
   )
 }
@@ -302,20 +315,50 @@ function TraceCredentialCell({ rec }: { rec: TraceRecord }) {
   )
 }
 
-function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
+function ExpandedTraceRow({
+  rec,
+  baseline,
+}: {
+  rec: TraceRecord
+  baseline: PhaseBaselineRow[] | undefined
+}) {
   return (
     <tr className="border-b border-border/40 bg-secondary/20">
       <td colSpan={12} className="px-3 py-3">
-        <ExpandedDetail rec={rec} />
+        <ExpandedDetail rec={rec} baseline={baseline} />
       </td>
     </tr>
   )
 }
 
-/** 展开后的链路详情：错误摘要 + 每跳时间线 */
-function ExpandedDetail({ rec }: { rec: TraceRecord }) {
+/** 展开后的链路详情：错误摘要 + 每跳时间线 + 流生命周期泳道 */
+function ExpandedDetail({
+  rec,
+  baseline,
+}: {
+  rec: TraceRecord
+  baseline: PhaseBaselineRow[] | undefined
+}) {
   return (
     <div className="space-y-3">
+      {rec.sessionId && (
+        <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
+          <span>会话</span>
+          <span
+            className="cursor-pointer font-mono text-foreground/80"
+            title={`完整会话 id: ${rec.sessionId}（点击复制）`}
+            onClick={() => {
+              navigator.clipboard?.writeText(rec.sessionId ?? '')
+              toast.success('已复制会话 id')
+            }}
+          >
+            {rec.sessionId.slice(0, 8)}
+          </span>
+          <span className="text-muted-foreground/60">
+            —— compact 前后对比此 id 是否变化，可判断是否换了会话
+          </span>
+        </div>
+      )}
       {rec.errorMessage && (
         <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[13px] text-destructive">
           {rec.errorMessage}
@@ -336,6 +379,14 @@ function ExpandedDetail({ rec }: { rec: TraceRecord }) {
         ) : (
           rec.attempts.map((a) => <AttemptRow key={a.attempt} a={a} />)
         )}
+      </div>
+      <div className="mt-3 text-[13px] font-medium text-muted-foreground">流生命周期</div>
+      <div className="mt-2">
+        <TracePhaseLane
+          phases={rec.phases ?? []}
+          proxyUrl={rec.attempts[rec.attempts.length - 1]?.proxyUrl}
+          baseline={baseline}
+        />
       </div>
     </div>
   )
@@ -522,6 +573,7 @@ export function TraceLogPage() {
     offset: page * PAGE_SIZE,
   }
   const { data, isLoading, isFetching, refetch } = useTraces(query)
+  const { data: baseline } = usePhaseBaseline(24)
   const records = data?.records ?? []
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
@@ -591,7 +643,7 @@ export function TraceLogPage() {
                 </thead>
                 <tbody>
                   {records.map((rec) => (
-                    <TraceRow key={rec.traceId} rec={rec} />
+                    <TraceRow key={rec.traceId} rec={rec} baseline={baseline} />
                   ))}
                 </tbody>
               </table>

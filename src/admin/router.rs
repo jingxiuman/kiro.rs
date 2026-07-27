@@ -20,7 +20,7 @@ use super::{
         get_all_credentials, get_credential_balance, get_credential_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_update_config,
         list_client_keys, list_groups, list_traces, trace_failure_stats,
-        ops_overview, ops_trend, ops_by_credential, ops_by_proxy, ops_events, poll_idc_login,
+        ops_overview, ops_trend, ops_by_credential, ops_by_proxy, ops_events, ops_phase_baseline, poll_idc_login,
         poll_idc_relogin, poll_social_login,
         poll_social_relogin, pull_update_image, reset_all_success_count, reset_client_key_stats,
         reset_failure_count, reset_success_count, rollback_image_update, rotate_client_key,
@@ -178,6 +178,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/ops/credentials", get(ops_by_credential))
         .route("/ops/proxies", get(ops_by_proxy))
         .route("/ops/events", get(ops_events))
+        .route("/ops/phase-baseline", get(ops_phase_baseline))
         .route("/models", get(get_model_registry).post(create_model))
         .route("/models/sync", post(sync_models))
         .route("/models/aliases", post(upsert_alias).delete(delete_alias))

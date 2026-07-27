@@ -957,6 +957,17 @@ impl std::fmt::Display for ToolJsonAccumulatorError {
 
 impl std::error::Error for ToolJsonAccumulatorError {}
 
+/// 把累积器错误映射到 phase outcome。
+/// 截断 = 传输链路问题（计入代理健康）；非法 = 上游内容问题（不计入）。
+/// 与 `is_incomplete()` 的注释保持同一口径。
+pub fn phase_outcome_for(err: &ToolJsonAccumulatorError) -> &'static str {
+    if err.is_incomplete() {
+        crate::admin::trace_db::outcome::UPSTREAM_TRUNCATED
+    } else {
+        crate::admin::trace_db::outcome::UPSTREAM_INVALID
+    }
+}
+
 /// 工具调用参数（JSON）累积器。
 ///
 /// Kiro 把 tool_use 的 `input` JSON 拆成多个 `toolUseEvent` 分片下发，最后一片
@@ -1443,6 +1454,11 @@ impl StreamContext {
     /// 有错误时返回 Some(是否截断)；无错误返回 None。见 [`ToolJsonAccumulatorError::is_incomplete`]。
     pub fn tool_json_error_incomplete(&self) -> Option<bool> {
         self.tool_json_error.as_ref().map(|err| err.is_incomplete())
+    }
+
+    /// 工具调用 JSON 错误的完整值（供 finish 段埋点走 `phase_outcome_for` 统一映射）。
+    pub fn tool_json_error(&self) -> Option<&ToolJsonAccumulatorError> {
+        self.tool_json_error.as_ref()
     }
 
     /// 创建 StreamContext。
@@ -2656,6 +2672,11 @@ impl BufferedStreamContext {
     /// 工具调用 JSON 错误是否为上游截断（转发内部 StreamContext）。
     pub fn tool_json_error_incomplete(&self) -> Option<bool> {
         self.inner.tool_json_error_incomplete()
+    }
+
+    /// 工具调用 JSON 错误的完整值（转发内部 StreamContext）。
+    pub fn tool_json_error(&self) -> Option<&ToolJsonAccumulatorError> {
+        self.inner.tool_json_error()
     }
 }
 
@@ -4852,5 +4873,40 @@ mod tests {
         assert!(usage.get("credit_usage").is_none());
         assert!(usage.get("credit_unit").is_none());
         assert!(usage.get("credit_unit_plural").is_none());
+    }
+
+    #[test]
+    fn truncated_tool_json_maps_to_upstream_truncated_outcome() {
+        let mut acc = ToolJsonAccumulator::new();
+        let map = HashMap::new();
+        // 分片写到一半，从未收到 stop=true
+        acc.push(
+            &tool_evt("tu-1", "str_replace", r#"{"file_path":"/a/b.rs","old_"#, false),
+            &map,
+        )
+        .expect("未 stop 的分片只累积，不应报错");
+
+        let err = acc.finish().expect_err("半截 JSON 必须由 finish 报错");
+        assert!(err.is_incomplete(), "应归 IncompleteJson（传输截断）而非 InvalidJson");
+        assert_eq!(err.error_type(), "upstream_tool_json_error");
+        assert_eq!(
+            phase_outcome_for(&err),
+            crate::admin::trace_db::outcome::UPSTREAM_TRUNCATED
+        );
+    }
+
+    #[test]
+    fn invalid_tool_json_maps_to_upstream_invalid_outcome() {
+        let mut acc = ToolJsonAccumulator::new();
+        let map = HashMap::new();
+        // 完整收到 stop=true，但 JSON 非法 —— push 当场报错
+        let err = acc
+            .push(&tool_evt("tu-2", "str_replace", r#"{"file_path": }"#, true), &map)
+            .expect_err("非法 JSON 必须由 push 报错");
+        assert!(!err.is_incomplete(), "完整但非法应归 InvalidJson，不罚代理");
+        assert_eq!(
+            phase_outcome_for(&err),
+            crate::admin::trace_db::outcome::UPSTREAM_INVALID
+        );
     }
 }

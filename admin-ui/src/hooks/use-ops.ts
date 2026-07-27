@@ -5,6 +5,7 @@ import {
   getOpsOverview,
   getOpsProxies,
   getOpsTrend,
+  getPhaseBaseline,
 } from '@/api/ops'
 
 /** 与 use-stats 同样的刷新策略：30s 轮询、切窗口保留旧数据 */
@@ -51,6 +52,14 @@ export function useOpsEvents(limit = 100) {
   return useQuery({
     queryKey: ['ops', 'events', limit],
     queryFn: () => getOpsEvents(limit),
+    ...COMMON,
+  })
+}
+
+export function usePhaseBaseline(hours = 24) {
+  return useQuery({
+    queryKey: ['ops', 'phase-baseline', hours],
+    queryFn: () => getPhaseBaseline(hours),
     ...COMMON,
   })
 }

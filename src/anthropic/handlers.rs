@@ -6,7 +6,8 @@ use std::time::Instant;
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::admin::trace_db::{
-    SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
+    SharedTraceStore, TraceAttempt, TraceKeySource, TracePhase, TraceRecord, TraceSink, outcome,
+    phase,
 };
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
@@ -30,7 +31,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{BufferedStreamContext, SseEvent, StreamContext, ToolJsonAccumulatorError};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -129,10 +130,16 @@ pub(crate) struct RequestTracer {
     key_source: TraceKeySource,
     model: String,
     is_stream: bool,
+    /// Claude Code 会话 id（metadata.user_id 的 `_session_<uuid>`），可为 None
+    session_id: Option<String>,
     started_at: Instant,
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
+    /// 已关闭的流生命周期段
+    phases: parking_lot::Mutex<Vec<TracePhase>>,
+    /// 当前打开的段：(段名, 起点)
+    open_phase: parking_lot::Mutex<Option<(&'static str, Instant)>>,
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -156,6 +163,17 @@ struct RequestTraceOptions {
     key_ctx: KeyContext,
     model: String,
     is_stream: bool,
+    session_id: Option<String>,
+}
+
+/// 从请求 metadata.user_id 提取 Claude Code 会话 id（`_session_<uuid>`）。
+/// 无 metadata / 非该格式时返回 None。
+fn session_id_of(payload: &super::types::MessagesRequest) -> Option<String> {
+    payload
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .and_then(super::cache_metering::extract_session_id)
 }
 
 impl RequestTracer {
@@ -168,9 +186,12 @@ impl RequestTracer {
             key_source: options.key_ctx.key_source,
             model: options.model,
             is_stream: options.is_stream,
+            session_id: options.session_id,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            phases: parking_lot::Mutex::new(Vec::new()),
+            open_phase: parking_lot::Mutex::new(None),
         }
     }
 
@@ -180,6 +201,38 @@ impl RequestTracer {
         if slot.is_none() {
             *slot = Some(Instant::now());
         }
+    }
+
+    /// 打开一个流生命周期段。重复 open 会覆盖前一个未关闭的段（视为埋点漏关，丢弃之）。
+    pub fn open_phase(&self, name: &'static str) {
+        *self.open_phase.lock() = Some((name, Instant::now()));
+    }
+
+    /// 关闭当前段并入队。名字不匹配或未 open 时静默忽略——埋点错误不得影响主流程。
+    pub fn close_phase(
+        &self,
+        name: &'static str,
+        outcome: &str,
+        bytes: Option<u64>,
+        detail: Option<String>,
+    ) {
+        let Some((open_name, started)) = self.open_phase.lock().take() else {
+            return;
+        };
+        if open_name != name {
+            return;
+        }
+        let mut phases = self.phases.lock();
+        let seq = phases.len() as u32;
+        phases.push(TracePhase {
+            seq,
+            phase: name.to_string(),
+            started_ms: started.duration_since(self.started_at).as_millis() as u64,
+            duration_ms: started.elapsed().as_millis() as u64,
+            outcome: outcome.to_string(),
+            bytes,
+            detail,
+        });
     }
 
     /// 组装并落库一条完整链路。store 为 None 时不做任何事。
@@ -193,6 +246,7 @@ impl RequestTracer {
     ) {
         let Some(store) = &self.store else { return };
         let attempts = std::mem::take(&mut *self.attempts.lock());
+        let phases = std::mem::take(&mut *self.phases.lock());
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
         let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
         let first_token_ms = self
@@ -219,9 +273,38 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
+            session_id: self.session_id.clone(),
             attempts,
+            phases,
         };
         store.insert(&rec);
+    }
+
+    /// 客户端断开专用的收尾：`finalize` 在这条路径上原本永不会被调用——
+    /// unfold 的 `None` 分支因为响应 body 被 axum 直接丢弃而永不执行，
+    /// `StreamPhaseGuard::Drop` 是唯一能观测到断连的位置。复用 `finalize`
+    /// 而不是重写一份落库逻辑，保持 attempts/phases 组装单一入口。
+    ///
+    /// `current_phase` 必须是 guard 实际打开的那个段名（FIRST_TOKEN 或
+    /// STREAMING），不能硬编码——理由与 `StreamPhaseGuard::current_phase`
+    /// 字段的文档一致。
+    pub fn finalize_on_disconnect(&self, current_phase: &'static str, sent_bytes: u64, detail: String) {
+        self.close_phase(
+            current_phase,
+            crate::admin::trace_db::outcome::CLIENT_DISCONNECTED,
+            Some(sent_bytes),
+            Some(detail.clone()),
+        );
+        // "interrupted" 与实时/缓冲流路径里上游断流复用同一个 final_status
+        // （见 handlers.rs 中 STREAM_INTERRUPTED 的两处先例），仅 error_type
+        // 换成 CLIENT_DISCONNECTED 以区分责任方。
+        self.finalize(
+            "interrupted",
+            Some(crate::admin::trace_db::outcome::CLIENT_DISCONNECTED),
+            Some(&detail),
+            Some(sent_bytes),
+            TraceUsage::zero(),
+        );
     }
 }
 
@@ -229,6 +312,128 @@ impl TraceSink for RequestTracer {
     fn on_attempt(&self, attempt: TraceAttempt) {
         self.attempts.lock().push(attempt);
     }
+}
+
+/// 挂在流状态里的哨兵：流被 drop 而未经由终态方法收尾时，说明客户端提前断开。
+///
+/// 需要它的原因：客户端断开时 axum 直接 drop response body，unfold 的
+/// `None` 分支永不执行，`finalize` 也就永不调用——该请求会在 traces 里完全消失。
+/// Drop 是唯一能观测到这件事的位置。
+///
+/// **方向性风险与防线**：`armed` 默认 `true`——任何未经解释的 drop 都会被记成
+/// `client_disconnected`。这是刻意的：判定必须"宁可冤枉（错记成客户端断开），
+/// 不可漏放（把真实的上游故障悄悄吞掉、代理逃过追责）"。防线是两个按值消费的
+/// 终态方法 `into_completed` / `into_upstream_error`——它们各自解除 `armed`
+/// 后再记录真实结果，编译器保证调用后 guard 被移走、`Drop` 变成 no-op。
+/// 未来新增任何"流退出"分支，都必须经过这两个方法之一；否则一次遗漏就会把
+/// 真实的上游故障悄悄记成客户端断开。
+pub(crate) struct StreamPhaseGuard {
+    tracer: std::sync::Arc<RequestTracer>,
+    sent_bytes: u64,
+    last_chunk_at: Instant,
+    armed: bool,
+    /// guard 构造时打开的是 FIRST_TOKEN 段；[`Self::mark_first_chunk`] 把它切到
+    /// STREAMING。终态方法/Drop 必须按这个字段收尾，不能硬编码 STREAMING——
+    /// 否则若 guard 在首个 chunk 到达前就被消费（上游零 chunk 断流、或客户端在
+    /// 等待首个 token 期间断开），close_phase 会因段名不匹配把 FIRST_TOKEN 段
+    /// 静默丢弃（见 close_phase 文档），这正是本功能要防止的"静默丢失"本身。
+    current_phase: &'static str,
+}
+
+impl StreamPhaseGuard {
+    pub fn new(tracer: std::sync::Arc<RequestTracer>, sent_bytes: u64) -> Self {
+        Self {
+            tracer,
+            sent_bytes,
+            last_chunk_at: Instant::now(),
+            armed: true,
+            current_phase: phase::FIRST_TOKEN,
+        }
+    }
+
+    /// 首个 chunk 到达：关闭 first_token 段，打开 streaming 段，并让 guard
+    /// 记住当前打开的是哪个段。幂等由调用方的 first_chunk 标志保证
+    /// （两条流路径各自维护，只在 first_chunk == true 时调用一次）。
+    pub fn mark_first_chunk(&mut self) {
+        self.tracer.close_phase(phase::FIRST_TOKEN, outcome::SUCCESS, Some(0), None);
+        self.tracer.open_phase(phase::STREAMING);
+        self.current_phase = phase::STREAMING;
+    }
+
+    /// 更新已发送字节数与最后一个 chunk 的时刻（每个 chunk 后调用）
+    pub fn set_bytes(&mut self, sent_bytes: u64) {
+        self.sent_bytes = sent_bytes;
+        self.last_chunk_at = Instant::now();
+    }
+
+    /// 距上一个 chunk 的间隔——区分「突然断」与「先卡死再断」
+    pub fn idle_ms(&self) -> u64 {
+        self.last_chunk_at.elapsed().as_millis() as u64
+    }
+
+    /// 流正常结束：按值消费 guard，记当前实际打开的段（FIRST_TOKEN 或
+    /// STREAMING，取决于是否已收到过 chunk）成功。
+    pub fn into_completed(mut self, sent_bytes: u64) {
+        self.armed = false; // 先解除，随后的 Drop 成为 no-op
+        self.tracer.close_phase(
+            self.current_phase,
+            crate::admin::trace_db::outcome::SUCCESS,
+            Some(sent_bytes),
+            None,
+        );
+    }
+
+    /// 上游断流：按值消费 guard，记当前实际打开的段为 stream_interrupted 并写齐三个判别位。
+    pub fn into_upstream_error(mut self, sent_bytes: u64, err: &dyn std::fmt::Display) {
+        self.armed = false;
+        let idle_ms = self.idle_ms();
+        self.tracer.close_phase(
+            self.current_phase,
+            crate::admin::trace_db::outcome::STREAM_INTERRUPTED,
+            Some(sent_bytes),
+            Some(format!(
+                "client_gone=false bytes={} idle_ms={} err={}",
+                sent_bytes, idle_ms, err
+            )),
+        );
+    }
+}
+
+impl Drop for StreamPhaseGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let detail = format!(
+            "client_gone=true bytes={} idle_ms={}",
+            self.sent_bytes,
+            self.idle_ms()
+        );
+        // 断连时 finalize() 永不会被正常调用（见 finalize_on_disconnect 文档），
+        // 这里必须连带落库，否则该请求会在 traces 表里完全消失。
+        self.tracer
+            .finalize_on_disconnect(self.current_phase, self.sent_bytes, detail);
+    }
+}
+
+/// 流正常结束的 finish 段：按 tool_use 累积器结果开合。
+///
+/// streaming 段本身由 [`StreamPhaseGuard::into_completed`] 关闭，此处只管 finish——
+/// **调用方必须保证 guard 已经消费完毕再调用本函数**：`open_phase` 会覆盖当前打开的段，
+/// 若在 guard 消费前 open(FINISH)，guard 随后 close(STREAMING) 会因段名不匹配被静默
+/// 忽略，streaming 段就此丢失且无任何报错（这是本任务的第一个陷阱）。
+pub(crate) fn phase_on_finish(
+    tracer: &RequestTracer,
+    sent_bytes: u64,
+    tool_json_error: Option<&ToolJsonAccumulatorError>,
+    tool_json_message: Option<String>,
+) {
+    tracer.open_phase(phase::FINISH);
+    let finish_outcome = match tool_json_error {
+        Some(err) => crate::anthropic::stream::phase_outcome_for(err),
+        None => outcome::SUCCESS,
+    };
+    tracer.close_phase(phase::FINISH, finish_outcome, Some(sent_bytes), tool_json_message);
 }
 
 /// 取追踪器里最后一跳的 outcome（用于把 provider 的失败分类提升到 record.error_type）。
@@ -358,6 +563,25 @@ pub(super) fn map_provider_error(err: Error) -> Response {
             Json(ErrorResponse::new(
                 "invalid_request_error",
                 "Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered.".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    // 上游临时过载（AWS Kiro：500 MODEL_TEMPORARILY_UNAVAILABLE / "high load"）。
+    // provider 已按瞬态错误重试 4 次仍失败。映射为 529 overloaded_error 而非 502：
+    // 529 是 Anthropic 语义的"过载"，上游网关/客户端据此走"退避重试 / 切换账号"，
+    // 而 502(bad gateway) 常被判为"该上游坏了"，反而放大故障转移。
+    if err_str.contains("MODEL_TEMPORARILY_UNAVAILABLE")
+        || err_str.contains("high load")
+    {
+        tracing::warn!(error = %err, "上游临时过载（映射为 529 overloaded_error）");
+        let status = StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+        return (
+            status,
+            Json(ErrorResponse::new(
+                "overloaded_error",
+                "Upstream model temporarily unavailable due to high load. Retry later.",
             )),
         )
             .into_response();
@@ -583,6 +807,7 @@ pub async fn post_messages(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
+                session_id: session_id_of(&payload),
             },
         ));
         handle_stream_request(
@@ -609,6 +834,7 @@ pub async fn post_messages(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
+                session_id: session_id_of(&payload),
             },
         ));
         handle_non_stream_request(
@@ -767,9 +993,13 @@ fn create_sse_stream(
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
 
+    // 段埋点：first_token 段在此打开，guard 承载 streaming 段（详见 StreamPhaseGuard 文档）。
+    tracer.open_phase(phase::FIRST_TOKEN);
+    let guard = StreamPhaseGuard::new(tracer.clone(), 0);
+
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, ops_feedback),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, ops_feedback)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, ops_feedback, true, Some(guard)),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, ops_feedback, mut first_chunk, mut guard)| async move {
             if finished {
                 return None;
             }
@@ -782,6 +1012,13 @@ fn create_sse_stream(
                         Some(Ok(chunk)) => {
                             tracer.mark_first_token();
                             sent_bytes += chunk.len() as u64;
+                            if let Some(g) = guard.as_mut() {
+                                if first_chunk {
+                                    g.mark_first_chunk();
+                                }
+                                g.set_bytes(sent_bytes);
+                            }
+                            first_chunk = false;
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
@@ -808,10 +1045,14 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
+                            // 按值消费 guard：本分支已显式处理结局，Drop 不得再判客户端断开。
+                            if let Some(g) = guard.take() {
+                                g.into_upstream_error(sent_bytes, &e);
+                            }
                             // 发送最终事件并结束（记为 error）
                             let final_events = ctx.generate_final_events();
                             record_stream_usage(&hook, &ctx, credential_id, "error");
@@ -829,12 +1070,23 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)))
                         }
                         None => {
+                            // 流正常结束：先按值消费 guard 收尾 streaming 段，再打开 finish 段——
+                            // 顺序不可反（见 phase_on_finish 文档的陷阱说明）。
+                            if let Some(g) = guard.take() {
+                                g.into_completed(sent_bytes);
+                            }
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
+                            phase_on_finish(
+                                &tracer,
+                                sent_bytes,
+                                ctx.tool_json_error(),
+                                ctx.tool_json_error_message(),
+                            );
                             if let Some(message) = ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
@@ -871,7 +1123,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)))
                         }
                     }
                 }
@@ -879,7 +1131,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)))
                 }
             }
         },
@@ -1472,6 +1724,7 @@ pub async fn post_messages_cc(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
+                session_id: session_id_of(&payload),
             },
         ));
         handle_stream_request_buffered(
@@ -1498,6 +1751,7 @@ pub async fn post_messages_cc(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
+                session_id: session_id_of(&payload),
             },
         ));
         handle_non_stream_request(
@@ -1593,6 +1847,10 @@ fn create_buffered_sse_stream(
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
+    // 段埋点：first_token 段在此打开，guard 承载 streaming 段（详见 StreamPhaseGuard 文档）。
+    tracer.open_phase(phase::FIRST_TOKEN);
+    let guard = StreamPhaseGuard::new(tracer.clone(), 0);
+
     stream::unfold(
         (
             body_stream,
@@ -1605,8 +1863,10 @@ fn create_buffered_sse_stream(
             tracer,
             0u64,
             ops_feedback,
+            true,
+            Some(guard),
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, ops_feedback)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, ops_feedback, mut first_chunk, mut guard)| async move {
             if finished {
                 return None;
             }
@@ -1621,7 +1881,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)));
                     }
 
                     // 然后处理数据流
@@ -1630,6 +1890,13 @@ fn create_buffered_sse_stream(
                             Some(Ok(chunk)) => {
                                 tracer.mark_first_token();
                                 sent_bytes += chunk.len() as u64;
+                                if let Some(g) = guard.as_mut() {
+                                    if first_chunk {
+                                        g.mark_first_chunk();
+                                    }
+                                    g.set_bytes(sent_bytes);
+                                }
+                                first_chunk = false;
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {
                                     tracing::warn!("缓冲区溢出: {}", e);
@@ -1652,6 +1919,10 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
+                                // 按值消费 guard：本分支已显式处理结局，Drop 不得再判客户端断开。
+                                if let Some(g) = guard.take() {
+                                    g.into_upstream_error(sent_bytes, &e);
+                                }
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
@@ -1675,9 +1946,14 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)));
                             }
                             None => {
+                                // 流正常结束：先按值消费 guard 收尾 streaming 段，再打开 finish 段——
+                                // 顺序不可反（见 phase_on_finish 文档的陷阱说明）。
+                                if let Some(g) = guard.take() {
+                                    g.into_completed(sent_bytes);
+                                }
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）。
                                 // finish_and_get_all_events 内部会 finish() 累积器；若有半截 /
                                 // 非法工具调用 JSON，error 事件已随缓冲发出，这里据此记 error。
@@ -1690,6 +1966,12 @@ fn create_buffered_sse_stream(
                                     cache_read_tokens: cr.max(0) as u64,
                                     credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
                                 };
+                                phase_on_finish(
+                                    &tracer,
+                                    sent_bytes,
+                                    ctx.tool_json_error(),
+                                    ctx.tool_json_error_message(),
+                                );
                                 if let Some(message) = ctx.tool_json_error_message() {
                                     // 区分上游截断（传输，计代理失败）与上游非法 JSON（内容，不罚代理），
                                     // 见实时流路径同名分支
@@ -1717,7 +1999,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)));
                             }
                         }
                     }
@@ -1762,6 +2044,19 @@ mod tests {
             "ValidationException: transient backend issue".to_string()
         ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn upstream_overload_maps_to_529_overloaded_error() {
+        // AWS Kiro 高负载：500 MODEL_TEMPORARILY_UNAVAILABLE → 529（而非 502），
+        // 便于上游网关识别为过载并退避/切换账号。
+        let resp = map_provider_error(anyhow::anyhow!(
+            "流式 API 请求失败: 500 Internal Server Error \
+             {\"message\":\"Encountered unexpectedly high load when processing the request, please try again.\",\
+             \"reason\":\"MODEL_TEMPORARILY_UNAVAILABLE\"}"
+                .to_string()
+        ));
+        assert_eq!(resp.status().as_u16(), 529);
     }
 
     #[test]
@@ -2271,5 +2566,484 @@ mod tests {
             zh.0.error.message, en.0.error.message,
             "两条路由的文案不得合并：客户端可能在匹配其中一份"
         );
+    }
+}
+
+#[cfg(test)]
+mod tracer_tests {
+    use super::*;
+    use crate::admin::trace_db::{outcome, phase};
+
+    /// 构造一个 store 为 None 的 tracer：验证 phase API 在未启用 trace 时不 panic
+    fn detached_tracer() -> RequestTracer {
+        RequestTracer {
+            store: None,
+            trace_id: "t".to_string(),
+            ts: "now".to_string(),
+            key_id: 0,
+            key_source: TraceKeySource::MasterApiKey,
+            model: "m".to_string(),
+            is_stream: true,
+            session_id: None,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+            phases: parking_lot::Mutex::new(Vec::new()),
+            open_phase: parking_lot::Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn phases_accumulate_in_order_with_seq() {
+        let t = detached_tracer();
+        t.open_phase(phase::FIRST_TOKEN);
+        t.close_phase(phase::FIRST_TOKEN, outcome::SUCCESS, Some(0), None);
+        t.open_phase(phase::STREAMING);
+        t.close_phase(phase::STREAMING, outcome::SUCCESS, Some(20211), None);
+        t.open_phase(phase::FINISH);
+        t.close_phase(
+            phase::FINISH,
+            outcome::UPSTREAM_TRUNCATED,
+            Some(20211),
+            Some("buffered 331 bytes".to_string()),
+        );
+
+        let got = t.phases.lock();
+        assert_eq!(got.len(), 3);
+        assert_eq!(
+            got.iter().map(|p| p.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "seq 必须连续递增"
+        );
+        assert_eq!(got[2].outcome, outcome::UPSTREAM_TRUNCATED);
+        assert_eq!(got[2].bytes, Some(20211));
+    }
+
+    #[test]
+    fn close_without_open_is_ignored_not_panic() {
+        let t = detached_tracer();
+        // 异常路径：埋点漏了 open 直接 close，不得 panic、不得写入半截段
+        t.close_phase(phase::STREAMING, outcome::SUCCESS, None, None);
+        assert!(t.phases.lock().is_empty());
+    }
+
+    #[test]
+    fn close_with_mismatched_name_is_ignored_and_does_not_wedge_tracer() {
+        let t = detached_tracer();
+        // 异常路径：open 了 A，却拿 B 来 close——名字不匹配，静默忽略，且
+        // open_phase 已经被 .take() 出来丢弃，不会残留一个「一直开着」的段。
+        t.open_phase(phase::FIRST_TOKEN);
+        t.close_phase(phase::STREAMING, outcome::SUCCESS, None, None);
+        assert!(
+            t.phases.lock().is_empty(),
+            "名字不匹配不得写入任何段"
+        );
+
+        // 证明没有被腐蚀：mismatch 之后重新 open/close 仍能正常记录，seq 从 0 开始。
+        t.open_phase(phase::FIRST_TOKEN);
+        t.close_phase(phase::FIRST_TOKEN, outcome::SUCCESS, Some(1), None);
+        let got = t.phases.lock();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].seq, 0, "mismatch 不得腐蚀 seq 计数器");
+    }
+
+    #[test]
+    fn reopen_without_close_discards_previous_open_segment() {
+        let t = detached_tracer();
+        // 文档语义：重复 open 视为埋点漏关，丢弃前一个未关闭的段。
+        t.open_phase(phase::FIRST_TOKEN);
+        t.open_phase(phase::STREAMING);
+        t.close_phase(phase::STREAMING, outcome::SUCCESS, None, None);
+
+        let got = t.phases.lock();
+        assert_eq!(got.len(), 1, "只应记录后一个 open 对应的段");
+        assert_eq!(got[0].phase, phase::STREAMING);
+    }
+
+    /// 探针：验证 stream 被 drop 时，unfold 状态里的 Drop impl 会执行。
+    /// 这是 `StreamPhaseGuard` 方案的前提——若此断言失败，客户端断开检测需改用其它手段。
+    #[test]
+    fn dropped_unfold_state_runs_drop_impl() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Marker(Arc<AtomicBool>);
+        impl Drop for Marker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let marker = Marker(flag.clone());
+
+        let s = futures::stream::unfold(marker, |m| async move { Some((1u8, m)) });
+        let s = Box::pin(s);
+        drop(s); // 模拟客户端断开：整个 stream 被丢弃
+
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "unfold 状态被 drop 时 Drop impl 应执行；若此断言失败，客户端断开检测需改用其它手段"
+        );
+    }
+
+    #[test]
+    fn client_disconnect_marks_phase_and_does_not_charge_proxy() {
+        let t = std::sync::Arc::new(detached_tracer());
+        t.open_phase(phase::FIRST_TOKEN);
+        {
+            let mut guard = StreamPhaseGuard::new(t.clone(), 4096);
+            guard.mark_first_chunk(); // 已收到过 chunk，段已切到 STREAMING
+            // guard 在此作用域结束时 drop —— 模拟客户端断开
+        }
+        let got = t.phases.lock();
+        // mark_first_chunk 先关闭一段 FIRST_TOKEN（成功），guard 的 Drop 再关闭
+        // 一段 STREAMING（client_disconnected）——两段都应被记录，只断言后者。
+        assert_eq!(got.len(), 2);
+        let seg = &got[1];
+        assert_eq!(seg.phase, phase::STREAMING);
+        assert_eq!(
+            seg.outcome,
+            outcome::CLIENT_DISCONNECTED,
+            "客户端断开必须与上游断流区分，否则会冤枉代理"
+        );
+        assert_eq!(seg.bytes, Some(4096));
+        let detail = seg.detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("client_gone=true"),
+            "detail 必须带 client_gone 判别位，实际: {detail}"
+        );
+        assert!(
+            detail.contains("idle_ms="),
+            "detail 必须带 idle_ms 判别位，实际: {detail}"
+        );
+        assert!(
+            detail.contains("bytes="),
+            "detail 必须带 bytes 判别位，实际: {detail}"
+        );
+    }
+
+    #[test]
+    fn normal_completion_does_not_mark_client_disconnect() {
+        let t = std::sync::Arc::new(detached_tracer());
+        t.open_phase(phase::FIRST_TOKEN);
+        {
+            let mut guard = StreamPhaseGuard::new(t.clone(), 4096);
+            guard.mark_first_chunk(); // 已收到过 chunk，段已切到 STREAMING
+            guard.into_completed(4096); // 正常收尾：按值消费，解除哨兵
+        }
+        let got = t.phases.lock();
+        // mark_first_chunk 先关闭一段 FIRST_TOKEN，into_completed 再关闭一段
+        // STREAMING——两段都应被记录，只断言后者。
+        assert_eq!(
+            got.len(),
+            2,
+            "正常收尾应记 first_token + streaming 两段成功，而不是空白"
+        );
+        let seg = &got[1];
+        assert_eq!(seg.phase, phase::STREAMING);
+        assert_eq!(
+            seg.outcome,
+            outcome::SUCCESS,
+            "正常收尾不得被误记成客户端断开"
+        );
+        assert_eq!(seg.bytes, Some(4096));
+    }
+
+    /// 回归测试（评审 Critical）：guard 在 FIRST_TOKEN 段仍打开、尚未收到首个
+    /// chunk 时就被按值消费（例如上游 200 后立即断流，body 里零个 chunk）。
+    /// 若 guard 的终态方法硬编码 close_phase(STREAMING,...)，这里的段名会与
+    /// 实际打开的 FIRST_TOKEN 不匹配，被 close_phase 静默丢弃——现象是
+    /// phases 里什么都没有，这正是本功能要消灭的"静默丢失"本身。
+    #[test]
+    fn guard_consumed_before_first_chunk_closes_first_token_not_streaming() {
+        let t = std::sync::Arc::new(detached_tracer());
+        t.open_phase(phase::FIRST_TOKEN); // 尚未收到首个 chunk，未调用 mark_first_chunk
+        {
+            let guard = StreamPhaseGuard::new(t.clone(), 0);
+            guard.into_upstream_error(0, &"upstream reset before any chunk");
+        }
+        let got = t.phases.lock();
+        assert_eq!(
+            got.len(),
+            1,
+            "尚未收到首个 chunk 时上游断流也必须记录一段，不能因为段名不匹配被吞掉"
+        );
+        assert_eq!(
+            got[0].phase,
+            phase::FIRST_TOKEN,
+            "guard 消费时实际打开的段是 FIRST_TOKEN，不是 STREAMING，必须按实际打开的段名收尾"
+        );
+        assert_eq!(got[0].outcome, outcome::STREAM_INTERRUPTED);
+    }
+
+    /// 同上，但覆盖 Drop 路径（客户端在等待首个 token 期间断开）。
+    #[test]
+    fn guard_dropped_before_first_chunk_closes_first_token_not_streaming() {
+        let t = std::sync::Arc::new(detached_tracer());
+        t.open_phase(phase::FIRST_TOKEN);
+        {
+            let _guard = StreamPhaseGuard::new(t.clone(), 0);
+            // 客户端在收到首个 chunk 之前断开：guard 未被任何终态方法消费，走 Drop。
+        }
+        let got = t.phases.lock();
+        assert_eq!(
+            got.len(),
+            1,
+            "等待首个 token 期间客户端断开也必须记录一段，不能被段名不匹配吞掉"
+        );
+        assert_eq!(
+            got[0].phase,
+            phase::FIRST_TOKEN,
+            "Drop 收尾时也必须按实际打开的段名（FIRST_TOKEN），不能硬编码 STREAMING"
+        );
+        assert_eq!(got[0].outcome, outcome::CLIENT_DISCONNECTED);
+    }
+
+    #[test]
+    fn upstream_error_does_not_mark_client_disconnect() {
+        let t = std::sync::Arc::new(detached_tracer());
+        t.open_phase(phase::FIRST_TOKEN);
+        {
+            let mut guard = StreamPhaseGuard::new(t.clone(), 512);
+            guard.mark_first_chunk(); // 已收到过 chunk，段已切到 STREAMING
+            guard.into_upstream_error(512, &"connection reset");
+        }
+        let got = t.phases.lock();
+        // mark_first_chunk 先关闭一段 FIRST_TOKEN，into_upstream_error 再关闭一段
+        // STREAMING——两段都应被记录，只断言后者。
+        assert_eq!(got.len(), 2);
+        let seg = &got[1];
+        assert_eq!(seg.phase, phase::STREAMING);
+        assert_eq!(
+            seg.outcome,
+            outcome::STREAM_INTERRUPTED,
+            "上游断流不得被误记成客户端断开"
+        );
+        assert_eq!(seg.bytes, Some(512));
+        let detail = seg.detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("client_gone=false"),
+            "上游断流的 detail 必须明确 client_gone=false，实际: {detail}"
+        );
+        assert!(
+            detail.contains("bytes="),
+            "detail 必须带 bytes 判别位，实际: {detail}"
+        );
+        assert!(
+            detail.contains("idle_ms="),
+            "detail 必须带 idle_ms 判别位，实际: {detail}"
+        );
+        assert!(
+            detail.contains("err=connection reset"),
+            "detail 必须带上游错误文本，实际: {detail}"
+        );
+    }
+
+    /// 端到端验证 axum drop 前提：真实起一个 axum 服务，用裸 TCP socket 连接，
+    /// 读到几个 chunk 后直接 drop 掉 socket（不发 FIN 的优雅关闭，模拟客户端
+    /// 突然断开），等待服务端感知，断言 streaming 段被记成 client_disconnected
+    /// 且 bytes > 0（证明断开发生在已发出内容之后）。
+    ///
+    /// Task 4 的探针只证明了 `stream::unfold` 状态被 drop 时 Drop impl 会执行
+    /// （纯 Rust 语义）。它没有证明 axum 在客户端真实断开的连接上，会在 guard
+    /// 还能起作用的时机把响应 body 的 unfold 状态 drop 掉——这是本测试要补的那一环。
+    #[tokio::test]
+    async fn client_disconnect_end_to_end() {
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        // tracer 用内存 TraceStore：本测试断言的是落库结果，而不是 tracer 的
+        // 内存态 phases——原始事故的病灶正是"断连时 finalize 永不执行，phases
+        // 停留在内存里、随 Arc 一起被丢弃，traces 表里连一行都没有"。
+        // Drop 现在必须调用 finalize_on_disconnect，把这个洞补上。
+        let store = crate::admin::trace_db::TraceStore::open_in_memory()
+            .expect("打开内存 trace store 失败");
+        let tracer = std::sync::Arc::new(RequestTracer {
+            store: Some(std::sync::Arc::new(store)),
+            trace_id: "e2e-disconnect".to_string(),
+            ts: "now".to_string(),
+            key_id: 0,
+            key_source: TraceKeySource::MasterApiKey,
+            model: "m".to_string(),
+            is_stream: true,
+            session_id: None,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+            phases: parking_lot::Mutex::new(Vec::new()),
+            open_phase: parking_lot::Mutex::new(None),
+        });
+        // 与真实调用点保持一致：guard 构造前先手动打开 FIRST_TOKEN，
+        // 首个 chunk 到达时再由 guard.mark_first_chunk() 切到 STREAMING
+        // （guard 内部记着 current_phase，收尾时按它，而不是硬编码 STREAMING）。
+        tracer.open_phase(phase::FIRST_TOKEN);
+
+        // 路由：慢速 SSE 流，每 50ms 发一个 chunk，共 20 个；guard 挂在流状态里。
+        async fn slow_sse_handler(State(tracer): State<std::sync::Arc<RequestTracer>>) -> impl IntoResponse {
+            let guard = StreamPhaseGuard::new(tracer, 0);
+            let body = stream::unfold((0u32, Some(guard), true), |(i, mut guard, mut first_chunk)| async move {
+                if i >= 20 {
+                    if let Some(g) = guard.take() {
+                        g.into_completed((i as u64) * 5);
+                    }
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let sent = (i + 1) as u64 * 5;
+                if let Some(g) = guard.as_mut() {
+                    if first_chunk {
+                        g.mark_first_chunk();
+                        first_chunk = false;
+                    }
+                    g.set_bytes(sent);
+                }
+                let chunk: Result<Bytes, Infallible> = Ok(Bytes::from("event: ping\ndata: x\n\n"));
+                Some((chunk, (i + 1, guard, first_chunk)))
+            });
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(body))
+                .unwrap()
+        }
+
+        let app = axum::Router::new()
+            .route("/stream", get(slow_sse_handler))
+            .with_state(tracer.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定本地端口失败");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // 裸 socket 连接，发原始 HTTP 请求
+        let mut sock = TcpStream::connect(addr)
+            .await
+            .expect("连接测试服务器失败");
+        sock.write_all(
+            b"GET /stream HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .expect("发送请求失败");
+
+        // 读够至少 3 个 chunk 的时长（>150ms）再 drop，确保断开确实发生在
+        // 已发出内容之后——只看字节数不够，响应头本身就可能超过任意阈值。
+        let mut received = 0usize;
+        let read_until = tokio::time::Instant::now() + Duration::from_millis(220);
+        loop {
+            let mut buf = [0u8; 512];
+            let remaining = read_until.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, sock.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => received += n,
+                _ => break,
+            }
+        }
+        assert!(received > 0, "测试服务器应至少发出了响应头/若干个 chunk");
+
+        // 模拟客户端突然断开：直接 drop 掉 socket（不走 shutdown() 优雅关闭）
+        drop(sock);
+
+        // 等待服务端感知断开——服务端下一次写入会因连接已断失败，触发 axum 丢弃
+        // response body 的 unfold 状态，进而运行 guard 的 Drop。
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // 评审 Important #2 的回归断言：不再看 tracer.phases（那只证明了内存态
+        // 埋点，不证明落库），而是查 TraceStore，证明 finalize_on_disconnect
+        // 真的把这条 trace 写进了 traces 表——ops UI 能查到它。
+        let query = crate::admin::trace_db::TraceQuery {
+            status: None,
+            error_type: Some(outcome::CLIENT_DISCONNECTED.to_string()),
+            credential_id: None,
+            key_id: None,
+            failed_attempt_credential_id: None,
+            model: None,
+            only_failed: false,
+            credential_ids: None,
+            limit: 10,
+            offset: 0,
+        };
+        let (records, _total) = tracer
+            .store
+            .as_ref()
+            .expect("测试 tracer 必须带 store")
+            .query_paged(&query);
+        let rec = records
+            .iter()
+            .find(|r| r.trace_id == tracer.trace_id)
+            .expect(
+                "断连必须落库一条 trace 记录——finalize 在此路径上原本永不会被调用，\
+                 这正是本回归要堵上的洞",
+            );
+        assert_eq!(rec.final_status, "interrupted");
+        assert_eq!(rec.error_type.as_deref(), Some(outcome::CLIENT_DISCONNECTED));
+        let seg = rec
+            .phases
+            .iter()
+            .find(|p| p.phase == phase::STREAMING)
+            .expect("落库记录里必须包含断连时的 streaming 段");
+        assert_eq!(
+            seg.outcome,
+            outcome::CLIENT_DISCONNECTED,
+            "客户端主动断开应记为 client_disconnected，实际: {}",
+            seg.outcome
+        );
+        assert!(
+            seg.bytes.unwrap_or(0) > 0,
+            "断开必须发生在已发出内容之后，bytes 应 > 0，实际: {:?}",
+            seg.bytes
+        );
+    }
+
+    /// 回归测试（评审 Important #1）：直接覆盖 `phase_on_finish` 这个真正的事故缝合处，
+    /// 而不是只测 `phase_outcome_for` 这个纯映射函数。若有人以后把 `phase::FINISH`
+    /// 换成 `phase::STREAMING`，或者把 open_phase/close_phase 的调用顺序倒过来，
+    /// 只测纯函数的话全量测试仍会全绿——这里要能捉住这类回归。
+    #[test]
+    fn phase_on_finish_records_finish_segment_with_mapped_outcome() {
+        let t = detached_tracer();
+        t.open_phase(phase::STREAMING); // 模拟 guard 已经 into_completed 关闭了 streaming 段
+
+        let err = ToolJsonAccumulatorError::IncompleteJson {
+            tool_use_id: "tu-1".to_string(),
+            name: "str_replace".to_string(),
+            bytes: 42,
+        };
+        phase_on_finish(&t, 1234, Some(&err), Some("half-written tool json".to_string()));
+
+        let got = t.phases.lock();
+        let seg = got.last().expect("phase_on_finish 必须记录一段 finish");
+        assert_eq!(seg.phase, phase::FINISH, "必须记到 finish 段，不能记错名字");
+        assert_eq!(
+            seg.outcome,
+            outcome::UPSTREAM_TRUNCATED,
+            "IncompleteJson 必须映射为 upstream_truncated"
+        );
+        assert_eq!(seg.bytes, Some(1234));
+        assert_eq!(seg.detail.as_deref(), Some("half-written tool json"));
+    }
+
+    /// 同上，覆盖无 tool_json_error 的正常收尾路径（finish 段应记 success）。
+    #[test]
+    fn phase_on_finish_records_success_when_no_tool_json_error() {
+        let t = detached_tracer();
+        t.open_phase(phase::STREAMING);
+
+        phase_on_finish(&t, 999, None, None);
+
+        let got = t.phases.lock();
+        let seg = got.last().expect("phase_on_finish 必须记录一段 finish");
+        assert_eq!(seg.phase, phase::FINISH);
+        assert_eq!(seg.outcome, outcome::SUCCESS);
+        assert_eq!(seg.bytes, Some(999));
     }
 }

@@ -6,6 +6,7 @@ import type {
   OpsOverview,
   OpsProxiesResponse,
   OpsTrendPoint,
+  PhaseBaselineRow,
 } from '@/types/api'
 
 const api = axios.create({
@@ -42,5 +43,12 @@ export async function getOpsProxies(hours: number): Promise<OpsProxiesResponse> 
 
 export async function getOpsEvents(limit = 100): Promise<OpsEvent[]> {
   const { data } = await api.get<OpsEvent[]>('/ops/events', { params: { limit } })
+  return data
+}
+
+export async function getPhaseBaseline(hours = 24): Promise<PhaseBaselineRow[]> {
+  const { data } = await api.get<PhaseBaselineRow[]>('/ops/phase-baseline', {
+    params: { hours },
+  })
   return data
 }

@@ -479,8 +479,31 @@ export interface TraceAttempt {
   /** 上游错误体片段（已截断） */
   errorSnippet: string | null
   durationMs: number
-  /** 本跳实际使用的出口代理 URL；null/undefined = 直连 */
+  /** 本跳出口：'direct' = 直连；null/undefined = 未知（该列存在前的历史行）；其余为代理 URL */
   proxyUrl?: string | null
+}
+
+/** 流生命周期的一段；仅流式请求有 */
+export interface TracePhase {
+  seq: number
+  /** first_token | streaming | finish */
+  phase: string
+  startedMs: number
+  durationMs: number
+  /** 复用 outcome 常量；client_disconnected = 客户端断开，非故障 */
+  outcome: string
+  /** 该段结束时已下发字节数 */
+  bytes?: number | null
+  detail?: string | null
+}
+
+/** 段 × 出口 的窗口失败率 */
+export interface PhaseBaselineRow {
+  phase: string
+  /** 'direct' = 直连；'' = 未知 */
+  proxyUrl: string
+  total: number
+  failed: number
 }
 
 /** 一个外部请求的完整链路 */
@@ -518,7 +541,11 @@ export interface TraceRecord {
   credits?: number
   /** 首 Token 延迟（毫秒，仅流式有值） */
   firstTokenMs?: number | null
+  /** Claude Code 会话 id（metadata.user_id 的 _session_<uuid>）；同一 Key 上区分会话/子代理 */
+  sessionId?: string | null
   attempts: TraceAttempt[]
+  /** 流生命周期分段；非流式为空数组 */
+  phases?: TracePhase[]
 }
 
 /** 链路查询参数 */
