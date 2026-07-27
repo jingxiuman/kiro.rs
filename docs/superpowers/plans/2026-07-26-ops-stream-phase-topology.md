@@ -935,6 +935,15 @@ finalize 不调用，请求在 traces 里完全消失。Drop 是唯一观测点�
 
 ### Task 5: 实时流与缓冲流路径接线
 
+> **执行记录（评审后追加，非原始计划）：** 首轮实现（`da0aa18`）评审报 1 Critical + 2 Important：
+> (1) `close_phase` 先 take 再比名字，guard 硬编码 `close_phase(STREAMING, ...)` 在首 chunk
+> 到达前终止时会把实际打开的 `FIRST_TOKEN` 段静默丢弃、不留替代记录；(2) `phase_on_finish`
+> ——本特性起因事故的确切接缝——没有直接测试；(3) `client_disconnected` 段永不落库，因为
+> `finalize()` 是全库唯一 `store.insert` 入口，断开路径上它不执行——这是**计划本身的缺口**，
+> 不是实现者遗漏。三项均裁定并入本 Task 修复：guard 增加 `current_phase` 字段以关闭实际打开
+> 的段；补 `phase_on_finish` 直接测试；新增 `RequestTracer::finalize_on_disconnect` 复用
+> `finalize()`，由 `Drop` 调用而非直接 `close_phase`。
+
 **Files:**
 - Modify: `src/anthropic/handlers.rs:769-860`（实时流 `stream::unfold`）
 - Modify: `src/anthropic/handlers.rs:1586-1680`（`create_buffered_sse_stream`）
