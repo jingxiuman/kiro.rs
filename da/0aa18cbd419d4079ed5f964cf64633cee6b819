@@ -1,0 +1,30 @@
+src/anthropic/handlers.rs
+  s_96f46b5ba50f6b::t_5f64129d3c2eac 2774-2775,2777,2780,2785,2789
+  s_96f46b5ba50f6b::t_6e89735a245859 924-927,929-930,943-949,976,980-983,1001,1004-1008,1012-1017,1054,1062
+  s_96f46b5ba50f6b::t_a6f162c765f15d 361-387
+  s_96f46b5ba50f6b::t_552996030d4698 10
+  s_96f46b5ba50f6b::t_bf7324d329a31d 34
+  s_96f46b5ba50f6b::t_82f6a61a22ca59 1776-1779,1792-1793,1795,1810,1819-1825,1848-1851,1875,1878-1882,1895-1900,1928
+  s_96f46b5ba50f6b::t_d0ee899dc6e72b 2689-2773,2776,2778-2779,2781-2784,2786-2788,2790-2814
+src/anthropic/stream.rs
+  s_96f46b5ba50f6b::t_75c664b7b57e35 2676-2680
+  s_96f46b5ba50f6b::t_27b7bc7ee2a4af 4877-4911
+  s_96f46b5ba50f6b::t_356db782196e7f 960-970
+  s_96f46b5ba50f6b::t_2ebd54b8a66142 1459-1463
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "da0aa18cbd419d4079ed5f964cf64633cee6b819",
+  "prompts": {},
+  "sessions": {
+    "s_96f46b5ba50f6b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ea859f2e-7a59-46d2-9fa5-979a92997f3a",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
