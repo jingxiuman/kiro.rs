@@ -1,0 +1,23 @@
+admin-ui/package.json
+  s_db6618452c5392::t_1f8d0fccd20ed9 3
+Cargo.toml
+  s_db6618452c5392::t_1f8d0fccd20ed9 3
+Cargo.lock
+  s_db6618452c5392::t_69f7aa9d70f0fb 1050
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "d5fccbc5b56d8704c0b810a6f63fa85dd6d463e4",
+  "prompts": {},
+  "sessions": {
+    "s_db6618452c5392": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f186ba4-f9bc-4feb-a388-6e28c0193514",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
