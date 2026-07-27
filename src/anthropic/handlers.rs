@@ -264,6 +264,33 @@ impl RequestTracer {
         };
         store.insert(&rec);
     }
+
+    /// 客户端断开专用的收尾：`finalize` 在这条路径上原本永不会被调用——
+    /// unfold 的 `None` 分支因为响应 body 被 axum 直接丢弃而永不执行，
+    /// `StreamPhaseGuard::Drop` 是唯一能观测到断连的位置。复用 `finalize`
+    /// 而不是重写一份落库逻辑，保持 attempts/phases 组装单一入口。
+    ///
+    /// `current_phase` 必须是 guard 实际打开的那个段名（FIRST_TOKEN 或
+    /// STREAMING），不能硬编码——理由与 `StreamPhaseGuard::current_phase`
+    /// 字段的文档一致。
+    pub fn finalize_on_disconnect(&self, current_phase: &'static str, sent_bytes: u64, detail: String) {
+        self.close_phase(
+            current_phase,
+            crate::admin::trace_db::outcome::CLIENT_DISCONNECTED,
+            Some(sent_bytes),
+            Some(detail.clone()),
+        );
+        // "interrupted" 与实时/缓冲流路径里上游断流复用同一个 final_status
+        // （见 handlers.rs 中 STREAM_INTERRUPTED 的两处先例），仅 error_type
+        // 换成 CLIENT_DISCONNECTED 以区分责任方。
+        self.finalize(
+            "interrupted",
+            Some(crate::admin::trace_db::outcome::CLIENT_DISCONNECTED),
+            Some(&detail),
+            Some(sent_bytes),
+            TraceUsage::zero(),
+        );
+    }
 }
 
 impl TraceSink for RequestTracer {
@@ -290,6 +317,12 @@ pub(crate) struct StreamPhaseGuard {
     sent_bytes: u64,
     last_chunk_at: Instant,
     armed: bool,
+    /// guard 构造时打开的是 FIRST_TOKEN 段；[`Self::mark_first_chunk`] 把它切到
+    /// STREAMING。终态方法/Drop 必须按这个字段收尾，不能硬编码 STREAMING——
+    /// 否则若 guard 在首个 chunk 到达前就被消费（上游零 chunk 断流、或客户端在
+    /// 等待首个 token 期间断开），close_phase 会因段名不匹配把 FIRST_TOKEN 段
+    /// 静默丢弃（见 close_phase 文档），这正是本功能要防止的"静默丢失"本身。
+    current_phase: &'static str,
 }
 
 impl StreamPhaseGuard {
@@ -299,7 +332,17 @@ impl StreamPhaseGuard {
             sent_bytes,
             last_chunk_at: Instant::now(),
             armed: true,
+            current_phase: phase::FIRST_TOKEN,
         }
+    }
+
+    /// 首个 chunk 到达：关闭 first_token 段，打开 streaming 段，并让 guard
+    /// 记住当前打开的是哪个段。幂等由调用方的 first_chunk 标志保证
+    /// （两条流路径各自维护，只在 first_chunk == true 时调用一次）。
+    pub fn mark_first_chunk(&mut self) {
+        self.tracer.close_phase(phase::FIRST_TOKEN, outcome::SUCCESS, Some(0), None);
+        self.tracer.open_phase(phase::STREAMING);
+        self.current_phase = phase::STREAMING;
     }
 
     /// 更新已发送字节数与最后一个 chunk 的时刻（每个 chunk 后调用）
@@ -313,23 +356,24 @@ impl StreamPhaseGuard {
         self.last_chunk_at.elapsed().as_millis() as u64
     }
 
-    /// 流正常结束：按值消费 guard，记 streaming 段成功。
+    /// 流正常结束：按值消费 guard，记当前实际打开的段（FIRST_TOKEN 或
+    /// STREAMING，取决于是否已收到过 chunk）成功。
     pub fn into_completed(mut self, sent_bytes: u64) {
         self.armed = false; // 先解除，随后的 Drop 成为 no-op
         self.tracer.close_phase(
-            crate::admin::trace_db::phase::STREAMING,
+            self.current_phase,
             crate::admin::trace_db::outcome::SUCCESS,
             Some(sent_bytes),
             None,
         );
     }
 
-    /// 上游断流：按值消费 guard，记 stream_interrupted 并写齐三个判别位。
+    /// 上游断流：按值消费 guard，记当前实际打开的段为 stream_interrupted 并写齐三个判别位。
     pub fn into_upstream_error(mut self, sent_bytes: u64, err: &dyn std::fmt::Display) {
         self.armed = false;
         let idle_ms = self.idle_ms();
         self.tracer.close_phase(
-            crate::admin::trace_db::phase::STREAMING,
+            self.current_phase,
             crate::admin::trace_db::outcome::STREAM_INTERRUPTED,
             Some(sent_bytes),
             Some(format!(
@@ -345,24 +389,16 @@ impl Drop for StreamPhaseGuard {
         if !self.armed {
             return;
         }
-        self.tracer.close_phase(
-            crate::admin::trace_db::phase::STREAMING,
-            crate::admin::trace_db::outcome::CLIENT_DISCONNECTED,
-            Some(self.sent_bytes),
-            Some(format!(
-                "client_gone=true bytes={} idle_ms={}",
-                self.sent_bytes,
-                self.idle_ms()
-            )),
+        let detail = format!(
+            "client_gone=true bytes={} idle_ms={}",
+            self.sent_bytes,
+            self.idle_ms()
         );
+        // 断连时 finalize() 永不会被正常调用（见 finalize_on_disconnect 文档），
+        // 这里必须连带落库，否则该请求会在 traces 表里完全消失。
+        self.tracer
+            .finalize_on_disconnect(self.current_phase, self.sent_bytes, detail);
     }
-}
-
-/// 首个 chunk 到达：关闭 first_token 段，打开 streaming 段。
-/// 幂等由调用方的 first_chunk 标志保证（两条流路径各自维护）。
-pub(crate) fn phase_on_first_chunk(tracer: &RequestTracer) {
-    tracer.close_phase(phase::FIRST_TOKEN, outcome::SUCCESS, Some(0), None);
-    tracer.open_phase(phase::STREAMING);
 }
 
 /// 流正常结束的 finish 段：按 tool_use 累积器结果开合。
@@ -940,13 +976,13 @@ fn create_sse_stream(
                         Some(Ok(chunk)) => {
                             tracer.mark_first_token();
                             sent_bytes += chunk.len() as u64;
-                            if first_chunk {
-                                phase_on_first_chunk(&tracer);
-                                first_chunk = false;
-                            }
                             if let Some(g) = guard.as_mut() {
+                                if first_chunk {
+                                    g.mark_first_chunk();
+                                }
                                 g.set_bytes(sent_bytes);
                             }
+                            first_chunk = false;
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
@@ -1816,13 +1852,13 @@ fn create_buffered_sse_stream(
                             Some(Ok(chunk)) => {
                                 tracer.mark_first_token();
                                 sent_bytes += chunk.len() as u64;
-                                if first_chunk {
-                                    phase_on_first_chunk(&tracer);
-                                    first_chunk = false;
-                                }
                                 if let Some(g) = guard.as_mut() {
+                                    if first_chunk {
+                                        g.mark_first_chunk();
+                                    }
                                     g.set_bytes(sent_bytes);
                                 }
+                                first_chunk = false;
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {
                                     tracing::warn!("缓冲区溢出: {}", e);
@@ -2602,20 +2638,25 @@ mod tracer_tests {
     #[test]
     fn client_disconnect_marks_phase_and_does_not_charge_proxy() {
         let t = std::sync::Arc::new(detached_tracer());
-        t.open_phase(phase::STREAMING);
+        t.open_phase(phase::FIRST_TOKEN);
         {
-            let _guard = StreamPhaseGuard::new(t.clone(), 4096);
+            let mut guard = StreamPhaseGuard::new(t.clone(), 4096);
+            guard.mark_first_chunk(); // 已收到过 chunk，段已切到 STREAMING
             // guard 在此作用域结束时 drop —— 模拟客户端断开
         }
         let got = t.phases.lock();
-        assert_eq!(got.len(), 1);
+        // mark_first_chunk 先关闭一段 FIRST_TOKEN（成功），guard 的 Drop 再关闭
+        // 一段 STREAMING（client_disconnected）——两段都应被记录，只断言后者。
+        assert_eq!(got.len(), 2);
+        let seg = &got[1];
+        assert_eq!(seg.phase, phase::STREAMING);
         assert_eq!(
-            got[0].outcome,
+            seg.outcome,
             outcome::CLIENT_DISCONNECTED,
             "客户端断开必须与上游断流区分，否则会冤枉代理"
         );
-        assert_eq!(got[0].bytes, Some(4096));
-        let detail = got[0].detail.as_deref().unwrap_or("");
+        assert_eq!(seg.bytes, Some(4096));
+        let detail = seg.detail.as_deref().unwrap_or("");
         assert!(
             detail.contains("client_gone=true"),
             "detail 必须带 client_gone 判别位，实际: {detail}"
@@ -2633,42 +2674,102 @@ mod tracer_tests {
     #[test]
     fn normal_completion_does_not_mark_client_disconnect() {
         let t = std::sync::Arc::new(detached_tracer());
-        t.open_phase(phase::STREAMING);
+        t.open_phase(phase::FIRST_TOKEN);
         {
-            let guard = StreamPhaseGuard::new(t.clone(), 4096);
+            let mut guard = StreamPhaseGuard::new(t.clone(), 4096);
+            guard.mark_first_chunk(); // 已收到过 chunk，段已切到 STREAMING
             guard.into_completed(4096); // 正常收尾：按值消费，解除哨兵
+        }
+        let got = t.phases.lock();
+        // mark_first_chunk 先关闭一段 FIRST_TOKEN，into_completed 再关闭一段
+        // STREAMING——两段都应被记录，只断言后者。
+        assert_eq!(
+            got.len(),
+            2,
+            "正常收尾应记 first_token + streaming 两段成功，而不是空白"
+        );
+        let seg = &got[1];
+        assert_eq!(seg.phase, phase::STREAMING);
+        assert_eq!(
+            seg.outcome,
+            outcome::SUCCESS,
+            "正常收尾不得被误记成客户端断开"
+        );
+        assert_eq!(seg.bytes, Some(4096));
+    }
+
+    /// 回归测试（评审 Critical）：guard 在 FIRST_TOKEN 段仍打开、尚未收到首个
+    /// chunk 时就被按值消费（例如上游 200 后立即断流，body 里零个 chunk）。
+    /// 若 guard 的终态方法硬编码 close_phase(STREAMING,...)，这里的段名会与
+    /// 实际打开的 FIRST_TOKEN 不匹配，被 close_phase 静默丢弃——现象是
+    /// phases 里什么都没有，这正是本功能要消灭的"静默丢失"本身。
+    #[test]
+    fn guard_consumed_before_first_chunk_closes_first_token_not_streaming() {
+        let t = std::sync::Arc::new(detached_tracer());
+        t.open_phase(phase::FIRST_TOKEN); // 尚未收到首个 chunk，未调用 mark_first_chunk
+        {
+            let guard = StreamPhaseGuard::new(t.clone(), 0);
+            guard.into_upstream_error(0, &"upstream reset before any chunk");
         }
         let got = t.phases.lock();
         assert_eq!(
             got.len(),
             1,
-            "正常收尾应记一段 streaming 成功，而不是空白"
+            "尚未收到首个 chunk 时上游断流也必须记录一段，不能因为段名不匹配被吞掉"
         );
         assert_eq!(
-            got[0].outcome,
-            outcome::SUCCESS,
-            "正常收尾不得被误记成客户端断开"
+            got[0].phase,
+            phase::FIRST_TOKEN,
+            "guard 消费时实际打开的段是 FIRST_TOKEN，不是 STREAMING，必须按实际打开的段名收尾"
         );
-        assert_eq!(got[0].bytes, Some(4096));
+        assert_eq!(got[0].outcome, outcome::STREAM_INTERRUPTED);
+    }
+
+    /// 同上，但覆盖 Drop 路径（客户端在等待首个 token 期间断开）。
+    #[test]
+    fn guard_dropped_before_first_chunk_closes_first_token_not_streaming() {
+        let t = std::sync::Arc::new(detached_tracer());
+        t.open_phase(phase::FIRST_TOKEN);
+        {
+            let _guard = StreamPhaseGuard::new(t.clone(), 0);
+            // 客户端在收到首个 chunk 之前断开：guard 未被任何终态方法消费，走 Drop。
+        }
+        let got = t.phases.lock();
+        assert_eq!(
+            got.len(),
+            1,
+            "等待首个 token 期间客户端断开也必须记录一段，不能被段名不匹配吞掉"
+        );
+        assert_eq!(
+            got[0].phase,
+            phase::FIRST_TOKEN,
+            "Drop 收尾时也必须按实际打开的段名（FIRST_TOKEN），不能硬编码 STREAMING"
+        );
+        assert_eq!(got[0].outcome, outcome::CLIENT_DISCONNECTED);
     }
 
     #[test]
     fn upstream_error_does_not_mark_client_disconnect() {
         let t = std::sync::Arc::new(detached_tracer());
-        t.open_phase(phase::STREAMING);
+        t.open_phase(phase::FIRST_TOKEN);
         {
-            let guard = StreamPhaseGuard::new(t.clone(), 512);
+            let mut guard = StreamPhaseGuard::new(t.clone(), 512);
+            guard.mark_first_chunk(); // 已收到过 chunk，段已切到 STREAMING
             guard.into_upstream_error(512, &"connection reset");
         }
         let got = t.phases.lock();
-        assert_eq!(got.len(), 1);
+        // mark_first_chunk 先关闭一段 FIRST_TOKEN，into_upstream_error 再关闭一段
+        // STREAMING——两段都应被记录，只断言后者。
+        assert_eq!(got.len(), 2);
+        let seg = &got[1];
+        assert_eq!(seg.phase, phase::STREAMING);
         assert_eq!(
-            got[0].outcome,
+            seg.outcome,
             outcome::STREAM_INTERRUPTED,
             "上游断流不得被误记成客户端断开"
         );
-        assert_eq!(got[0].bytes, Some(512));
-        let detail = got[0].detail.as_deref().unwrap_or("");
+        assert_eq!(seg.bytes, Some(512));
+        let detail = seg.detail.as_deref().unwrap_or("");
         assert!(
             detail.contains("client_gone=false"),
             "上游断流的 detail 必须明确 client_gone=false，实际: {detail}"
@@ -2703,9 +2804,10 @@ mod tracer_tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpListener, TcpStream};
 
-        // tracer 用内存 TraceStore，但本测试直接检视 tracer 的内存态 phases——
-        // client_disconnected 是 guard Drop 时写入 tracer.phases 的，与是否
-        // finalize() 落库无关（这正是原始事故的病灶：断连时 finalize 永不执行）。
+        // tracer 用内存 TraceStore：本测试断言的是落库结果，而不是 tracer 的
+        // 内存态 phases——原始事故的病灶正是"断连时 finalize 永不执行，phases
+        // 停留在内存里、随 Arc 一起被丢弃，traces 表里连一行都没有"。
+        // Drop 现在必须调用 finalize_on_disconnect，把这个洞补上。
         let store = crate::admin::trace_db::TraceStore::open_in_memory()
             .expect("打开内存 trace store 失败");
         let tracer = std::sync::Arc::new(RequestTracer {
@@ -2722,12 +2824,15 @@ mod tracer_tests {
             phases: parking_lot::Mutex::new(Vec::new()),
             open_phase: parking_lot::Mutex::new(None),
         });
-        tracer.open_phase(phase::STREAMING);
+        // 与真实调用点保持一致：guard 构造前先手动打开 FIRST_TOKEN，
+        // 首个 chunk 到达时再由 guard.mark_first_chunk() 切到 STREAMING
+        // （guard 内部记着 current_phase，收尾时按它，而不是硬编码 STREAMING）。
+        tracer.open_phase(phase::FIRST_TOKEN);
 
         // 路由：慢速 SSE 流，每 50ms 发一个 chunk，共 20 个；guard 挂在流状态里。
         async fn slow_sse_handler(State(tracer): State<std::sync::Arc<RequestTracer>>) -> impl IntoResponse {
             let guard = StreamPhaseGuard::new(tracer, 0);
-            let body = stream::unfold((0u32, Some(guard)), |(i, mut guard)| async move {
+            let body = stream::unfold((0u32, Some(guard), true), |(i, mut guard, mut first_chunk)| async move {
                 if i >= 20 {
                     if let Some(g) = guard.take() {
                         g.into_completed((i as u64) * 5);
@@ -2737,10 +2842,14 @@ mod tracer_tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 let sent = (i + 1) as u64 * 5;
                 if let Some(g) = guard.as_mut() {
+                    if first_chunk {
+                        g.mark_first_chunk();
+                        first_chunk = false;
+                    }
                     g.set_bytes(sent);
                 }
                 let chunk: Result<Bytes, Infallible> = Ok(Bytes::from("event: ping\ndata: x\n\n"));
-                Some((chunk, (i + 1, guard)))
+                Some((chunk, (i + 1, guard, first_chunk)))
             });
             axum::response::Response::builder()
                 .status(StatusCode::OK)
@@ -2795,11 +2904,40 @@ mod tracer_tests {
         // response body 的 unfold 状态，进而运行 guard 的 Drop。
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let phases = tracer.phases.lock();
-        let seg = phases
+        // 评审 Important #2 的回归断言：不再看 tracer.phases（那只证明了内存态
+        // 埋点，不证明落库），而是查 TraceStore，证明 finalize_on_disconnect
+        // 真的把这条 trace 写进了 traces 表——ops UI 能查到它。
+        let query = crate::admin::trace_db::TraceQuery {
+            status: None,
+            error_type: Some(outcome::CLIENT_DISCONNECTED.to_string()),
+            credential_id: None,
+            key_id: None,
+            failed_attempt_credential_id: None,
+            model: None,
+            only_failed: false,
+            credential_ids: None,
+            limit: 10,
+            offset: 0,
+        };
+        let (records, _total) = tracer
+            .store
+            .as_ref()
+            .expect("测试 tracer 必须带 store")
+            .query_paged(&query);
+        let rec = records
+            .iter()
+            .find(|r| r.trace_id == tracer.trace_id)
+            .expect(
+                "断连必须落库一条 trace 记录——finalize 在此路径上原本永不会被调用，\
+                 这正是本回归要堵上的洞",
+            );
+        assert_eq!(rec.final_status, "interrupted");
+        assert_eq!(rec.error_type.as_deref(), Some(outcome::CLIENT_DISCONNECTED));
+        let seg = rec
+            .phases
             .iter()
             .find(|p| p.phase == phase::STREAMING)
-            .expect("streaming 段应被记录——axum 应已在断连后 drop 了响应体");
+            .expect("落库记录里必须包含断连时的 streaming 段");
         assert_eq!(
             seg.outcome,
             outcome::CLIENT_DISCONNECTED,
@@ -2811,5 +2949,48 @@ mod tracer_tests {
             "断开必须发生在已发出内容之后，bytes 应 > 0，实际: {:?}",
             seg.bytes
         );
+    }
+
+    /// 回归测试（评审 Important #1）：直接覆盖 `phase_on_finish` 这个真正的事故缝合处，
+    /// 而不是只测 `phase_outcome_for` 这个纯映射函数。若有人以后把 `phase::FINISH`
+    /// 换成 `phase::STREAMING`，或者把 open_phase/close_phase 的调用顺序倒过来，
+    /// 只测纯函数的话全量测试仍会全绿——这里要能捉住这类回归。
+    #[test]
+    fn phase_on_finish_records_finish_segment_with_mapped_outcome() {
+        let t = detached_tracer();
+        t.open_phase(phase::STREAMING); // 模拟 guard 已经 into_completed 关闭了 streaming 段
+
+        let err = ToolJsonAccumulatorError::IncompleteJson {
+            tool_use_id: "tu-1".to_string(),
+            name: "str_replace".to_string(),
+            bytes: 42,
+        };
+        phase_on_finish(&t, 1234, Some(&err), Some("half-written tool json".to_string()));
+
+        let got = t.phases.lock();
+        let seg = got.last().expect("phase_on_finish 必须记录一段 finish");
+        assert_eq!(seg.phase, phase::FINISH, "必须记到 finish 段，不能记错名字");
+        assert_eq!(
+            seg.outcome,
+            outcome::UPSTREAM_TRUNCATED,
+            "IncompleteJson 必须映射为 upstream_truncated"
+        );
+        assert_eq!(seg.bytes, Some(1234));
+        assert_eq!(seg.detail.as_deref(), Some("half-written tool json"));
+    }
+
+    /// 同上，覆盖无 tool_json_error 的正常收尾路径（finish 段应记 success）。
+    #[test]
+    fn phase_on_finish_records_success_when_no_tool_json_error() {
+        let t = detached_tracer();
+        t.open_phase(phase::STREAMING);
+
+        phase_on_finish(&t, 999, None, None);
+
+        let got = t.phases.lock();
+        let seg = got.last().expect("phase_on_finish 必须记录一段 finish");
+        assert_eq!(seg.phase, phase::FINISH);
+        assert_eq!(seg.outcome, outcome::SUCCESS);
+        assert_eq!(seg.bytes, Some(999));
     }
 }
