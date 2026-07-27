@@ -220,6 +220,8 @@ impl RequestTracer {
             credits: usage.credits,
             first_token_ms,
             attempts,
+            // Task 3 起填充：流生命周期分段
+            phases: Vec::new(),
         };
         store.insert(&rec);
     }

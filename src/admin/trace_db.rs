@@ -46,6 +46,39 @@ pub struct TraceAttempt {
     pub proxy_url: Option<String>,
 }
 
+/// 流生命周期的一段。仅流式请求产生；非流式请求无此记录。
+///
+/// 与 [`TraceAttempt`] 的分工：attempt 覆盖 connect→headers（N 跳，含重试），
+/// phase 覆盖 headers 之后的流生命周期（1 条流）。两者基数不同，不合表。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TracePhase {
+    /// 段序号，从 0 递增，保证渲染顺序
+    pub seq: u32,
+    /// 段名，见 [`phase`]
+    pub phase: String,
+    /// 相对请求起点的偏移（毫秒）
+    pub started_ms: u64,
+    /// 本段耗时（毫秒）
+    pub duration_ms: u64,
+    /// 本段结局，复用 [`outcome`] 常量
+    pub outcome: String,
+    /// 该段结束时已下发给客户端的累计字节数
+    pub bytes: Option<u64>,
+    /// 错误片段 / 判别位摘要
+    pub detail: Option<String>,
+}
+
+/// 流生命周期段名
+pub mod phase {
+    /// 建连成功到首个上游 chunk 到达
+    pub const FIRST_TOKEN: &str = "first_token";
+    /// 首 chunk 之后的持续传输
+    pub const STREAMING: &str = "streaming";
+    /// 流结束时的收尾判定（含 tool_use 累积器 finish 结果）
+    pub const FINISH: &str = "finish";
+}
+
 /// 调用方使用的入口 Key 类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,6 +163,9 @@ pub struct TraceRecord {
     pub first_token_ms: Option<u64>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
+    /// 流生命周期分段；非流式请求为空
+    #[serde(default)]
+    pub phases: Vec<TracePhase>,
 }
 
 /// 失败分类（attempt.outcome / record.error_type 取值）
@@ -150,6 +186,8 @@ pub mod outcome {
     /// 仅用作 record.error_type：上游返回了完整但非法的 tool_use JSON（InvalidJson）。
     /// 属上游内容问题（非截断、非客户端错误），不计入代理健康。
     pub const UPSTREAM_INVALID: &str = "upstream_invalid";
+    /// 仅用作 phase.outcome：客户端主动断开（非上游故障，不计入代理健康）
+    pub const CLIENT_DISCONNECTED: &str = "client_disconnected";
 }
 
 /// 把上游错误体截断到安全长度（按字符边界，避免切碎 UTF-8）
@@ -393,6 +431,22 @@ impl TraceStore {
                     ],
                 )?;
             }
+            for p in &rec.phases {
+                tx.execute(
+                    "INSERT OR REPLACE INTO trace_phases (trace_id, seq, phase, started_ms, \
+                     duration_ms, outcome, bytes, detail) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    rusqlite::params![
+                        rec.trace_id,
+                        p.seq as i64,
+                        p.phase,
+                        p.started_ms as i64,
+                        p.duration_ms as i64,
+                        p.outcome,
+                        p.bytes.map(|v| v as i64),
+                        p.detail,
+                    ],
+                )?;
+            }
             Ok(())
         })();
         match res {
@@ -532,6 +586,7 @@ impl TraceStore {
                 credits: row.get::<_, f64>(17)?,
                 first_token_ms: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
                 attempts: Vec::new(),
+                phases: Vec::new(),
             })
         })?;
         let mut records: Vec<TraceRecord> = rows.collect::<rusqlite::Result<_>>()?;
@@ -556,6 +611,26 @@ impl TraceStore {
             })?;
             rec.attempts = attempts.collect::<rusqlite::Result<_>>()?;
         }
+
+        // 批量取每条 trace 的 phases
+        let mut phase_stmt = conn.prepare(
+            "SELECT seq, phase, started_ms, duration_ms, outcome, bytes, detail \
+             FROM trace_phases WHERE trace_id = ? ORDER BY seq ASC",
+        )?;
+        for rec in &mut records {
+            let phases = phase_stmt.query_map([&rec.trace_id], |row| {
+                Ok(TracePhase {
+                    seq: row.get::<_, i64>(0)? as u32,
+                    phase: row.get(1)?,
+                    started_ms: row.get::<_, i64>(2)? as u64,
+                    duration_ms: row.get::<_, i64>(3)? as u64,
+                    outcome: row.get(4)?,
+                    bytes: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                    detail: row.get(6)?,
+                })
+            })?;
+            rec.phases = phases.collect::<rusqlite::Result<_>>()?;
+        }
         Ok((records, total as usize))
     }
 
@@ -572,6 +647,11 @@ impl TraceStore {
             }
         };
         let res = (|| -> rusqlite::Result<usize> {
+            tx.execute(
+                "DELETE FROM trace_phases WHERE trace_id IN \
+                 (SELECT trace_id FROM traces WHERE ts_epoch < ?1)",
+                [cutoff],
+            )?;
             tx.execute(
                 "DELETE FROM trace_attempts WHERE trace_id IN \
                  (SELECT trace_id FROM traces WHERE ts_epoch < ?1)",
@@ -607,6 +687,13 @@ impl TraceStore {
             }
         };
         let res = (|| -> rusqlite::Result<usize> {
+            // trace_phases 无 credential_id 列，只能走 trace_id 子查询这半支
+            // （trace_attempts 那条语句里 "credential_id = ?1 OR" 这半支对 trace_phases 不适用）
+            tx.execute(
+                "DELETE FROM trace_phases WHERE trace_id IN \
+                 (SELECT trace_id FROM traces WHERE final_credential_id = ?1)",
+                [credential_id],
+            )?;
             tx.execute(
                 "DELETE FROM trace_attempts WHERE credential_id = ?1 \
                  OR trace_id IN (SELECT trace_id FROM traces WHERE final_credential_id = ?1)",
@@ -754,6 +841,20 @@ CREATE TABLE IF NOT EXISTS trace_attempts (
     PRIMARY KEY (trace_id, attempt)
 );
 CREATE INDEX IF NOT EXISTS idx_attempts_trace ON trace_attempts(trace_id);
+
+CREATE TABLE IF NOT EXISTS trace_phases (
+    trace_id    TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    phase       TEXT NOT NULL,
+    started_ms  INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    outcome     TEXT NOT NULL,
+    bytes       INTEGER,
+    detail      TEXT,
+    PRIMARY KEY (trace_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_phases_trace ON trace_phases(trace_id);
+CREATE INDEX IF NOT EXISTS idx_phases_phase_outcome ON trace_phases(phase, outcome);
 ";
 
 #[cfg(test)]
@@ -822,6 +923,7 @@ mod tests {
                     proxy_url: None,
                 },
             ],
+            phases: Vec::new(),
         }
     }
 
@@ -1120,5 +1222,94 @@ mod tests {
             Some("direct"),
             "真直连必须写成字面量 direct，不能塌陷成 NULL"
         );
+    }
+
+    #[test]
+    fn phases_roundtrip() {
+        let store = mem_store();
+        let mut rec = sample(TraceSample {
+            trace_id: "t-ph",
+            status: "error",
+            credential_id: 5,
+            model: "m1",
+        });
+        rec.phases = vec![
+            TracePhase {
+                seq: 0,
+                phase: phase::FIRST_TOKEN.to_string(),
+                started_ms: 0,
+                duration_ms: 1200,
+                outcome: outcome::SUCCESS.to_string(),
+                bytes: Some(0),
+                detail: None,
+            },
+            TracePhase {
+                seq: 1,
+                phase: phase::STREAMING.to_string(),
+                started_ms: 1200,
+                duration_ms: 18400,
+                outcome: outcome::SUCCESS.to_string(),
+                bytes: Some(20211),
+                detail: None,
+            },
+            TracePhase {
+                seq: 2,
+                phase: phase::FINISH.to_string(),
+                started_ms: 19600,
+                duration_ms: 3,
+                outcome: outcome::UPSTREAM_TRUNCATED.to_string(),
+                bytes: Some(20211),
+                detail: Some("buffered 331 bytes".to_string()),
+            },
+        ];
+        store.insert(&rec);
+
+        let out = store.query(&TraceQuery {
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(out[0].phases.len(), 3);
+        assert_eq!(out[0].phases[0].phase, phase::FIRST_TOKEN);
+        assert_eq!(out[0].phases[2].outcome, outcome::UPSTREAM_TRUNCATED);
+        assert_eq!(out[0].phases[2].bytes, Some(20211));
+        assert_eq!(
+            out[0].phases[2].detail.as_deref(),
+            Some("buffered 331 bytes")
+        );
+        // 顺序由 seq 保证
+        assert_eq!(
+            out[0].phases.iter().map(|p| p.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_phases() {
+        let store = mem_store();
+        let mut rec = sample(TraceSample {
+            trace_id: "t-old",
+            status: "error",
+            credential_id: 5,
+            model: "m1",
+        });
+        // 造一条 30 天前的记录
+        rec.ts = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        rec.phases = vec![TracePhase {
+            seq: 0,
+            phase: phase::STREAMING.to_string(),
+            started_ms: 0,
+            duration_ms: 10,
+            outcome: outcome::SUCCESS.to_string(),
+            bytes: Some(1),
+            detail: None,
+        }];
+        store.insert(&rec);
+        store.cleanup();
+
+        let conn = store.conn.lock();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM trace_phases", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "过期 trace 的 phases 必须一并清理，不能留孤儿行");
     }
 }
