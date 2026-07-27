@@ -1,0 +1,33 @@
+src/admin/service.rs
+  s_b2a249ac7d536c::t_300fd542505b80 501-503
+src/admin/binary_update.rs
+  s_b2a249ac7d536c::t_c6356d357684f4 26-29
+admin-ui/src/App.tsx
+  s_b2a249ac7d536c::t_426fa80ce5261e 320
+docker-compose.yml
+  s_b2a249ac7d536c::t_426fa80ce5261e 3
+admin-ui/src/components/dashboard.tsx
+  s_b2a249ac7d536c::t_426fa80ce5261e 1140
+admin-ui/package.json
+  s_b2a249ac7d536c::t_f6fbed3c1e74c9 3
+Cargo.toml
+  s_b2a249ac7d536c::t_f6fbed3c1e74c9 3
+Cargo.lock
+  s_b2a249ac7d536c::t_fbd71f1932f1b6 1050
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "e0fbc6ead8d09ea7429583e8fadfdcd41d0a57e1",
+  "prompts": {},
+  "sessions": {
+    "s_b2a249ac7d536c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1dfe9aa-e54c-4dc3-b526-fc877a1bbd03",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
