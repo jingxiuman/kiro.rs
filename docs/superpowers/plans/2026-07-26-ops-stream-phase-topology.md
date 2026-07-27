@@ -780,12 +780,36 @@ Run: `cargo test dropped_unfold_state_runs_drop_impl -- --nocapture`
         let t = std::sync::Arc::new(detached_tracer());
         t.open_phase(phase::STREAMING);
         {
-            let mut guard = StreamPhaseGuard::new(t.clone(), 4096);
-            guard.disarm(); // 正常收尾时显式解除
+            let guard = StreamPhaseGuard::new(t.clone(), 4096);
+            guard.into_completed(4096); // 正常收尾：按值消费，记 streaming 成功
         }
-        assert!(
-            t.phases.lock().is_empty(),
+        let got = t.phases.lock();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].outcome,
+            outcome::SUCCESS,
             "正常收尾不得被误记成客户端断开"
+        );
+    }
+
+    #[test]
+    fn upstream_error_does_not_mark_client_disconnect() {
+        let t = std::sync::Arc::new(detached_tracer());
+        t.open_phase(phase::STREAMING);
+        {
+            let guard = StreamPhaseGuard::new(t.clone(), 512);
+            guard.into_upstream_error(512, &"connection reset");
+        }
+        let got = t.phases.lock();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].outcome,
+            outcome::STREAM_INTERRUPTED,
+            "上游断流必须记成 stream_interrupted，不得吞成客户端断开"
+        );
+        assert!(
+            got[0].detail.as_deref().unwrap().contains("client_gone=false"),
+            "判别位必须明确写 client_gone=false"
         );
     }
 ```
@@ -800,11 +824,19 @@ Expected: 编译失败，`cannot find type StreamPhaseGuard`
 在 `src/anthropic/handlers.rs` 的 `RequestTracer` impl 之后新增：
 
 ```rust
-/// 挂在流状态里的哨兵：流被 drop 而未显式 disarm 时，说明客户端提前断开。
+/// 挂在流状态里的哨兵：流被 drop 而**未经任何消费式终结方法**时，说明客户端提前断开。
 ///
 /// 需要它的原因：客户端断开时 axum 直接 drop response body，unfold 的
 /// `None` 分支永不执行，`finalize` 也就永不调用——该请求会在 traces 里完全消失。
 /// Drop 是唯一能观测到这件事的位置。
+///
+/// **方向性风险**（这是本设计最脆弱的一点，改动前先读）：`armed` 默认为 true，
+/// 意味着「未解释的 drop」默认被判成客户端断开。而约束要求的是相反方向——
+/// 仅在明确检测到客户端断开时才判定，其余归上游断。两者的缓冲带就是
+/// `into_completed` / `into_upstream_error` 这两个**按值消费**的终结方法：
+/// 凡是显式处理了结局的分支都必须交出 guard 的所有权，编译器会盯着这件事。
+/// 新增任何流退出分支时，必须走其中之一，否则真实的上游故障会被静默记成
+/// 客户端断开——代理不被追责、故障永久隐身，正是「不可漏放」要防的。
 pub(crate) struct StreamPhaseGuard {
     tracer: std::sync::Arc<RequestTracer>,
     sent_bytes: u64,
@@ -833,9 +865,32 @@ impl StreamPhaseGuard {
         self.last_chunk_at.elapsed().as_millis() as u64
     }
 
-    /// 正常收尾 / 上游断流已被显式处理，解除哨兵
-    pub fn disarm(&mut self) {
+    /// 流正常结束：**按值消费** guard，记 streaming 段成功。
+    /// 消费式而非 `&mut self` 的 disarm，是为了让「已显式处理结局」的分支
+    /// 在类型层面吃掉 guard——忘调的面积从「每条分支」缩小到「真正未处理的分支」。
+    pub fn into_completed(mut self, sent_bytes: u64) {
+        self.armed = false; // 先解除，随后的 Drop 成为 no-op
+        self.tracer.close_phase(
+            crate::admin::trace_db::phase::STREAMING,
+            crate::admin::trace_db::outcome::SUCCESS,
+            Some(sent_bytes),
+            None,
+        );
+    }
+
+    /// 上游断流：**按值消费** guard，记 stream_interrupted 并写齐三个判别位。
+    pub fn into_upstream_error(mut self, sent_bytes: u64, err: &dyn std::fmt::Display) {
         self.armed = false;
+        let idle_ms = self.idle_ms();
+        self.tracer.close_phase(
+            crate::admin::trace_db::phase::STREAMING,
+            crate::admin::trace_db::outcome::STREAM_INTERRUPTED,
+            Some(sent_bytes),
+            Some(format!(
+                "client_gone=false bytes={} idle_ms={} err={}",
+                sent_bytes, idle_ms, err
+            )),
+        );
     }
 }
 
@@ -860,8 +915,9 @@ impl Drop for StreamPhaseGuard {
 
 - [ ] **Step 6: 运行测试确认通过**
 
-Run: `cargo test client_disconnect -- --nocapture && cargo test normal_completion -- --nocapture`
-Expected: 两个 PASS
+Run: `cargo test --bin kiro-rs stream_phase_guard -- --nocapture`
+（三个用例：客户端断开触发 / 正常收尾不触发 / 上游断流不触发）
+Expected: 三个 PASS
 
 - [ ] **Step 7: 提交**
 
@@ -871,7 +927,8 @@ git commit -m "feat(trace): StreamPhaseGuard 检测客户端提前断开
 
 客户端断开时 axum 直接 drop response body，unfold 的 None 分支不执行，
 finalize 不调用，请求在 traces 里完全消失。Drop 是唯一观测点。
-判定保守：仅显式 drop 未 disarm 时判客户端断开，其余归上游断。"
+终结方法按值消费 guard：显式处理结局的分支必须交出所有权，
+编译器帮忙盯住「忘记标记」这个失效模式。"
 ```
 
 ---
@@ -1004,30 +1061,15 @@ Expected: 两个 PASS
 3. `Some(Err(e))` 分支内，现有 `tracing::error!("读取响应流失败: {}", e);` 之后追加：
 
 ```rust
-                            let idle_ms = guard.idle_ms();
-                            guard.disarm();
-                            tracer.close_phase(
-                                phase::STREAMING,
-                                outcome::STREAM_INTERRUPTED,
-                                Some(sent_bytes),
-                                // 三个判别位齐全：client_gone=false 表示是上游断而非客户端走人
-                                Some(format!(
-                                    "client_gone=false bytes={} idle_ms={} err={}",
-                                    sent_bytes, idle_ms, e
-                                )),
-                            );
+                            // 按值消费 guard：本分支已显式处理结局，Drop 不得再判客户端断开
+                            guard.into_upstream_error(sent_bytes, &e);
 ```
 
 4. `None` 分支内，现有 `let final_events = ctx.generate_final_events();` 之后追加：
 
 ```rust
-                            guard.disarm();
-                            tracer.close_phase(
-                                phase::STREAMING,
-                                outcome::SUCCESS,
-                                Some(sent_bytes),
-                                None,
-                            );
+                            // 按值消费 guard：正常收尾，Drop 不得再判客户端断开
+                            guard.into_completed(sent_bytes);
                             tracer.open_phase(phase::FINISH);
                             let finish_outcome = match ctx.tool_json_error() {
                                 Some(err) => crate::anthropic::stream::phase_outcome_for(err),
@@ -1059,32 +1101,14 @@ pub(crate) fn phase_on_first_chunk(tracer: &RequestTracer) {
     tracer.open_phase(phase::STREAMING);
 }
 
-/// 上游断流：关闭 streaming 段，写齐三个判别位。
-pub(crate) fn phase_on_stream_error(
-    tracer: &RequestTracer,
-    sent_bytes: u64,
-    idle_ms: u64,
-    err: &dyn std::fmt::Display,
-) {
-    tracer.close_phase(
-        phase::STREAMING,
-        outcome::STREAM_INTERRUPTED,
-        Some(sent_bytes),
-        Some(format!(
-            "client_gone=false bytes={} idle_ms={} err={}",
-            sent_bytes, idle_ms, err
-        )),
-    );
-}
-
-/// 流正常结束：关闭 streaming 段，再按 tool_use 累积器结果开合 finish 段。
-pub(crate) fn phase_on_stream_end(
+/// 流正常结束的 finish 段：按 tool_use 累积器结果开合。
+/// streaming 段本身由 `StreamPhaseGuard::into_completed` 关闭，此处只管 finish。
+pub(crate) fn phase_on_finish(
     tracer: &RequestTracer,
     sent_bytes: u64,
     tool_json_error: Option<&ToolJsonAccumulatorError>,
     tool_json_message: Option<String>,
 ) {
-    tracer.close_phase(phase::STREAMING, outcome::SUCCESS, Some(sent_bytes), None);
     tracer.open_phase(phase::FINISH);
     let finish_outcome = match tool_json_error {
         Some(err) => crate::anthropic::stream::phase_outcome_for(err),
@@ -1099,22 +1123,49 @@ pub(crate) fn phase_on_stream_end(
 }
 ```
 
-这三个函数只接 `&RequestTracer` 和标量，**与两条路径的状态元组形状无关**，
-所以不需要泛型或 trait object。把 Step 5 里的内联代码替换成对它们的调用。
+**streaming 段的两个结局不在这里重复**——它们已经是 `StreamPhaseGuard` 的消费式
+终结方法（`into_upstream_error` / `into_completed`），两条路径直接调用同一份实现。
+guard 承载 streaming 段，这两个自由函数承载 first_token 与 finish 段，职责不重叠。
+
+两个自由函数只接 `&RequestTracer` 和标量，**与两条路径的状态元组形状无关**，
+不需要泛型或 trait object。把 Step 5 里的内联代码替换成对它们的调用。
 
 - [ ] **Step 7: 缓冲流接线**
 
 `create_buffered_sse_stream`（`handlers.rs:1586`）：`mark_first_token` 在 `:1631`、
 `Some(Err(e))` 在 `:1653`。在这两处及流结束处分别调用 Step 6 抽出的
-`phase_on_first_chunk` / `phase_on_stream_error` / `phase_on_stream_end`，
-并同样把 `StreamPhaseGuard` 放进该路径的流状态里。
+`phase_on_first_chunk` / `phase_on_finish`，并同样把 `StreamPhaseGuard`
+放进该路径的流状态里，用 `into_upstream_error` / `into_completed` 终结。
 
-- [ ] **Step 8: 全量编译与测试**
+- [ ] **Step 8: 验证 axum drop 前提（端到端，真实 socket 关闭）**
+
+Task 4 的探针只证明了 Rust 的 drop 语义，**没有**证明 axum 在客户端断开时
+真的会 drop response body、且时机上来得及让 guard 干活。整个 `client_disconnected`
+机制是否真会触发，到此仍未被证实。这一步补上。
+
+写一个集成测试（`#[tokio::test]`）：
+
+1. 用 axum 起一个最小服务，路由返回一个**慢速 SSE 流**（每 50ms 发一个 chunk，
+   共 20 个），流状态里挂上 `StreamPhaseGuard`，tracer 用内存 `TraceStore`
+   （`TraceStore::open_in_memory()`）
+2. 用 `tokio::net::TcpStream` 直接连上去发原始 HTTP 请求，读到前几个 chunk 后
+   **直接 drop 掉 socket**
+3. 等待足够长（例如 500ms）让服务端感知断开
+4. 断言：该 trace 的 phases 里出现 `outcome == client_disconnected` 的 streaming 段，
+   且 `bytes > 0`（证明断开发生在已发出内容之后）
+
+Run: `cargo test --bin kiro-rs client_disconnect_end_to_end -- --nocapture`
+
+**若该测试无法让服务端观测到断开**（例如 Drop 根本不触发，或触发时机晚于进程判定），
+**不要删掉测试或放宽断言**。停下来报告实测现象——这说明整个 `client_disconnected`
+判别不成立，是设计问题而非测试问题，需要人决策。
+
+- [ ] **Step 9: 全量编译与测试**
 
 Run: `cargo test --no-run 2>&1 | tail -5 && cargo test -- --nocapture 2>&1 | tail -20`
 Expected: 编译通过，全部测试 PASS
 
-- [ ] **Step 9: 提交**
+- [ ] **Step 10: 提交**
 
 ```bash
 git add src/anthropic/handlers.rs src/anthropic/stream.rs
