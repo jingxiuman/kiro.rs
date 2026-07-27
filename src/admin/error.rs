@@ -27,6 +27,16 @@ pub enum AdminServiceError {
 
     /// 凭据无效（验证失败）
     InvalidCredential(String),
+
+    /// 模型表中不存在该 upstreamId。
+    /// 不复用 `NotFound { id: u64 }`——后者只承载数字凭据 id。
+    ModelNotFound(String),
+
+    /// 模型/别名冲突（重复 upstreamId、对外名撞名、别名 dangling 等）
+    ModelConflict(String),
+
+    /// 字段不可写或取值非法（PATCH 白名单之外的字段、非正数窗口等）
+    InvalidModelField(String),
 }
 
 impl fmt::Display for AdminServiceError {
@@ -39,6 +49,9 @@ impl fmt::Display for AdminServiceError {
             AdminServiceError::RateLimited { .. } => write!(f, "上游请求过于频繁，请稍后重试"),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::ModelNotFound(id) => write!(f, "模型不存在: {}", id),
+            AdminServiceError::ModelConflict(msg) => write!(f, "模型配置冲突: {}", msg),
+            AdminServiceError::InvalidModelField(msg) => write!(f, "模型字段无效: {}", msg),
         }
     }
 }
@@ -54,6 +67,9 @@ impl AdminServiceError {
             AdminServiceError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::ModelNotFound(_) => StatusCode::NOT_FOUND,
+            AdminServiceError::ModelConflict(_) => StatusCode::CONFLICT,
+            AdminServiceError::InvalidModelField(_) => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -69,6 +85,12 @@ impl AdminServiceError {
                 AdminErrorResponse::internal_error(self.to_string())
             }
             AdminServiceError::InvalidCredential(_) => {
+                AdminErrorResponse::invalid_request(self.to_string())
+            }
+            AdminServiceError::ModelNotFound(_) => AdminErrorResponse::not_found(self.to_string()),
+            // 沿用既有的两种响应 type：冲突与字段非法都属于「请求本身有问题」，
+            // 状态码（409/400）已经把两者区分开，不新增响应格式。
+            AdminServiceError::ModelConflict(_) | AdminServiceError::InvalidModelField(_) => {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
         }

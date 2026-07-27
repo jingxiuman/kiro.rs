@@ -121,7 +121,7 @@ docker compose logs --tail=200 kiro-rs
 指定镜像版本：
 
 ```bash
-KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.7.1 docker compose up -d
+KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.7.2 docker compose up -d
 ```
 
 ### 下载二进制
@@ -314,6 +314,7 @@ codex
 | `/api/admin/credentials` | 凭据列表、新增、编辑、删除 |
 | `/api/admin/credentials/{id}/balance` | 查询单个凭据订阅 / 用量 |
 | `/api/admin/credentials/{id}/models` | 查询该凭据上游实际可用模型 |
+| `/api/admin/models*` | 模型注册表：查询、增删改、别名、手动同步、同步设置 |
 | `/api/admin/client-keys` | 客户端 Key 管理 |
 | `/api/admin/stats/*` | 用量统计 |
 | `/api/admin/traces` | 请求链路追踪查询 |
@@ -374,6 +375,10 @@ Admin API 鉴权同样支持：
 | `githubToken` | 无 | 在线更新访问 GitHub API 时使用，降低 rate limit 风险 |
 | `updateAutoApply` | `false` | 是否每天自动检查并应用新版本 |
 | `updateAutoApplyTime` | `03:00` | 自动更新时间，本地时区 `HH:MM` |
+| `modelSyncEnabled` | `false` | 是否每日自动同步上游模型表，详见[模型注册表与自动同步](#model-registry) |
+| `modelSyncTime` | `04:00` | 模型同步时间，本地时区 `HH:MM` |
+| `modelSyncProbeCredentialId` | 无 | 模型同步探针凭据 ID，未配置时同步降级为采样、不判定模型消失 |
+| `allowUnknownModelPassthrough` | `false` | 未收录模型是否原样透传给上游 |
 
 非空的 `config.apiKey` 每次启动都会同步为不可删除、可轮换的系统 Key `id=0`。手动修改配置后，旧系统 Key 立即失效，新值自动启用；已有名称、描述、分组和累计统计会保留。Admin 面板新建或轮换的客户端 Key 统一以 `sk-` 开头，但请求鉴权不会对任何已存储 Key 强制检查前缀。`adminApiKey` 独立用于 Admin UI / Admin API 登录，不参与 `/v1` 业务流量鉴权。
 
@@ -510,7 +515,9 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 `GET /v1/models` 返回本服务声明支持的模型 ID。真实可用性仍取决于上游账号订阅；Admin 的“凭据模型”会查询该凭据的上游真实可用模型列表。
 
-当前静态列表包含：
+下面的列表、映射规则和窗口取值是**编译内置默认**。没有 `models.json` 时它就是最终结果；有 `models.json` 时会在其上叠加人工覆盖与自动同步的结果，见[模型注册表与自动同步](#model-registry)。
+
+内置默认列表包含：
 
 - `gpt-5.6-sol`
 - `gpt-5.6-terra`
@@ -542,13 +549,89 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `opus` + `4-5` / `4.5` | `claude-opus-4.5` |
 | 任意 `haiku` | `claude-haiku-4.5` |
 
-没有命中上述规则的模型会作为不支持模型处理。
+没有命中上述规则、且不在下文「自定义模型」表中的模型会作为不支持模型处理。
 
 上下文窗口估算：
 
 - `gpt-5.*`：`272_000`（GPT-5.6 静态模型声明最大输出为 `64_000`）
 - `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-fable-5`：`1_000_000`
 - 其它模型：`200_000`
+
+<a id="model-registry"></a>
+### 模型注册表与自动同步
+
+模型表由「编译内置默认」与覆盖层文件 `models.json` 合并而成。
+
+`models.json` 放在**凭据目录**（`credentials.json` 所在目录，Docker 部署即 `./data/`），不是 `config.json` 所在目录，也不是 `config.json` 的一部分——模型表会被自动同步反复重写，独立成文件才能用自己的写锁串行化，不必和运行时配置抢同一份 load-modify-save。
+
+**文件不存在时行为与改造前完全一致**：直接使用上面的内置默认列表、映射规则和窗口取值，不算降级，不打错误日志。文件损坏、schema 版本不符或校验不过时，整体拒绝该文件、退回内置默认，并打一条 error 日志（降级运行，服务照常起）。
+
+#### 配置项
+
+四个开关都在 `config.json` 里，也可在 Admin UI 修改（热生效，不必重启）：
+
+| 字段 | 默认值 | 说明 |
+|---|---:|---|
+| `modelSyncEnabled` | `false` | 是否启用每日自动同步上游模型列表。关闭时模型表只由内置默认与人工编辑决定 |
+| `modelSyncTime` | `04:00` | 每日同步时刻，本地时区 `HH:MM` |
+| `modelSyncProbeCredentialId` | 无 | 探针凭据 ID。见下方「探针凭据」 |
+| `allowUnknownModelPassthrough` | `false` | 未收录模型是否原样透传给上游。关闭时返回 400；开启时按 `200_000` 估算窗口发往上游，并打一条 warn |
+
+Admin API：`GET/POST /api/admin/models`、`PATCH/DELETE /api/admin/models/{upstreamId}`、`POST /api/admin/models/sync`（手动触发一轮）、`POST/DELETE /api/admin/models/aliases`、`PATCH /api/admin/models/settings`。Admin UI 入口在凭据管理页顶栏的「模型映射」。
+
+#### 锁定字段（`pinned`）
+
+被锁字段的用户值胜过自动同步，也胜过代码内置默认；未锁字段跟随更新。**通过 Admin API / UI PATCH 一个字段，会自动把它锁上**，不需要单独操作。
+
+只有下面 5 个字段会被同步覆盖，因而也只有它们值得锁：
+
+| 字段 | 含义 |
+|---|---|
+| `exposedId` | 对外模型名 |
+| `displayName` | 展示名 |
+| `contextWindow` | **输入**上下文窗口 |
+| `maxOutputTokens` | **输出**上限，即 `/v1/models` 里的 `max_tokens` |
+| `exposeThinkingVariant` | 是否派生 `-thinking` 变体 |
+
+其余字段（`enabled`、`listed`、`sortOrder`、别名等）本来就只属于人工，同步不碰，无所谓锁不锁。解锁某字段后，它会在下一轮同步时回归上游值。
+
+#### 探针凭据
+
+不同凭据的订阅等级不同，能看到的模型也不同。因此「上游是否还返回某模型」这个判断只有在一个**固定的、可信的**凭据上做才有意义：
+
+- **配了 `modelSyncProbeCredentialId` 且该凭据可用** → 本轮是**权威轮次**，可以判定模型消失。
+- **没配，或探针凭据本轮拉取失败** → 降级为**采样轮次**：抽若干凭据取并集，只做新增与更新，**绝不判定任何模型消失**。
+
+**探针应当使用订阅等级最高的凭据。** 用一个低等级凭据当探针，它看不到的高等级模型会被持续判为「上游已下线」，最终标成 deprecated。下面的护栏能兜住整表误删这种最坏情况，但兜不住个别模型被误标。
+
+#### 安全护栏
+
+模型表被误删整表的代价很高（客户端模型列表突然清空），所以消失判定上叠了四道：
+
+1. **全部凭据拉取失败的轮次直接拒绝**，不写文件——「一个模型都没返回」在语义上无法与「上游全下线」区分，一律按故障处理。
+2. **采样轮次绝不判定消失**，只做新增与更新。
+3. **单轮中若「仍在服役的模型」缺失比例超过 50%**，判定这个探针不具代表性（多半是订阅等级不够或凭据出了问题），**跳过本轮的消失判定**并打一条 error 日志。
+4. **需连续 2 个权威轮次未见**才把模型标为 `deprecated`。中间任意一轮重新见到即计数归零、状态复活。
+
+`deprecated` 只是一个标记：该模型**仍然出现在 `/v1/models`、仍然可以正常请求**，UI 里标黄。模型不会凭空从列表里消失。真要下线，手动关掉它的「启用」开关——这时它才从 `/v1/models` 移除，请求返回「模型已禁用」（web-search 路径为英文 `model disabled`），与「模型不支持」区分开，便于排查是配置问题还是拼写问题。
+
+#### 已知限制
+
+以下都是当前确实存在、且有意选择不修的边界：
+
+1. **同步开启时，PATCH 过某个内置模型之后、到下一轮同步之前**，该行 4 个未锁的同步字段取的是「编辑那一刻」的值，不会跟随新版代码里的内置定义变化。下一轮同步会把它们刷新回来。彻底消除需要逐字段记录来源，会改变 `models.json` 的序列化格式，代价大于收益。
+2. **`syncState.modelMeta` 没有清理机制。** 曾经出现过、后来被上游彻底移除、且从未进入覆盖层的模型，其元数据条目会永久滞留在文件里。上界是「历史上见过的所有模型」，不会无限增长，但也不会缩小。
+3. **护栏 3 的 error 日志按同步周期重复打印，无去重。** 探针配错是一个持续状态，不是一次性事件，因此每轮都会刷一条。看到重复日志请去改探针凭据，而不是当噪音忽略。
+4. **`config.json` 既有的 6 处写入点仍是无保护的 load-modify-save**，并发写有丢失更新的可能。这是本次改造之前就存在的行为，不是新引入的；本次只把新增的 `PATCH /models/settings` 路径纳入了锁保护。`models.json` 自身的所有写路径都经写锁串行化。
+5. **「同步成功后刷新 `credentialSupport`」缺端到端验证。** 测试环境没有可用的上游凭据，`sync_once` 在选凭据阶段就会失败。启动时的灌入路径已实测，同步写入侧有单测，但这条链路整体未跑通过。
+
+### 自定义模型（`customModels`，已迁移至模型注册表）
+
+`config.json` 里的 `customModels` 数组是**旧版**自定义模型映射机制，字段含义（`id`/`backendId`/`displayName`/`contextWindow`/`maxTokens`/`supportsReasoning`/`ownedBy`）与以前一致，但**不再由它直接驱动路由**——现在由上面的[模型注册表](#model-registry)统一管理。
+
+启动时，若 `customModels` 非空，程序会把其中**注册表里还不存在**（按 `backendId` 对应的 `upstreamId` 或 `id` 对应的 `exposedId` 判断）的条目自动导入为 `models.json` 里的一条人工（Manual）行；已存在同名条目的则跳过、不覆盖注册表里的编辑（注册表以 Admin UI / API 的修改为准）。这个导入每次启动都会执行，但只在首次真正写入 —— 已导入过的条目第二次会被跳过，`models.json` 不再变化。
+
+**建议**：新部署直接用 Admin UI（凭据管理页顶栏「模型映射」）或 `POST /api/admin/models` 添加自定义模型，不必再写 `customModels`。这个配置项只是为了让老配置文件平滑过渡，后续版本可能移除。
 
 <a id="thinking-tools-websearch"></a>
 ## Thinking、工具与 WebSearch
@@ -676,6 +759,7 @@ data/
 ├── kiro_balance_cache.json
 ├── proxy_pool.json
 ├── cache_metering.json
+├── models.json
 ├── traces.db
 └── usage_log.YYYY-MM-DD.jsonl
 ```
@@ -687,6 +771,7 @@ data/
 - `kiro_balance_cache.json`：凭据订阅、额度、邮箱等缓存。
 - `proxy_pool.json`：代理池与健康状态。
 - `cache_metering.json`：prompt cache 计量缓存，定期落盘。
+- `models.json`：模型注册表覆盖层，见[模型注册表与自动同步](#model-registry)。文件不存在是正常状态。
 - `traces.db`：SQLite 请求链路追踪数据库，WAL 模式。
 - `usage_log.*.jsonl`：按日滚动请求用量日志。
 
@@ -785,7 +870,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 构建并推送 Docker Hub 多架构镜像。
 - 创建 GitHub Release。
 
-当前稳定版：[v0.7.1](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.7.1)。
+当前稳定版：[v0.7.2](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.7.2)。
 
 Docker 镜像：
 

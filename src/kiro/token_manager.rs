@@ -1030,6 +1030,11 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 凭据可用模型集缓存：凭据 id 字符串 → upstream_id 列表。
+    /// 来自 `ModelRegistryStore` 的 `credential_support` 字段（models.json）。
+    /// 填充时机：启动时由 `main.rs` 从 `models.json` 灌入，之后每轮同步
+    /// （定时调度器 / `POST /models/sync`）落盘成功后刷新。
+    credential_support: parking_lot::RwLock<std::collections::HashMap<String, Vec<String>>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1062,10 +1067,34 @@ fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
     }
 }
 
+/// 该凭据是否已知支持目标上游模型。
+///
+/// **无记录时放行**（保守，不误杀）——采样模式下大多数凭据没有 `credential_support`
+/// 记录，若无记录就拒绝，会把绝大多数凭据全部踢出轮换。
+/// 残留风险：未记录的凭据仍可能被选中并遇到上游 400，而 provider 对非 429/5xx 的
+/// 4xx 直接返回、不换凭据重试（provider.rs `is_client_error` 分支），客户端会直接
+/// 吃到这个错误。该风险由采样/回填机制在别处缓解，不属于本函数职责。
+///
+/// `support` 的键是凭据 id 的字符串形式（JSON 对象键的限制），值是 upstream_id
+/// 列表（点号形式，如 `claude-opus-4.8`）。传入的 `upstream_id` 必须是已经过
+/// 模型注册表映射后的上游 id，不是客户端请求中的原始模型名。
+pub fn credential_supports_model(
+    credential_id: u64,
+    upstream_id: &str,
+    support: &std::collections::HashMap<String, Vec<String>>,
+) -> bool {
+    match support.get(&credential_id.to_string()) {
+        Some(models) => models.iter().any(|m| m == upstream_id),
+        None => true,
+    }
+}
+
 fn credential_matches_request(
     credentials: &KiroCredentials,
+    credential_id: u64,
     model: Option<&str>,
     group: Option<&str>,
+    credential_support: &std::collections::HashMap<String, Vec<String>>,
 ) -> bool {
     let is_opus = model
         .map(|m| m.to_ascii_lowercase().contains("opus"))
@@ -1073,6 +1102,13 @@ fn credential_matches_request(
 
     if is_opus && !credentials.supports_opus() {
         return false;
+    }
+
+    // 按上游宣告的 credential_support 过滤（无记录则放行，见 credential_supports_model 注释）
+    if let Some(m) = model {
+        if !credential_supports_model(credential_id, m, credential_support) {
+            return false;
+        }
     }
 
     group_matches(&credentials.groups, group)
@@ -1197,6 +1233,7 @@ impl MultiTokenManager {
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            credential_support: parking_lot::RwLock::new(std::collections::HashMap::new()),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1257,6 +1294,20 @@ impl MultiTokenManager {
     }
 
     /// 获取可用凭据数量
+    /// 更新凭据可用模型集缓存（`credential_support`）。
+    ///
+    /// 调用时机（T12 负责接线）：启动时由 `ModelRegistryStore::load()` 的
+    /// `file.credential_support` 做初始填充；模型同步完成后用最新数据整体替换。
+    pub fn set_credential_support(&self, map: std::collections::HashMap<String, Vec<String>>) {
+        *self.credential_support.write() = map;
+    }
+
+    /// 回读当前生效的凭据可用模型集。启动日志用它做"确实灌进来了"的回读校验，
+    /// 避免只凭"调用过 set_ 了"就宣称接线完成。
+    pub fn credential_support(&self) -> std::collections::HashMap<String, Vec<String>> {
+        self.credential_support.read().clone()
+    }
+
     pub fn available_count(&self) -> usize {
         let now = Instant::now();
         self.entries
@@ -1276,6 +1327,7 @@ impl MultiTokenManager {
     fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
+        let credential_support = self.credential_support.read();
 
         // 过滤可用凭据
         let available: Vec<_> = entries
@@ -1289,7 +1341,7 @@ impl MultiTokenManager {
                     return false;
                 }
                 // 模型/分组隔离：请求模型必须由该账号支持，且账号必须匹配请求分组
-                if !credential_matches_request(&e.credentials, model, group) {
+                if !credential_matches_request(&e.credentials, e.id, model, group, &credential_support) {
                     return false;
                 }
                 true
@@ -1356,13 +1408,14 @@ impl MultiTokenManager {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     let now = Instant::now();
+                    let credential_support = self.credential_support.read();
                     entries
                         .iter()
                         .find(|e| {
                             e.id == current_id
                                 && !e.disabled
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && credential_matches_request(&e.credentials, model, group)
+                                && credential_matches_request(&e.credentials, e.id, model, group, &credential_support)
                         })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
@@ -2304,12 +2357,13 @@ impl MultiTokenManager {
             }
 
             let throttled_now = Instant::now();
+            let credential_support = self.credential_support.read();
             entries
                 .iter()
                 .filter(|e| {
                     !e.disabled
                         && !e.throttled_until.map(|t| t > throttled_now).unwrap_or(false)
-                        && credential_matches_request(&e.credentials, model, group)
+                        && credential_matches_request(&e.credentials, e.id, model, group, &credential_support)
                 })
                 .count()
         }
@@ -3415,6 +3469,76 @@ impl Drop for MultiTokenManager {
             self.save_stats();
         }
     }
+}
+
+/// 供模型注册表同步服务（`anthropic::model_sync`）拉取上游模型列表。
+///
+/// 复用既有 `get_available_models_for`（内部处理 token 刷新与并发网络请求），
+/// 只做返回类型转换，使同步逻辑可以脱离真实网络在单测中注入假实现。
+impl crate::anthropic::model_sync::ModelListFetcher for MultiTokenManager {
+    fn fetch(
+        &self,
+        credential_id: u64,
+    ) -> crate::anthropic::model_sync::BoxFuture<'_, Result<Vec<crate::anthropic::model_sync::UpstreamModel>, String>>
+    {
+        Box::pin(async move {
+            let resp = self
+                .get_available_models_for(credential_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(resp
+                .models
+                .into_iter()
+                .map(|m| crate::anthropic::model_sync::UpstreamModel {
+                    model_id: m.model_id,
+                    model_name: m.model_name,
+                    max_input_tokens: m.token_limits.and_then(|t| t.max_input_tokens),
+                })
+                .collect())
+        })
+    }
+
+    /// 可用于同步的凭据 id，升序。判据与 `is_credential_usable` 完全一致
+    /// （见 `sync_credential_is_usable`）。
+    fn candidate_credential_ids(&self) -> Vec<u64> {
+        let entries = self.entries.lock();
+        let now = Instant::now();
+        let mut ids: Vec<u64> = entries
+            .iter()
+            .filter(|e| sync_credential_is_usable(e, now))
+            .map(|e| e.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn is_credential_usable(&self, credential_id: u64) -> bool {
+        let entries = self.entries.lock();
+        let now = Instant::now();
+        entries
+            .iter()
+            .any(|e| e.id == credential_id && sync_credential_is_usable(e, now))
+    }
+}
+
+/// 同步服务眼中「这条凭据现在能不能用来拉上游模型列表」的**唯一判据**。
+///
+/// N5 修复：此前 `is_credential_usable`（探针可用性）已收紧为
+/// 「未禁用 && 未冷却 && token 可刷新」，但 `candidate_credential_ids`
+/// （采样轮次的候选来源）仍只过滤 `!disabled`，两处判据不一致 ——
+/// 采样轮照样会选到冷却中、或 refreshToken 已失效的凭据，白发一次注定失败的
+/// 上游请求，还挤掉一个真能返回数据的名额。抽成同一个 helper，杜绝再次漂移。
+///
+/// 三条判据的由来（spec §6.2）：
+/// - `disabled`：人工或自动下线的凭据本就不参与轮换。
+/// - `throttled_until`：账号级 429 风控冷却窗口，字段注释即写明「视为不可用」。
+/// - refreshToken 可用性：refreshToken 失效（但尚未触发自动禁用阈值）的凭据
+///   拉取必然失败；API Key 凭据不走刷新流程，豁免这一条。
+fn sync_credential_is_usable(entry: &CredentialEntry, now: Instant) -> bool {
+    !entry.disabled
+        && !entry.throttled_until.map(|t| t > now).unwrap_or(false)
+        && (entry.credentials.is_api_key_credential()
+            || validate_refresh_token(&entry.credentials).is_ok())
 }
 
 #[cfg(test)]
@@ -4547,6 +4671,36 @@ mod tests {
     }
 
     #[test]
+    fn credential_support_filter_rules() {
+        use std::collections::HashMap;
+        let mut support: HashMap<String, Vec<String>> = HashMap::new();
+        support.insert("3".to_string(), vec!["claude-opus-4.8".to_string()]);
+
+        // 有记录且包含 → 放行
+        assert!(credential_supports_model(3, "claude-opus-4.8", &support));
+        // 有记录但不含 → 拒绝
+        assert!(!credential_supports_model(3, "claude-opus-5", &support));
+        // 无记录 → 放行（保守，不误杀）
+        assert!(credential_supports_model(9, "claude-opus-5", &support));
+    }
+
+    #[test]
+    fn credential_matches_request_opus_gate_and_support_gate_are_and() {
+        use std::collections::HashMap;
+        // 该凭据不支持 opus（FREE 订阅）
+        let mut creds = grouped_cred("a", &[]);
+        creds.subscription_title = Some("FREE".to_string());
+        assert!(!creds.supports_opus());
+
+        // credential_support 里却记录了该凭据"支持" claude-opus-5
+        // —— 两个门是 AND 关系：即便 support 记录放行，opus 订阅门仍应拒绝。
+        let mut support: HashMap<String, Vec<String>> = HashMap::new();
+        support.insert("1".to_string(), vec!["claude-opus-5".to_string()]);
+
+        assert!(!credential_matches_request(&creds, 1, Some("claude-opus-5"), None, &support));
+    }
+
+    #[test]
     fn test_select_next_credential_filters_by_group() {
         // A∈g1, B∈g2, C∈无分组
         let manager = MultiTokenManager::new(
@@ -4718,5 +4872,56 @@ mod tests {
 
         // 但 g2 仍可用
         assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
+    }
+
+    /// N5：`candidate_credential_ids`（采样轮次的候选来源）与 `is_credential_usable`
+    /// （探针可用性判据）必须用同一套判据，否则采样轮照样会选到冷却中、或
+    /// refreshToken 已失效的凭据，白发一次注定失败的上游请求。
+    #[test]
+    fn sync_candidate_ids_use_same_usability_predicate_as_probe() {
+        use crate::anthropic::model_sync::ModelListFetcher;
+
+        let good = |token: &str| {
+            let mut c = KiroCredentials::default();
+            c.refresh_token = Some(token.repeat(150));
+            c
+        };
+        // id=1 正常；id=2 将被置于冷却窗口；id=3 refreshToken 被截断（不可刷新）；
+        // id=4 已禁用。
+        let mut truncated = KiroCredentials::default();
+        truncated.refresh_token = Some("short".to_string());
+        let mut disabled = good("d");
+        disabled.disabled = true;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![good("a"), good("b"), truncated, disabled],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 把 2 号打进账号级 429 冷却窗口
+        {
+            let mut entries = manager.entries.lock();
+            let e = entries.iter_mut().find(|e| e.id == 2).unwrap();
+            e.throttled_until = Some(Instant::now() + std::time::Duration::from_secs(60));
+        }
+
+        assert_eq!(
+            manager.candidate_credential_ids(),
+            vec![1],
+            "冷却中(2)、refreshToken 失效(3)、已禁用(4) 的凭据都不该成为采样候选"
+        );
+        // 两处判据必须一致
+        for id in [1u64, 2, 3, 4] {
+            assert_eq!(
+                manager.candidate_credential_ids().contains(&id),
+                manager.is_credential_usable(id),
+                "凭据 {} 在两处判据下的结论不一致",
+                id
+            );
+        }
     }
 }

@@ -30,6 +30,43 @@ pub enum ToolCompatibilityMode {
     Raw,
 }
 
+/// 自定义模型定义。
+///
+/// 用户在 `config.json` 的 `customModels` 数组里声明客户端模型别名到 Kiro 后端
+/// 模型 ID 的映射及元数据。运行期由 [`crate::model::custom_models`] 全局注册表按
+/// `id`（大小写不敏感）精确匹配，优先于内置的模糊映射逻辑——既能新增模型，也能
+/// 覆盖内置模型的映射。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomModel {
+    /// 客户端请求时使用的模型名（别名）。匹配大小写不敏感。
+    pub id: String,
+
+    /// 映射到的 Kiro 后端模型 ID（实际下发给上游）。
+    pub backend_id: String,
+
+    /// `/v1/models` 展示名（可选，缺省用 `id`）。
+    #[serde(default)]
+    pub display_name: Option<String>,
+
+    /// 上下文窗口大小（可选，缺省 200000）。
+    #[serde(default)]
+    pub context_window: Option<i32>,
+
+    /// 单次响应最大 token 数，用于 `/v1/models` 展示（可选，缺省 64000）。
+    #[serde(default)]
+    pub max_tokens: Option<i32>,
+
+    /// 是否支持原生 reasoning / `output_config`（可选，缺省 false）。
+    /// 命中的自定义模型置 true 时，会按 backend_id 放行 `additionalModelRequestFields`。
+    #[serde(default)]
+    pub supports_reasoning: Option<bool>,
+
+    /// `/v1/models` 的 `owned_by` 字段（可选，缺省 "custom"）。
+    #[serde(default)]
+    pub owned_by: Option<String>,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -179,6 +216,33 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 是否启用「每日自动同步上游模型」。**默认 false** —— 保证不配置任何东西时
+    /// 行为与改造前完全一致（零行为回归）。
+    #[serde(default)]
+    pub model_sync_enabled: bool,
+
+    /// 每日同步触发时间（`HH:MM`，本地 24 小时制）。
+    #[serde(default = "default_model_sync_time")]
+    pub model_sync_time: String,
+
+    /// 探针凭据 id。设置且可用时，该轮同步为「权威轮次」，可判定模型消失。
+    /// 未设置或不可用时回退为采样 3 个凭据的「非权威轮次」，只做新增/更新。
+    #[serde(default)]
+    pub model_sync_probe_credential_id: Option<u64>,
+
+    /// 未收录模型是否放行透传。**默认 false** —— 保留「模型名写错」的快速失败信号。
+    #[serde(default)]
+    pub allow_unknown_model_passthrough: bool,
+
+    /// 自定义模型映射表（兼容旧版 config.json 配置项）。
+    ///
+    /// **已被模型注册表（`models.json` / admin UI）取代**：启动时一次性把这里
+    /// 未在注册表中出现的条目导入为 Manual 行（见
+    /// [`crate::model::custom_models_import`]），此后以注册表为准。保留此字段
+    /// 只是为了不让老配置文件在升级后直接报错；新部署请直接用 admin UI 管理模型。
+    #[serde(default)]
+    pub custom_models: Vec<CustomModel>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -256,6 +320,10 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
+fn default_model_sync_time() -> String {
+    "04:00".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -292,6 +360,11 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
+            model_sync_enabled: false,
+            model_sync_time: default_model_sync_time(),
+            model_sync_probe_credential_id: None,
+            allow_unknown_model_passthrough: false,
+            custom_models: Vec::new(),
             config_path: None,
         }
     }
@@ -355,5 +428,33 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod model_sync_config_tests {
+    use super::*;
+
+    /// 四个新字段必须全部可缺省，且 modelSyncEnabled 默认 false
+    /// （否则破坏「零行为回归」）
+    #[test]
+    fn model_sync_fields_default_off() {
+        let cfg: Config = serde_json::from_str(r#"{"apiKey":"sk-x"}"#).unwrap();
+        assert!(!cfg.model_sync_enabled, "自动同步必须默认关闭");
+        assert_eq!(cfg.model_sync_time, "04:00");
+        assert_eq!(cfg.model_sync_probe_credential_id, None);
+        assert!(!cfg.allow_unknown_model_passthrough, "透传必须默认关闭");
+    }
+
+    #[test]
+    fn model_sync_fields_roundtrip_camel_case() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"modelSyncEnabled":true,"modelSyncTime":"3:5","modelSyncProbeCredentialId":7,"allowUnknownModelPassthrough":true}"#,
+        )
+        .unwrap();
+        assert!(cfg.model_sync_enabled);
+        assert_eq!(cfg.model_sync_time, "3:5");
+        assert_eq!(cfg.model_sync_probe_credential_id, Some(7));
+        assert!(cfg.allow_unknown_model_passthrough);
     }
 }

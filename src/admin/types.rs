@@ -471,6 +471,176 @@ pub struct SetLogGovernanceConfigRequest {
     pub usage_log_retention_days: Option<u32>,
 }
 
+/// 更新模型同步运行时配置（字段缺省表示不修改）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetModelSyncSettingsRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub time: Option<String>,
+    #[serde(default)]
+    pub probe_credential_id: Option<u64>,
+    /// 请求体中是否出现了 probeCredentialId 键（区分「不改」与「置空」）
+    #[serde(default, rename = "probeCredentialIdSet")]
+    pub probe_credential_id_set: bool,
+    #[serde(default)]
+    pub allow_passthrough: Option<bool>,
+    /// 白名单之外的键，一律拒绝。与 `PatchModelRequest::extra` 同一个理由：
+    /// serde 默认**静默丢弃**未知字段。实测 `{"allowUnknownModelPassthrough":true}`
+    /// （config.json 里的真实键名，与这里的 `allowPassthrough` 只差一个写法）
+    /// 会返回 200 却什么都没改，用户以为开关打开了。
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+// ============ 模型注册表 ============
+
+/// `PATCH /models/{upstreamId}` 请求体。**只列可写字段。**
+///
+/// `upstreamId` / `origin` / `status` / `missingSyncRounds` / `lastSeenAt` /
+/// `created` 为只读——尤其 `origin` 必须只读，否则可把 builtin 改成 manual
+/// 绕过删除保护。
+///
+/// `extra` 捕获所有白名单之外的键：serde 默认会**静默丢弃**未知字段，
+/// 那样用户改了 `origin` 却看到 200，以为改成功了。这里收集下来在
+/// `apply_model_patch` 里明确报错。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchModelRequest {
+    pub exposed_id: Option<String>,
+    pub display_name: Option<String>,
+    pub context_window: Option<i32>,
+    pub max_output_tokens: Option<i32>,
+    pub expose_thinking_variant: Option<bool>,
+    pub enabled: Option<bool>,
+    pub sort_order: Option<i32>,
+    pub match_kind: Option<crate::anthropic::model_registry::MatchKind>,
+    /// 是否支持原生 reasoning / `output_config`。三态：`Some(true)`/`Some(false)`
+    /// 显式声明，`None` 回落内置判断。与 `probeCredentialId`/`probeCredentialIdSet`
+    /// 同一模式：`supportsReasoning` 单独出现无法区分「不改」与「清回 None」，
+    /// 靠 `supportsReasoningSet` 显式标出「本次请求确实要动这个字段」。
+    /// 与 `enabled`/`sortOrder`/`matchKind` 同组：本地策略开关，同步
+    /// （ListAvailableModels）不返回这个信息、无数据源覆盖它，因此不进
+    /// pinned、UI 不显示锁图标。
+    #[serde(default)]
+    pub supports_reasoning: Option<bool>,
+    #[serde(default)]
+    pub supports_reasoning_set: bool,
+    /// 解除锁定的字段名，使其回归自动同步
+    #[serde(default)]
+    pub unpin: Vec<String>,
+    /// 白名单之外的键，一律拒绝。见结构体文档。
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// `POST /models` 请求体。只有 `upstreamId` 必填，其余按 §4.4 派生或取保守默认值。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateModelRequest {
+    pub upstream_id: String,
+    pub exposed_id: Option<String>,
+    pub display_name: Option<String>,
+    pub context_window: Option<i32>,
+    pub max_output_tokens: Option<i32>,
+    pub expose_thinking_variant: Option<bool>,
+    pub enabled: Option<bool>,
+    pub sort_order: Option<i32>,
+    pub match_kind: Option<crate::anthropic::model_registry::MatchKind>,
+    /// 白名单之外的键，一律拒绝。理由同 `PatchModelRequest::extra`：静默丢弃
+    /// 未知字段会让「写错字段名」表现为 200 成功，而值根本没进表。
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// `GET /models` 里的一行。在 `ModelRow` 之外附加只读的响应期派生字段。
+///
+/// `deletable` 不是 `ModelRow` 自身的字段：`ModelRow` 同时也是 models.json
+/// 的持久化类型（见 `ModelRegistryFile.models`），若把 `deletable` 加进
+/// `ModelRow`，它会跟着 `pinned`/`origin` 一起被写进磁盘——而它其实是每次
+/// 响应时现算的派生值（同源判据见 `is_builtin_upstream_id`），不该落盘。
+/// 用外层包一层的方式把「持久化字段」与「响应期派生字段」分开。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRowResponse {
+    #[serde(flatten)]
+    pub row: crate::anthropic::model_registry::ModelRow,
+    /// 这一行能否被删除。与 `DELETE /models/{upstreamId}` 的判据
+    /// （`is_builtin_upstream_id`）同源，前端应据此而非 `origin` 决定删除按钮。
+    pub deletable: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRegistryResponse {
+    pub models: Vec<ModelRowResponse>,
+    pub aliases: Vec<crate::anthropic::model_registry::ModelAlias>,
+    pub sync_state: crate::anthropic::model_registry::SyncState,
+    pub settings: ModelSyncSettingsResponse,
+    pub degraded: bool,
+    pub degraded_reason: Option<String>,
+    /// 已记录可用模型的凭据数 / 启用凭据总数，用于 UI 提示覆盖率
+    pub credential_support_covered: usize,
+    pub credential_total: usize,
+    /// **最近一轮同步**是否因比例护栏暂停了消失判定。
+    /// 从 `syncState.source` 解码而来（定时同步不经 admin 层，重启也会丢内存态，
+    /// 所以这个状态必须落盘才看得见），UI 据此常驻显示确认横幅。
+    pub disappearance_check_skipped: bool,
+    /// 最近一轮的缺失比例（0.0~1.0）。未跳过时为 0。
+    pub missing_ratio: f64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSyncSettingsResponse {
+    pub enabled: bool,
+    pub time: String,
+    pub probe_credential_id: Option<u64>,
+    pub allow_passthrough: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncSummaryResponse {
+    pub round: String,
+    pub added: usize,
+    pub updated: usize,
+    pub deprecated: usize,
+    pub trusted: bool,
+    pub source: String,
+    /// 本轮是否因比例护栏暂停了消失判定（新增/更新照常）。见 spec §6.3 第四版。
+    pub disappearance_check_skipped: bool,
+    /// 护栏判据的实际缺失比例（0.0~1.0）。
+    pub missing_ratio: f64,
+}
+
+/// `POST /models/sync` 的查询参数。
+///
+/// 风格对齐既有的 `DELETE /groups/{name}?force=true`（`DeleteGroupQuery`）：
+/// 「明知有保护、仍要执行」在本项目里就是一个 `force` 查询参数。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncModelsQuery {
+    /// **强制放行一次消失判定**。缺省 false —— 必须由人显式带上，绝不是默认行为。
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertAliasRequest {
+    pub from: String,
+    pub to: String,
+}
+
+/// `DELETE /models/aliases` 请求体。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteAliasRequest {
+    pub from: String,
+}
+
 // ============ 代理池 ============
 
 /// 代理池条目

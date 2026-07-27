@@ -576,3 +576,187 @@ export interface UpdateGroupRequest {
   /** 新备注；空字符串清除；undefined 保留原值 */
   description?: string
 }
+
+// ============ 模型注册表 ============
+// 与 src/admin/types.rs 的 ModelRegistryResponse / src/anthropic/model_registry.rs 的
+// ModelRow 一一对应（后端 serde rename_all = "camelCase"）。
+
+/** 匹配方式：精确匹配，或前缀通配（如 `gpt-5*` 透传行） */
+export type MatchKind = 'exact' | 'prefix'
+
+/** 行状态：上游仍在返回 / 上游已不再返回但保留可用 */
+export type ModelStatus = 'active' | 'deprecated'
+
+/** 行来源：代码内置（不可删）/ 自动同步产生 / 人工新增 */
+export type ModelOrigin = 'builtin' | 'synced' | 'manual'
+
+/**
+ * 会被自动同步覆盖、因而支持「锁定」的字段。
+ *
+ * 与后端 `PATCHABLE_PINNED_FIELDS` 保持一致。`enabled` / `sortOrder` /
+ * `matchKind` 是本地策略，同步不碰，因此不在此列、也不该显示锁标记。
+ */
+export const LOCKABLE_MODEL_FIELDS = [
+  'exposedId',
+  'displayName',
+  'contextWindow',
+  'maxOutputTokens',
+  'exposeThinkingVariant',
+] as const
+
+export type LockableModelField = (typeof LOCKABLE_MODEL_FIELDS)[number]
+
+/** 模型表一行 = 一个上游模型 */
+export interface ModelRow {
+  /** 上游 modelId，行主键 */
+  upstreamId: string
+  matchKind: MatchKind
+  /** 对外暴露的模型名 */
+  exposedId: string
+  displayName: string
+  ownedBy: string
+  modelType: string
+  created: number
+  /** **输入**上下文窗口 */
+  contextWindow: number
+  /** **输出**上限（/v1/models 的 max_tokens），与 contextWindow 是不同的量 */
+  maxOutputTokens: number
+  exposeThinkingVariant: boolean
+  enabled: boolean
+  /** 是否出现在 /v1/models 列表中。prefix 行强制 false */
+  listed: boolean
+  status: ModelStatus
+  origin: ModelOrigin
+  sortOrder: number
+  /** 已锁定（人工编辑过、同步时逐字段跳过）的字段名 */
+  pinned: string[]
+  missingSyncRounds: number
+  lastSeenAt: string | null
+  /** 额外的子串匹配关键字（只读，后端内置） */
+  matchSubstrings?: string[]
+  /**
+   * 是否支持原生 reasoning / `output_config`。三态：`true`/`false` 是显式声明；
+   * 字段缺失（`undefined`）表示未设置，运行时回落到内置硬编码判断。与
+   * `enabled`/`sortOrder`/`matchKind` 同组，不受自动同步管辖，不显示锁图标。
+   */
+  supportsReasoning?: boolean
+  /**
+   * 这一行能否被删除，只读，响应期计算。与后端 `DELETE /models/{upstreamId}`
+   * 的判据同源，不与 `origin` 等价：PATCH 一个内置模型会在覆盖层落一条
+   * `origin = 'manual'` 的行，但它本质仍是内置模型、仍不可删。删除按钮的
+   * 显隐必须看这个字段，不能看 `origin === 'builtin'`。
+   */
+  deletable: boolean
+}
+
+/** 手动别名：from → to（to 必须是某个存在的 upstreamId） */
+export interface ModelAlias {
+  from: string
+  to: string
+}
+
+export interface ModelSyncSettings {
+  enabled: boolean
+  /** 每日自动同步时间，HH:MM */
+  time: string
+  probeCredentialId: number | null
+  allowPassthrough: boolean
+}
+
+export interface ModelSyncState {
+  lastSyncAt: string | null
+  lastFetchStartedAt: string | null
+  source: string | null
+  /**
+   * upstreamId → 同步元数据。**注意**：这些值后端已经叠加到 `models` 的行上，
+   * UI 直接读行上的 status / missingSyncRounds / lastSeenAt 即可，不要读这里。
+   */
+  modelMeta?: Record<
+    string,
+    { missingSyncRounds: number; status: ModelStatus; lastSeenAt: string | null }
+  >
+}
+
+/** `GET /models` 以及所有写端点的统一响应体 */
+export interface ModelRegistryResponse {
+  /** 有效行集（内置 ∪ 覆盖层叠加后的结果），已按 sortOrder 升序排好 */
+  models: ModelRow[]
+  aliases: ModelAlias[]
+  syncState: ModelSyncState
+  settings: ModelSyncSettings
+  /** models.json 读取/校验失败，当前跑在纯内置表上 */
+  degraded: boolean
+  degradedReason: string | null
+  /** 已记录可用模型的凭据数 */
+  credentialSupportCovered: number
+  /** 启用中的凭据总数 */
+  credentialTotal: number
+  /**
+   * 最近一轮同步是否因「单轮标记比例护栏」暂停了消失判定（spec §6.3 第四版）。
+   * 从 syncState.source 解码而来，服务重启、定时同步（不经 admin 层）之后
+   * 仍能看见——不暴露这个字段，系统会长期处于「同步天天成功、消失判定其实
+   * 已停机」而无人知晓的状态。
+   */
+  disappearanceCheckSkipped: boolean
+  /** 触发护栏判据的实际缺失比例（0.0~1.0）。未跳过时为 0 */
+  missingRatio: number
+}
+
+/** `POST /models/sync` 的 diff 摘要 */
+export interface SyncSummary {
+  /** authoritative（权威轮，可写入）/ advisory（参考轮，不写入） */
+  round: string
+  added: number
+  updated: number
+  deprecated: number
+  trusted: boolean
+  source: string
+  /** 本轮是否因护栏暂停了消失判定（新增/更新照常进行） */
+  disappearanceCheckSkipped: boolean
+  missingRatio: number
+}
+
+/** `PATCH /models/{upstreamId}` 请求体。只列可写字段 */
+export interface PatchModelRequest {
+  exposedId?: string
+  displayName?: string
+  contextWindow?: number
+  maxOutputTokens?: number
+  exposeThinkingVariant?: boolean
+  enabled?: boolean
+  sortOrder?: number
+  matchKind?: MatchKind
+  /**
+   * 是否支持原生 reasoning / `output_config`。要清回「跟随内置默认」（即把
+   * 后端字段变回 `None`）需要传 `supportsReasoning: undefined` 且
+   * `supportsReasoningSet: true`——只传 `undefined` 的 `supportsReasoning`
+   * 而不带 `Set` 标记，后端视为「本次不改这个字段」。
+   */
+  supportsReasoning?: boolean
+  supportsReasoningSet?: boolean
+  /** 解除锁定的字段名，使其回归自动同步 */
+  unpin?: string[]
+}
+
+/** `POST /models` 请求体。只有 upstreamId 必填 */
+export interface CreateModelRequest {
+  upstreamId: string
+  exposedId?: string
+  displayName?: string
+  contextWindow?: number
+  maxOutputTokens?: number
+  exposeThinkingVariant?: boolean
+  enabled?: boolean
+  sortOrder?: number
+  matchKind?: MatchKind
+}
+
+/** `PATCH /models/settings` 请求体 */
+export interface SetModelSyncSettingsRequest {
+  enabled?: boolean
+  time?: string
+  probeCredentialId?: number | null
+  /** 请求体中是否出现了 probeCredentialId 键（区分「不改」与「置空」） */
+  probeCredentialIdSet?: boolean
+  allowPassthrough?: boolean
+}

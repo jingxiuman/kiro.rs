@@ -30,9 +30,10 @@ use super::types::{
     LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
     QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-    StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
-    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    SetLogGovernanceConfigRequest, SetModelSyncSettingsRequest, SetUpdateConfigRequest,
+    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
+    StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
+    UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -145,6 +146,29 @@ impl RuntimeUpdateConfig {
     }
 }
 
+/// 模型同步的运行时配置。不放进不可变的 Config clone
+/// （MultiTokenManager 持有的是 clone，见 token_manager.rs 中 `config:` 字段），
+/// 否则 PATCH 无法热生效。
+#[derive(Debug, Clone)]
+pub struct ModelSyncSettings {
+    pub enabled: bool,
+    pub time: String,
+    pub probe_credential_id: Option<u64>,
+    pub allow_passthrough: bool,
+}
+
+impl ModelSyncSettings {
+    /// pub(crate)：main.rs 需要在 admin 分支之外先建出共享 holder 给调度器用。
+    pub(crate) fn from_config(config: &Config) -> Self {
+        Self {
+            enabled: config.model_sync_enabled,
+            time: config.model_sync_time.clone(),
+            probe_credential_id: config.model_sync_probe_credential_id,
+            allow_passthrough: config.allow_unknown_model_passthrough,
+        }
+    }
+}
+
 /// Admin 服务
 ///
 /// 封装所有 Admin API 的业务逻辑
@@ -168,6 +192,18 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// 模型同步运行时配置（可热改）。
+    /// `Arc` 是因为同步调度器创建在 admin 分支之外（spec §6.1），它和这里必须
+    /// 读同一份 holder，否则 UI 改了开关调度器看不到，得重启才生效。
+    model_sync: Arc<parking_lot::RwLock<ModelSyncSettings>>,
+    /// config.json 写锁。既有的 `update_config_file` 是无保护的
+    /// load-modify-save，本锁用于串行化本任务新增的写路径，避免并发丢失更新。
+    config_write_lock: tokio::sync::Mutex<()>,
+    /// models.json 存储层。由启动流程注入（见 `with_model_registry`）；
+    /// 未注入时 `/models` 相关端点返回明确的未初始化错误，而不是假装成功。
+    model_registry_store: Option<Arc<crate::anthropic::model_registry_store::ModelRegistryStore>>,
+    /// 手动同步用的同步服务。同上，由启动流程注入。
+    model_sync_service: Option<Arc<crate::anthropic::model_sync::ModelSyncService>>,
 }
 
 /// Social 登录会话状态
@@ -206,7 +242,8 @@ struct IdcAuthSession {
 
 /// 解析自动更新触发时间（`HH:MM`，本地 24 小时制）。允许 `H:M` 简写，
 /// 例如 `3:0`；解析失败时返回原字符串，便于错误信息提示。
-fn parse_auto_apply_time(value: &str) -> Result<(u32, u32), AdminServiceError> {
+/// pub(crate)：模型同步调度器建在 admin 分支之外（main.rs），需要同一套 HH:MM 解析。
+pub(crate) fn parse_auto_apply_time(value: &str) -> Result<(u32, u32), AdminServiceError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(AdminServiceError::InvalidCredential(
@@ -475,6 +512,7 @@ impl AdminService {
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
+        let model_sync = ModelSyncSettings::from_config(token_manager.config());
 
         let svc = Self {
             token_manager,
@@ -488,6 +526,10 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            model_sync: Arc::new(parking_lot::RwLock::new(model_sync)),
+            config_write_lock: tokio::sync::Mutex::new(()),
+            model_registry_store: None,
+            model_sync_service: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -1250,6 +1292,259 @@ impl AdminService {
             }
             Err(e) => tracing::warn!("读取配置文件失败（跳过持久化）: {}", e),
         }
+    }
+
+    /// 注入模型注册表依赖（models.json 存储层 + 同步服务）。
+    ///
+    /// 与 `with_log_governance` 同样的注入风格。**调度器不在这里** ——
+    /// 定时同步必须在 admin 分支之外创建（spec §6.1：AdminService 仅在
+    /// adminApiKey 非空时创建），这里只承接手动触发与表编辑。
+    pub fn with_model_registry(
+        mut self,
+        store: Option<Arc<crate::anthropic::model_registry_store::ModelRegistryStore>>,
+        sync_service: Option<Arc<crate::anthropic::model_sync::ModelSyncService>>,
+    ) -> Self {
+        self.model_registry_store = store;
+        self.model_sync_service = sync_service;
+        self
+    }
+
+    /// 采用启动流程创建的共享同步配置 holder。
+    ///
+    /// 不这样做的话，`AdminService::new` 会自己从 config 复制一份，
+    /// `set_model_sync_settings` 只改到自己那份，admin 分支之外的调度器
+    /// 永远看的是启动瞬间的快照 —— 开关/时间/探针的修改都得重启才生效。
+    pub fn with_model_sync_settings(
+        mut self,
+        settings: Arc<parking_lot::RwLock<ModelSyncSettings>>,
+    ) -> Self {
+        self.model_sync = settings;
+        self
+    }
+
+    fn registry_store(
+        &self,
+    ) -> Result<&Arc<crate::anthropic::model_registry_store::ModelRegistryStore>, AdminServiceError>
+    {
+        self.model_registry_store.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("模型注册表未初始化（models.json 存储层缺失）".to_string())
+        })
+    }
+
+    /// 启用中的凭据 id（覆盖率分母）。禁用凭据不参与调度，统计它没有意义。
+    fn enabled_credential_ids(&self) -> Vec<u64> {
+        self.token_manager
+            .snapshot()
+            .entries
+            .iter()
+            .filter(|e| !e.disabled)
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// `GET /models`
+    pub fn model_registry(
+        &self,
+    ) -> Result<crate::admin::types::ModelRegistryResponse, AdminServiceError> {
+        let store = self.registry_store()?;
+        Ok(build_model_registry_response(
+            store,
+            self.model_sync_settings(),
+            &self.enabled_credential_ids(),
+        ))
+    }
+
+    /// 所有写路径的公共骨架：store.mutate（内部串行 + 原子落盘 + 落盘前整表校验）
+    /// → 成功后才热替换内存注册表 → 返回最新快照供 UI 直接刷新。
+    async fn mutate_registry<F>(
+        &self,
+        f: F,
+    ) -> Result<crate::admin::types::ModelRegistryResponse, AdminServiceError>
+    where
+        F: FnOnce(
+            &mut crate::anthropic::model_registry::ModelRegistryFile,
+        ) -> Result<(), AdminServiceError>,
+    {
+        let store = self.registry_store()?;
+        let file = store
+            .mutate(|file| f(file).map_err(encode_model_error))
+            .await
+            .map_err(decode_model_error)?;
+
+        // 落盘成功才 swap，失败则内存保持旧值（spec §6.5）
+        match crate::anthropic::model_registry::ModelRegistry::from_file(file) {
+            Ok(registry) => crate::anthropic::model_registry::install_registry(registry),
+            Err(e) => {
+                tracing::error!("写入后的 models.json 校验失败: {}，保持内存中旧表", e);
+                return Err(AdminServiceError::InternalError(format!(
+                    "模型表已写盘但校验失败: {}",
+                    e
+                )));
+            }
+        }
+        self.model_registry()
+    }
+
+    /// `POST /models` 手动新增一行（origin = manual）
+    pub async fn create_model(
+        &self,
+        req: crate::admin::types::CreateModelRequest,
+    ) -> Result<crate::admin::types::ModelRegistryResponse, AdminServiceError> {
+        self.mutate_registry(|file| create_model_in_file(file, &req)).await
+    }
+
+    /// `PATCH /models/{upstreamId}`
+    pub async fn patch_model(
+        &self,
+        upstream_id: &str,
+        req: crate::admin::types::PatchModelRequest,
+    ) -> Result<crate::admin::types::ModelRegistryResponse, AdminServiceError> {
+        self.mutate_registry(|file| patch_model_in_file(file, upstream_id, &req)).await
+    }
+
+    /// `DELETE /models/{upstreamId}`
+    pub async fn delete_model(
+        &self,
+        upstream_id: &str,
+    ) -> Result<crate::admin::types::ModelRegistryResponse, AdminServiceError> {
+        self.mutate_registry(|file| delete_model_in_file(file, upstream_id)).await
+    }
+
+    /// `POST /models/aliases`
+    pub async fn upsert_alias(
+        &self,
+        req: crate::admin::types::UpsertAliasRequest,
+    ) -> Result<crate::admin::types::ModelRegistryResponse, AdminServiceError> {
+        self.mutate_registry(|file| upsert_alias_in_file(file, &req)).await
+    }
+
+    /// `DELETE /models/aliases`
+    pub async fn delete_alias(
+        &self,
+        from: &str,
+    ) -> Result<crate::admin::types::ModelRegistryResponse, AdminServiceError> {
+        self.mutate_registry(|file| delete_alias_in_file(file, from)).await
+    }
+
+    /// `POST /models/sync` 手动触发一轮同步，返回 diff 摘要。
+    ///
+    /// 失败（无可用凭据 / 全部凭据返回空列表 / 乱序丢弃）时 models.json 不被改动，
+    /// 原因原样带回给 UI —— 这些都是需要人看到具体原因才能处理的情况。
+    pub async fn sync_models(
+        &self,
+        force_disappearance_check: bool,
+    ) -> Result<crate::admin::types::SyncSummaryResponse, AdminServiceError> {
+        use crate::anthropic::model_sync::{RoundKind, SyncOptions};
+
+        let service = self.model_sync_service.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("模型同步服务未初始化".to_string())
+        })?;
+        let probe = self.model_sync_settings().probe_credential_id;
+        if force_disappearance_check {
+            // 强制放行会真的把模型标成 deprecated，留一条谁都能查到的痕迹。
+            tracing::warn!("运维显式强制放行一次消失判定（POST /models/sync?force=true）");
+        }
+        let summary = service
+            .sync_once_with(
+                probe,
+                Utc::now(),
+                SyncOptions { force_disappearance_check },
+            )
+            .await
+            .map_err(|e| AdminServiceError::InternalError(format!("模型同步失败: {}", e)))?;
+
+        // 同步顺带刷新了 credentialSupport，落盘后要灌回调度层，否则手动同步之后
+        // 凭据过滤仍按上一份记录走（新记录到下次重启才生效）。
+        if let Some(store) = &self.model_registry_store {
+            self.token_manager
+                .set_credential_support(store.load().file.credential_support);
+        }
+
+        Ok(crate::admin::types::SyncSummaryResponse {
+            round: match summary.round {
+                RoundKind::Authoritative => "authoritative".to_string(),
+                RoundKind::Advisory => "advisory".to_string(),
+            },
+            added: summary.added,
+            updated: summary.updated,
+            deprecated: summary.deprecated,
+            trusted: summary.trusted,
+            source: summary.source,
+            disappearance_check_skipped: summary.disappearance_check_skipped,
+            missing_ratio: summary.missing_ratio,
+        })
+    }
+
+    /// 获取模型同步运行时配置
+    pub fn model_sync_settings(&self) -> ModelSyncSettings {
+        self.model_sync.read().clone()
+    }
+
+    /// 更新模型同步运行时配置（字段缺省表示不修改），持久化到 config.json 并热生效。
+    pub async fn set_model_sync_settings(
+        &self,
+        req: SetModelSyncSettingsRequest,
+    ) -> Result<ModelSyncSettings, AdminServiceError> {
+        // M1：白名单之外的键一律拒绝。serde 默认静默丢弃未知字段，实测
+        // `{"allowUnknownModelPassthrough":true}`（config.json 里的真实键名）
+        // 返回 200 却什么都没改 —— 用户会以为开关已经打开。
+        if !req.extra.is_empty() {
+            let names: Vec<&str> = req.extra.keys().map(|k| k.as_str()).collect();
+            return Err(AdminServiceError::InvalidModelField(format!(
+                "以下字段未知: {}。可写字段: enabled、time、probeCredentialId\
+                 （配合 probeCredentialIdSet）、allowPassthrough",
+                names.join("、")
+            )));
+        }
+
+        // 校验时间格式，复用既有解析器。
+        // M2：解析器的错误文案属于「二进制自动更新」那条路径（凭据无效: 自动更新时间…），
+        // 用在这里会把「模型同步时间」说成「凭据无效」，排查方向直接被带偏。
+        // 这里改挂 §8 为模型字段准备的 InvalidModelField，并换成本路径的措辞。
+        if let Some(time) = req.time.as_deref() {
+            parse_auto_apply_time(time).map_err(|_| {
+                AdminServiceError::InvalidModelField(format!(
+                    "模型同步时间无效：{}（应为 HH:MM，HH 0-23，MM 0-59）",
+                    time
+                ))
+            })?;
+        }
+
+        // 串行化 config.json 的 load-modify-save，避免并发写丢失更新
+        let _guard = self.config_write_lock.lock().await;
+
+        let mut next = self.model_sync_settings();
+        if let Some(v) = req.enabled {
+            next.enabled = v;
+        }
+        if let Some(v) = req.time.clone() {
+            next.time = v;
+        }
+        if req.probe_credential_id_set {
+            next.probe_credential_id = req.probe_credential_id;
+        }
+        if let Some(v) = req.allow_passthrough {
+            next.allow_passthrough = v;
+        }
+
+        // 持久化：从磁盘加载最新后再写，避免覆盖其他字段
+        let base = self.token_manager.config();
+        let path = base.config_path().ok_or_else(|| {
+            AdminServiceError::InternalError("配置文件路径未知，无法保存配置".to_string())
+        })?;
+        let mut config = Config::load(path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+        config.model_sync_enabled = next.enabled;
+        config.model_sync_time = next.time.clone();
+        config.model_sync_probe_credential_id = next.probe_credential_id;
+        config.allow_unknown_model_passthrough = next.allow_passthrough;
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        *self.model_sync.write() = next.clone();
+        crate::anthropic::model_registry::set_allow_passthrough(next.allow_passthrough);
+        Ok(next)
     }
 
     /// 获取全局代理 URL
@@ -3080,12 +3375,1229 @@ impl AdminService {
     }
 }
 
+// ============ 模型注册表：纯函数层 ============
+//
+// 这些函数只操作 `ModelRegistryFile`，不碰 I/O、不碰全局状态，因此可以脱离
+// AdminService（构造它需要一个真实的 MultiTokenManager）单独单测。
+// AdminService 上的方法只负责「取 store → mutate → 热替换 → 返回快照」。
+
+/// 可写字段中「会被自动 pin」的那部分 = **同步会覆盖的字段**，直接复用
+/// `SYNC_MANAGED_FIELDS`，不在这里另抄一份（抄第二份就会漂移）。
+///
+/// 这条等式就是 pin 的定义本身：pin 的全部意义是挡住同步，所以「值得 pin 的字段」
+/// 恰好是「同步会覆盖的字段」。反过来说，`enabled` / `sortOrder` / `matchKind` 是
+/// 本地展示与准入策略，同步流程根本不碰，pin 了只会在 UI 上多出永远解不掉的锁标记。
+use crate::anthropic::model_registry::SYNC_MANAGED_FIELDS as PATCHABLE_PINNED_FIELDS;
+
+/// 领域错误穿过 `ModelRegistryStore::mutate` 的 `String` 通道时用的标签。
+/// mutate 的闭包只能返回 `String`，直接丢失错误类型会让「模型不存在」变成 500。
+const TAG_NOT_FOUND: &str = "[model-not-found] ";
+const TAG_CONFLICT: &str = "[model-conflict] ";
+const TAG_INVALID: &str = "[model-invalid-field] ";
+
+fn encode_model_error(err: AdminServiceError) -> String {
+    match err {
+        AdminServiceError::ModelNotFound(m) => format!("{}{}", TAG_NOT_FOUND, m),
+        AdminServiceError::ModelConflict(m) => format!("{}{}", TAG_CONFLICT, m),
+        AdminServiceError::InvalidModelField(m) => format!("{}{}", TAG_INVALID, m),
+        other => other.to_string(),
+    }
+}
+
+fn decode_model_error(raw: String) -> AdminServiceError {
+    if let Some(m) = raw.strip_prefix(TAG_NOT_FOUND) {
+        AdminServiceError::ModelNotFound(m.to_string())
+    } else if let Some(m) = raw.strip_prefix(TAG_CONFLICT) {
+        AdminServiceError::ModelConflict(m.to_string())
+    } else if let Some(m) = raw.strip_prefix(TAG_INVALID) {
+        AdminServiceError::InvalidModelField(m.to_string())
+    } else {
+        // 剩下的都是 store 自己的失败：读写 / 序列化 / 落盘前的整表校验。
+        // 前两类是服务端问题；整表校验失败在这里理论上不会发生（每个 in_file
+        // 函数返回前都已自校验），保守归为 InternalError 而不是伪装成 4xx。
+        AdminServiceError::InternalError(raw)
+    }
+}
+
+/// 整表校验：任何一次写入后的文件都必须能被 `from_file` 加载，
+/// 否则下次启动会整体退回内置默认（degraded）。
+fn validate_registry_file(
+    file: &crate::anthropic::model_registry::ModelRegistryFile,
+) -> Result<crate::anthropic::model_registry::ModelRegistry, AdminServiceError> {
+    crate::anthropic::model_registry::ModelRegistry::from_file(file.clone())
+        .map_err(AdminServiceError::ModelConflict)
+}
+
+/// 有效行集 = 内置默认 ∪ 覆盖层（叠加 syncState.modelMeta）。
+/// **查行必须走这里**，不能只看 `file.models`：内置行不在覆盖层里。
+fn effective_registry(
+    file: &crate::anthropic::model_registry::ModelRegistryFile,
+) -> Result<crate::anthropic::model_registry::ModelRegistry, AdminServiceError> {
+    validate_registry_file(file)
+}
+
+/// 应用 PATCH，被编辑的字段自动进 pinned。
+///
+/// 语义要点：**白名单之外的字段一律报错**。serde 默认静默丢弃未知字段，
+/// 用户改 `origin` 会拿到 200 却什么都没发生；而 `origin` 恰恰是删除保护的
+/// 依据，静默失败在这里是安全问题的一半。
+pub fn apply_model_patch(
+    row: &mut crate::anthropic::model_registry::ModelRow,
+    req: &crate::admin::types::PatchModelRequest,
+) -> Result<(), AdminServiceError> {
+    if !req.extra.is_empty() {
+        let names: Vec<&str> = req.extra.keys().map(|k| k.as_str()).collect();
+        return Err(AdminServiceError::InvalidModelField(format!(
+            "以下字段不可写（只读或未知）: {}。可写字段: exposedId、displayName、\
+             contextWindow、maxOutputTokens、exposeThinkingVariant、enabled、sortOrder、\
+             matchKind、supportsReasoning",
+            names.join("、")
+        )));
+    }
+
+    // 先全部校验再落值：中途失败不能留下改了一半的行。
+    if let Some(v) = req.exposed_id.as_deref() {
+        if v.trim().is_empty() {
+            return Err(AdminServiceError::InvalidModelField(
+                "exposedId 不能为空".to_string(),
+            ));
+        }
+    }
+    if let Some(v) = req.display_name.as_deref() {
+        if v.trim().is_empty() {
+            return Err(AdminServiceError::InvalidModelField(
+                "displayName 不能为空".to_string(),
+            ));
+        }
+    }
+    if let Some(v) = req.context_window {
+        if v <= 0 {
+            return Err(AdminServiceError::InvalidModelField(
+                "contextWindow 必须为正数".to_string(),
+            ));
+        }
+    }
+    if let Some(v) = req.max_output_tokens {
+        if v <= 0 {
+            return Err(AdminServiceError::InvalidModelField(
+                "maxOutputTokens 必须为正数".to_string(),
+            ));
+        }
+    }
+
+    let pin = |row: &mut crate::anthropic::model_registry::ModelRow, field: &str| {
+        if PATCHABLE_PINNED_FIELDS.contains(&field) && !row.pinned.iter().any(|p| p == field) {
+            row.pinned.push(field.to_string());
+        }
+    };
+
+    if let Some(v) = req.exposed_id.clone() {
+        row.exposed_id = v.trim().to_ascii_lowercase();
+        pin(row, "exposedId");
+    }
+    if let Some(v) = req.display_name.clone() {
+        row.display_name = v;
+        pin(row, "displayName");
+    }
+    if let Some(v) = req.context_window {
+        row.context_window = v;
+        pin(row, "contextWindow");
+    }
+    if let Some(v) = req.max_output_tokens {
+        row.max_output_tokens = v;
+        pin(row, "maxOutputTokens");
+    }
+    if let Some(v) = req.expose_thinking_variant {
+        row.expose_thinking_variant = v;
+        pin(row, "exposeThinkingVariant");
+    }
+    // 以下四个字段同步流程不覆盖，不需要 pin（见 PATCHABLE_PINNED_FIELDS 注释）：
+    // enabled/sortOrder/matchKind 是既有的本地策略；supportsReasoning 同理——
+    // 同步的数据源（ListAvailableModels）不返回这个信息，加进 pin 名单只会让
+    // 它永远显示解不开的锁，且没有任何东西会去解它。
+    if let Some(v) = req.enabled {
+        row.enabled = v;
+    }
+    if let Some(v) = req.sort_order {
+        row.sort_order = v;
+    }
+    if let Some(v) = req.match_kind {
+        row.match_kind = v;
+    }
+    // 用 `supportsReasoningSet` 标出「本次确实要动这个字段」，而不是直接看
+    // `supports_reasoning.is_some()`——否则「清回跟随内置默认」（值本身是 None）
+    // 就永远无法通过 PATCH 表达，只能靠直接改 models.json。
+    if req.supports_reasoning_set {
+        row.supports_reasoning = req.supports_reasoning;
+    }
+
+    for field in &req.unpin {
+        row.pinned.retain(|p| p != field);
+    }
+    Ok(())
+}
+
+/// builtin 行永不可删。
+pub fn ensure_deletable(
+    row: &crate::anthropic::model_registry::ModelRow,
+) -> Result<(), AdminServiceError> {
+    if row.origin == crate::anthropic::model_registry::ModelOrigin::Builtin {
+        return Err(AdminServiceError::InvalidModelField(format!(
+            "内置模型不可删除: {}",
+            row.upstream_id
+        )));
+    }
+    Ok(())
+}
+
+/// PATCH 一行。行可能只存在于内置默认里（覆盖层没有它），此时把它**下沉**成一条
+/// manual 覆盖行。
+///
+/// 为什么下沉后 origin 记 `Manual` 而不是保留 `Builtin`：`origin=builtin` 的行
+/// 不允许出现在覆盖层（见 model_sync 里 `retain` 维持的不变量），一旦写进去，
+/// 它就成了内置定义的冻结快照。删除保护因此**不能**只看覆盖层里的 origin ——
+/// `delete_model_in_file` 改为对照 `builtin_rows()` 判定，见那里的注释。
+fn patch_model_in_file(
+    file: &mut crate::anthropic::model_registry::ModelRegistryFile,
+    upstream_id: &str,
+    req: &crate::admin::types::PatchModelRequest,
+) -> Result<(), AdminServiceError> {
+    use crate::anthropic::model_registry::{ModelOrigin, ModelStatus};
+
+    // 改动先做在副本上，校验通过才提交，保证「失败不留半成品」
+    let mut next = file.clone();
+    let effective = effective_registry(&next)?;
+
+    match next.models.iter_mut().find(|r| r.upstream_id == upstream_id) {
+        Some(row) => apply_model_patch(row, req)?,
+        None => {
+            let Some(base) = effective
+                .rows()
+                .iter()
+                .find(|r| r.upstream_id == upstream_id)
+                .cloned()
+            else {
+                return Err(AdminServiceError::ModelNotFound(upstream_id.to_string()));
+            };
+            let mut row = base;
+            row.origin = ModelOrigin::Manual;
+            // 同步元数据的权威源是 syncState.modelMeta，覆盖层不该带着它的副本，
+            // 否则文件里会出现两份互相打架的 status/missingSyncRounds。
+            //
+            // 注意这里清掉行上的 last_seen_at **并不能**清掉 modelMeta 里的那份：
+            // 加载器（overlay_onto_builtin）判定「同步是否写过这一行」时两处都算数，
+            // 而 PATCH 不该去动同步元数据。因此在同步已开启的部署里，本行 4 个非
+            // pinned 的同步管辖字段会取「编辑这一刻的内置定义」，直到下一轮同步把
+            // 它们刷成上游值（窗口 ≤ 一个同步周期）。已知限制，见 overlay_onto_builtin。
+            row.status = ModelStatus::Active;
+            row.missing_sync_rounds = 0;
+            row.last_seen_at = None;
+            apply_model_patch(&mut row, req)?;
+            next.models.push(row);
+        }
+    }
+
+    validate_registry_file(&next)?;
+    *file = next;
+    Ok(())
+}
+
+/// 新增一行手动模型。
+fn create_model_in_file(
+    file: &mut crate::anthropic::model_registry::ModelRegistryFile,
+    req: &crate::admin::types::CreateModelRequest,
+) -> Result<(), AdminServiceError> {
+    use crate::anthropic::model_registry::{MatchKind, ModelOrigin, ModelRow, ModelStatus};
+    use crate::anthropic::model_sync::{derive_exposed_id, derive_thinking_variant};
+
+    // M1：未知字段一律拒绝（与 PATCH 同一处理）。静默丢弃会让「字段名写错」
+    // 表现成 200 成功，而值根本没进表 —— 用户下次看到的是「我明明设过了」。
+    if !req.extra.is_empty() {
+        let names: Vec<&str> = req.extra.keys().map(|k| k.as_str()).collect();
+        return Err(AdminServiceError::InvalidModelField(format!(
+            "以下字段不可写（只读或未知）: {}。可写字段: upstreamId、exposedId、displayName、\
+             contextWindow、maxOutputTokens、exposeThinkingVariant、enabled、sortOrder、matchKind",
+            names.join("、")
+        )));
+    }
+
+    let upstream_id = req.upstream_id.trim().to_string();
+    if upstream_id.is_empty() {
+        return Err(AdminServiceError::InvalidModelField(
+            "upstreamId 不能为空".to_string(),
+        ));
+    }
+
+    let mut next = file.clone();
+    let effective = effective_registry(&next)?;
+    if effective.rows().iter().any(|r| r.upstream_id == upstream_id) {
+        return Err(AdminServiceError::ModelConflict(format!(
+            "已存在同名 upstreamId: {}",
+            upstream_id
+        )));
+    }
+
+    let context_window = req
+        .context_window
+        .unwrap_or(crate::anthropic::model_registry::PASSTHROUGH_CONTEXT_WINDOW);
+    let max_output_tokens = req.max_output_tokens.unwrap_or(64_000);
+    if context_window <= 0 || max_output_tokens <= 0 {
+        return Err(AdminServiceError::InvalidModelField(
+            "contextWindow / maxOutputTokens 必须为正数".to_string(),
+        ));
+    }
+
+    // sortOrder 基线取**有效行集**的最大值，否则会与内置行（占 [0,130]）撞号，
+    // 同值行之间的列表顺序就不确定了。
+    let max_sort = effective
+        .rows()
+        .iter()
+        .map(|r| r.sort_order)
+        .max()
+        .unwrap_or(0);
+    let match_kind = req.match_kind.unwrap_or(MatchKind::Exact);
+
+    let row = ModelRow {
+        exposed_id: req
+            .exposed_id
+            .clone()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| derive_exposed_id(&upstream_id)),
+        display_name: req
+            .display_name
+            .clone()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| upstream_id.clone()),
+        owned_by: if upstream_id.starts_with("claude-") {
+            "anthropic".to_string()
+        } else {
+            "openai".to_string()
+        },
+        model_type: "chat".to_string(),
+        created: Utc::now().timestamp(),
+        context_window,
+        max_output_tokens,
+        // prefix 行不得开启 thinking 变体（§4.5 第 6 条），这里直接按类型定死，
+        // 免得写出一份自己加载不了的文件。
+        expose_thinking_variant: match match_kind {
+            MatchKind::Prefix => false,
+            MatchKind::Exact => req
+                .expose_thinking_variant
+                .unwrap_or_else(|| derive_thinking_variant(&upstream_id)),
+        },
+        enabled: req.enabled.unwrap_or(true),
+        listed: match_kind == MatchKind::Exact,
+        status: ModelStatus::Active,
+        origin: ModelOrigin::Manual,
+        sort_order: req.sort_order.unwrap_or(max_sort + 10),
+        pinned: Vec::new(),
+        missing_sync_rounds: 0,
+        last_seen_at: None,
+        match_substrings: Vec::new(),
+        supports_reasoning: None,
+        upstream_id,
+        match_kind,
+    };
+
+    next.models.push(row);
+    validate_registry_file(&next)?;
+    *file = next;
+    Ok(())
+}
+
+/// 删除一行。
+fn delete_model_in_file(
+    file: &mut crate::anthropic::model_registry::ModelRegistryFile,
+    upstream_id: &str,
+) -> Result<(), AdminServiceError> {
+    // 删除保护对照的是**代码里的内置集**，不是覆盖层行上的 origin：
+    // PATCH 一个内置行会在覆盖层落一条 manual 行（覆盖层不允许 builtin），
+    // 若只看 origin，「先改一下再删」就绕过了保护，而且删掉后内置行会重新
+    // 出现在列表里——用户看到的是「删除按钮没用」。同源判据见
+    // `is_builtin_upstream_id`（响应里的 `deletable` 字段也调它）。
+    if crate::anthropic::model_registry::is_builtin_upstream_id(upstream_id) {
+        return Err(AdminServiceError::InvalidModelField(format!(
+            "内置模型不可删除: {}",
+            upstream_id
+        )));
+    }
+
+    let Some(idx) = file.models.iter().position(|r| r.upstream_id == upstream_id) else {
+        return Err(AdminServiceError::ModelNotFound(upstream_id.to_string()));
+    };
+    // 老文件里可能残留 origin=builtin 的行（本分支中间版本写出的快照），继续挡住。
+    ensure_deletable(&file.models[idx])?;
+
+    if let Some(alias) = file.aliases.iter().find(|a| a.to == upstream_id) {
+        return Err(AdminServiceError::ModelConflict(format!(
+            "别名 {} 指向该模型，请先删除别名",
+            alias.from
+        )));
+    }
+
+    let mut next = file.clone();
+    next.models.remove(idx);
+    // 行没了，它的同步元数据就是孤儿记录，一并清掉
+    next.sync_state.model_meta.remove(upstream_id);
+    validate_registry_file(&next)?;
+    *file = next;
+    Ok(())
+}
+
+/// 新增或覆盖一条别名。
+fn upsert_alias_in_file(
+    file: &mut crate::anthropic::model_registry::ModelRegistryFile,
+    req: &crate::admin::types::UpsertAliasRequest,
+) -> Result<(), AdminServiceError> {
+    use crate::anthropic::model_registry::ModelAlias;
+
+    let from = req.from.trim().to_ascii_lowercase();
+    let to = req.to.trim().to_string();
+    if from.is_empty() || to.is_empty() {
+        return Err(AdminServiceError::InvalidModelField(
+            "别名的 from / to 都不能为空".to_string(),
+        ));
+    }
+
+    let mut next = file.clone();
+    let effective = effective_registry(&next)?;
+    if !effective.rows().iter().any(|r| r.upstream_id == to) {
+        return Err(AdminServiceError::ModelConflict(format!(
+            "别名指向不存在的 upstreamId: {}",
+            to
+        )));
+    }
+
+    match next.aliases.iter_mut().find(|a| a.from == from) {
+        Some(existing) => existing.to = to,
+        None => next.aliases.push(ModelAlias { from, to }),
+    }
+    validate_registry_file(&next)?;
+    *file = next;
+    Ok(())
+}
+
+/// 删除一条别名。
+fn delete_alias_in_file(
+    file: &mut crate::anthropic::model_registry::ModelRegistryFile,
+    from: &str,
+) -> Result<(), AdminServiceError> {
+    let from = from.trim().to_ascii_lowercase();
+    let Some(idx) = file.aliases.iter().position(|a| a.from == from) else {
+        return Err(AdminServiceError::ModelNotFound(format!("别名 {}", from)));
+    };
+    let mut next = file.clone();
+    next.aliases.remove(idx);
+    validate_registry_file(&next)?;
+    *file = next;
+    Ok(())
+}
+
+/// 组装 `GET /models` 响应。从 store 重新 load 而不是读全局 REGISTRY：
+/// 只有 load 能给出 `degraded_reason` 与 `syncState` 原文。
+fn build_model_registry_response(
+    store: &crate::anthropic::model_registry_store::ModelRegistryStore,
+    settings: ModelSyncSettings,
+    enabled_credential_ids: &[u64],
+) -> crate::admin::types::ModelRegistryResponse {
+    use crate::admin::types::{ModelRegistryResponse, ModelRowResponse, ModelSyncSettingsResponse};
+    use crate::anthropic::model_registry::is_builtin_upstream_id;
+
+    let out = store.load();
+    // rows() 已经叠加了 syncState.modelMeta（status / missingSyncRounds /
+    // lastSeenAt），所以状态列直接取这里，不要去读 file.models。
+    let mut models = out.registry.rows().to_vec();
+    models.sort_by(|a, b| {
+        a.sort_order
+            .cmp(&b.sort_order)
+            .then_with(|| a.upstream_id.cmp(&b.upstream_id))
+    });
+    // deletable 与 delete_model_in_file 同源判据，不能看 row.origin（见
+    // ModelRowResponse 文档）。
+    let models: Vec<ModelRowResponse> = models
+        .into_iter()
+        .map(|row| ModelRowResponse {
+            deletable: !is_builtin_upstream_id(&row.upstream_id),
+            row,
+        })
+        .collect();
+
+    let credential_support_covered = enabled_credential_ids
+        .iter()
+        .filter(|id| {
+            out.file
+                .credential_support
+                .get(&id.to_string())
+                .is_some_and(|v| !v.is_empty())
+        })
+        .count();
+
+    // 护栏结论编码在 syncState.source 里（定时同步不经 admin 层、重启会丢内存态，
+    // 唯有落盘的字段能让 UI 持续看见「消失判定已停机」）。这里拆成两个显式字段，
+    // 并把 source 还原成干净的来源串给 UI 展示。
+    let mut sync_state = out.file.sync_state;
+    let (clean_source, disappearance_check_skipped, missing_ratio) = sync_state
+        .source
+        .as_deref()
+        .map(crate::anthropic::model_sync::decode_source)
+        .unwrap_or_else(|| (String::new(), false, 0.0));
+    if sync_state.source.is_some() {
+        sync_state.source = Some(clean_source);
+    }
+
+    ModelRegistryResponse {
+        models,
+        aliases: out.registry.aliases().to_vec(),
+        sync_state,
+        settings: ModelSyncSettingsResponse {
+            enabled: settings.enabled,
+            time: settings.time,
+            probe_credential_id: settings.probe_credential_id,
+            allow_passthrough: settings.allow_passthrough,
+        },
+        degraded: out.degraded_reason.is_some(),
+        degraded_reason: out.degraded_reason,
+        credential_support_covered,
+        credential_total: enabled_credential_ids.len(),
+        disappearance_check_skipped,
+        missing_ratio,
+    }
+}
+
 fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
     error
         .downcast_ref::<UpstreamRateLimitError>()
         .map(|rate_limit| AdminServiceError::RateLimited {
             retry_after: rate_limit.retry_after().map(str::to_string),
         })
+}
+
+#[cfg(test)]
+mod model_registry_tests {
+    use super::*;
+    use crate::admin::types::{CreateModelRequest, PatchModelRequest, UpsertAliasRequest};
+    use crate::anthropic::model_registry::{
+        builtin_rows, ModelAlias, ModelOrigin, ModelRegistry, ModelRegistryFile, ModelStatus,
+    };
+    use crate::anthropic::model_registry_store::ModelRegistryStore;
+    use crate::anthropic::model_sync::{
+        BoxFuture, ModelListFetcher, ModelSyncService, UpstreamModel,
+    };
+
+    fn empty_file() -> ModelRegistryFile {
+        ModelRegistryFile::default()
+    }
+
+    /// PATCH 只能改白名单字段；被改字段自动进 pinned
+    #[test]
+    fn patch_pins_edited_fields_and_rejects_readonly() {
+        let mut row = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+
+        let req = PatchModelRequest {
+            context_window: Some(800_000),
+            unpin: vec![],
+            ..Default::default()
+        };
+        apply_model_patch(&mut row, &req).unwrap();
+        assert_eq!(row.context_window, 800_000);
+        assert!(
+            row.pinned.contains(&"contextWindow".to_string()),
+            "被编辑字段应自动 pin"
+        );
+
+        // unpin 后该字段回归自动同步
+        let req = PatchModelRequest {
+            unpin: vec!["contextWindow".to_string()],
+            ..Default::default()
+        };
+        apply_model_patch(&mut row, &req).unwrap();
+        assert!(!row.pinned.contains(&"contextWindow".to_string()));
+    }
+
+    /// builtin 行不可删
+    #[test]
+    fn builtin_row_cannot_be_deleted() {
+        let rows = builtin_rows();
+        let builtin = rows.iter().find(|r| r.exposed_id == "claude-opus-4-8").unwrap();
+        assert!(ensure_deletable(builtin).is_err());
+    }
+
+    /// 白名单之外的字段必须**明确报错**，不能静默忽略——
+    /// 静默忽略会让用户以为 origin/status 改成功了。
+    #[test]
+    fn patch_rejects_fields_outside_whitelist() {
+        let raw = r#"{"contextWindow":500000,"origin":"manual","missingSyncRounds":0}"#;
+        let req: PatchModelRequest = serde_json::from_str(raw).unwrap();
+        let mut row = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        let err = apply_model_patch(&mut row, &req).unwrap_err();
+        match err {
+            AdminServiceError::InvalidModelField(msg) => {
+                assert!(msg.contains("origin"), "错误信息应点名被拒字段: {}", msg);
+                assert!(msg.contains("missingSyncRounds"), "应列出全部被拒字段: {}", msg);
+            }
+            other => panic!("期望 InvalidModelField，实际 {:?}", other),
+        }
+        // 拒绝时不得留下部分生效的修改
+        assert_eq!(row.context_window, 1_000_000, "被拒的 PATCH 不应改动任何字段");
+    }
+
+    /// 非正数窗口拒绝
+    #[test]
+    fn patch_rejects_non_positive_numbers() {
+        let mut row = builtin_rows().into_iter().next().unwrap();
+        let req = PatchModelRequest {
+            context_window: Some(0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            apply_model_patch(&mut row, &req),
+            Err(AdminServiceError::InvalidModelField(_))
+        ));
+    }
+
+    /// PATCH 一个内置行：覆盖层里落一行 **manual**（覆盖层不得出现 builtin 行），
+    /// 但删除保护必须仍然生效——否则「改一下再删」就绕过了内置行不可删。
+    #[test]
+    fn patch_builtin_writes_manual_overlay_but_keeps_delete_protection() {
+        let mut file = empty_file();
+        let req = PatchModelRequest {
+            context_window: Some(800_000),
+            ..Default::default()
+        };
+        patch_model_in_file(&mut file, "claude-opus-4.8", &req).unwrap();
+
+        assert_eq!(file.models.len(), 1);
+        assert_eq!(file.models[0].origin, ModelOrigin::Manual);
+        assert!(
+            !file.models.iter().any(|r| r.origin == ModelOrigin::Builtin),
+            "覆盖层不得写入 builtin 行"
+        );
+        assert_eq!(file.models[0].context_window, 800_000);
+        assert!(file.models[0].pinned.contains(&"contextWindow".to_string()));
+
+        // 仍然不可删
+        let err = delete_model_in_file(&mut file, "claude-opus-4.8").unwrap_err();
+        assert!(matches!(err, AdminServiceError::InvalidModelField(_)));
+        assert_eq!(file.models.len(), 1, "删除失败不应改动文件");
+    }
+
+    /// 回归用例：PATCH 过的内置模型在覆盖层落成 origin=Manual，但响应里的
+    /// `deletable` 必须仍然是 false —— 它对照的是 `is_builtin_upstream_id`，
+    /// 不是行上的 origin。否则前端会照 origin 显示删除按钮，点击后端却拒绝。
+    #[test]
+    fn patched_builtin_row_stays_non_deletable_in_response() {
+        let mut file = empty_file();
+        let req = PatchModelRequest {
+            context_window: Some(800_000),
+            ..Default::default()
+        };
+        patch_model_in_file(&mut file, "claude-opus-4.8", &req).unwrap();
+
+        // 落盘后走响应组装路径（与 GET /models 完全一致的代码路径）
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "kiro-admin-models-patched-deletable-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let store = ModelRegistryStore::new(path.clone());
+        let settings = ModelSyncSettings {
+            enabled: false,
+            time: "04:00".to_string(),
+            probe_credential_id: None,
+            allow_passthrough: false,
+        };
+        let resp = build_model_registry_response(&store, settings, &[]);
+        let _ = std::fs::remove_file(&path);
+
+        let row = resp
+            .models
+            .iter()
+            .find(|r| r.row.upstream_id == "claude-opus-4.8")
+            .expect("PATCH 过的行应出现在响应里");
+        assert_eq!(row.row.origin, ModelOrigin::Manual, "覆盖层落地后 origin 应为 Manual");
+        assert!(
+            !row.deletable,
+            "origin 已变成 Manual，但该行本质仍是内置模型，deletable 必须仍为 false"
+        );
+    }
+
+    #[test]
+    fn patch_unknown_model_is_not_found() {
+        let mut file = empty_file();
+        let err = patch_model_in_file(&mut file, "claude-nope", &PatchModelRequest::default())
+            .unwrap_err();
+        assert!(matches!(err, AdminServiceError::ModelNotFound(_)));
+    }
+
+    #[test]
+    fn create_and_delete_manual_model() {
+        let mut file = empty_file();
+        let req = CreateModelRequest {
+            upstream_id: "claude-opus-9.0".to_string(),
+            ..Default::default()
+        };
+        create_model_in_file(&mut file, &req).unwrap();
+        assert_eq!(file.models.len(), 1);
+        assert_eq!(file.models[0].origin, ModelOrigin::Manual);
+        // exposedId 按 §4.4 派生：claude-* 点号转连字符
+        assert_eq!(file.models[0].exposed_id, "claude-opus-9-0");
+        // sortOrder 必须避开内置行占用的号段
+        assert!(file.models[0].sort_order > 130);
+
+        // 重复 upstreamId → 冲突
+        let err = create_model_in_file(&mut file, &req).unwrap_err();
+        assert!(matches!(err, AdminServiceError::ModelConflict(_)));
+
+        // manual 行可删
+        delete_model_in_file(&mut file, "claude-opus-9.0").unwrap();
+        assert!(file.models.is_empty());
+        // 删不存在的行
+        assert!(matches!(
+            delete_model_in_file(&mut file, "claude-opus-9.0"),
+            Err(AdminServiceError::ModelNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn alias_upsert_and_delete() {
+        let mut file = empty_file();
+        upsert_alias_in_file(
+            &mut file,
+            &UpsertAliasRequest {
+                from: "opus".to_string(),
+                to: "claude-opus-4.8".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(file.aliases.len(), 1);
+
+        // 同名 from 覆盖而非追加
+        upsert_alias_in_file(
+            &mut file,
+            &UpsertAliasRequest {
+                from: "opus".to_string(),
+                to: "claude-sonnet-5".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(file.aliases.len(), 1);
+        assert_eq!(file.aliases[0].to, "claude-sonnet-5");
+
+        // 指向不存在的 upstreamId → 冲突（加载校验会拒绝整份文件，必须提前挡）
+        let err = upsert_alias_in_file(
+            &mut file,
+            &UpsertAliasRequest {
+                from: "x".to_string(),
+                to: "claude-missing".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AdminServiceError::ModelConflict(_)));
+
+        delete_alias_in_file(&mut file, "opus").unwrap();
+        assert!(file.aliases.is_empty());
+        assert!(matches!(
+            delete_alias_in_file(&mut file, "opus"),
+            Err(AdminServiceError::ModelNotFound(_))
+        ));
+    }
+
+    /// 被别名指向的模型不得被删——否则写出去的文件下次加载时因 dangling alias 整体被拒
+    #[test]
+    fn model_referenced_by_alias_cannot_be_deleted() {
+        let mut file = empty_file();
+        create_model_in_file(
+            &mut file,
+            &CreateModelRequest {
+                upstream_id: "claude-opus-9.0".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        file.aliases.push(ModelAlias {
+            from: "o9".to_string(),
+            to: "claude-opus-9.0".to_string(),
+        });
+        let err = delete_model_in_file(&mut file, "claude-opus-9.0").unwrap_err();
+        assert!(matches!(err, AdminServiceError::ModelConflict(_)));
+    }
+
+    /// 空表 / 缺文件边界：GET /models 必须给出内置全量、非降级、别名为空
+    #[test]
+    fn registry_response_on_missing_file_is_builtin_and_not_degraded() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("kiro-admin-models-missing-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let store = ModelRegistryStore::new(path);
+        let settings = ModelSyncSettings {
+            enabled: false,
+            time: "04:00".to_string(),
+            probe_credential_id: None,
+            allow_passthrough: false,
+        };
+        let resp = build_model_registry_response(&store, settings, &[]);
+
+        assert!(!resp.degraded, "文件不存在不是降级状态");
+        assert!(resp.degraded_reason.is_none());
+        assert_eq!(resp.models.len(), builtin_rows().len());
+        assert!(resp.aliases.is_empty());
+        assert_eq!(resp.credential_total, 0);
+        assert_eq!(resp.credential_support_covered, 0);
+    }
+
+    /// 覆盖率统计：只有「已记录可用模型」的启用凭据才算被覆盖
+    #[test]
+    fn registry_response_reports_credential_support_coverage() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("kiro-admin-models-cov-{}.json", std::process::id()));
+        let mut file = empty_file();
+        file.credential_support
+            .insert("1".to_string(), vec!["claude-opus-4.8".to_string()]);
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let store = ModelRegistryStore::new(path.clone());
+        let settings = ModelSyncSettings {
+            enabled: true,
+            time: "04:00".to_string(),
+            probe_credential_id: Some(1),
+            allow_passthrough: false,
+        };
+        let resp = build_model_registry_response(&store, settings, &[1, 2, 3]);
+        assert_eq!(resp.credential_total, 3);
+        assert_eq!(resp.credential_support_covered, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    struct StubFetcher {
+        models: Vec<UpstreamModel>,
+    }
+
+    impl ModelListFetcher for StubFetcher {
+        fn fetch(&self, _id: u64) -> BoxFuture<'_, Result<Vec<UpstreamModel>, String>> {
+            let models = self.models.clone();
+            Box::pin(async move { Ok(models) })
+        }
+        fn candidate_credential_ids(&self) -> Vec<u64> {
+            vec![1]
+        }
+        fn is_credential_usable(&self, _id: u64) -> bool {
+            true
+        }
+    }
+
+    /// pinned 存在的**唯一理由**：手工改过的字段不被后续自动同步冲掉。
+    /// 光测「PATCH 写进去了」不够，必须真跑一轮同步再看值。
+    #[tokio::test]
+    async fn pinned_field_survives_a_sync_round() {
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("kiro-admin-models-pinned-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(ModelRegistryStore::new(path.clone()));
+
+        // 人工把窗口改成 800K（自动进 pinned），displayName 不动
+        store
+            .mutate(|f| {
+                patch_model_in_file(
+                    f,
+                    "claude-opus-4.8",
+                    &PatchModelRequest {
+                        context_window: Some(800_000),
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+
+        // 上游报 1M 窗口 + 新名字
+        let fetcher = Arc::new(StubFetcher {
+            models: vec![UpstreamModel {
+                model_id: "claude-opus-4.8".to_string(),
+                model_name: Some("Claude Opus 4.8 (上游名)".to_string()),
+                max_input_tokens: Some(1_000_000),
+            }],
+        });
+        let sync = ModelSyncService::new(Arc::clone(&store), fetcher);
+        sync.sync_once(Some(1), Utc::now()).await.unwrap();
+
+        let out = store.load();
+        let row = out
+            .registry
+            .rows()
+            .iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        assert_eq!(row.context_window, 800_000, "pinned 字段被同步冲掉了");
+        assert_eq!(
+            row.display_name, "Claude Opus 4.8 (上游名)",
+            "未 pinned 字段应跟随上游更新"
+        );
+        assert_eq!(row.status, ModelStatus::Active);
+        let _ = std::fs::remove_file(&path);
+        // sync_once 会 install_registry 到全局 holder：必须还原，
+        // 否则 800K 的 opus 窗口会漏给后面依赖内置默认的测试（converter 侧）。
+        crate::anthropic::model_registry::install_registry(ModelRegistry::builtin());
+    }
+
+    /// PATCH `supportsReasoning` 不进 pinned——它与 `enabled`/`sortOrder`/
+    /// `matchKind` 同组：本地策略开关，同步没有数据源覆盖它，pin 了只会在 UI
+    /// 上留一个永远解不开的锁。
+    #[test]
+    fn patch_supports_reasoning_does_not_pin() {
+        let mut row = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        assert_eq!(row.supports_reasoning, None, "前置条件：内置行默认未设置");
+
+        let req = PatchModelRequest {
+            supports_reasoning: Some(false),
+            supports_reasoning_set: true,
+            ..Default::default()
+        };
+        apply_model_patch(&mut row, &req).unwrap();
+
+        assert_eq!(row.supports_reasoning, Some(false));
+        assert!(
+            !row.pinned.contains(&"supportsReasoning".to_string()),
+            "supportsReasoning 不应自动进 pinned"
+        );
+
+        // supportsReasoningSet 标出「清回 None」，而不是 Option<bool> 字段本身
+        // 缺省时的「不改」语义。
+        let clear_req = PatchModelRequest {
+            supports_reasoning: None,
+            supports_reasoning_set: true,
+            ..Default::default()
+        };
+        apply_model_patch(&mut row, &clear_req).unwrap();
+        assert_eq!(row.supports_reasoning, None, "supportsReasoningSet 应能清回未设置");
+    }
+
+    /// PATCH `supportsReasoning` 后跑一轮同步，值不应被抹掉——同步的数据源
+    /// （`ListAvailableModels`）根本不携带这个信息，因此它必须走「用户专属
+    /// 字段覆盖层始终胜出」这条路径，而不是「同步管辖字段仅 pinned 时保留」。
+    #[tokio::test]
+    async fn supports_reasoning_survives_a_sync_round() {
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "kiro-admin-models-supports-reasoning-sync-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(ModelRegistryStore::new(path.clone()));
+
+        store
+            .mutate(|f| {
+                patch_model_in_file(
+                    f,
+                    "claude-opus-4.8",
+                    &PatchModelRequest {
+                        supports_reasoning: Some(false),
+                        supports_reasoning_set: true,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+
+        let fetcher = Arc::new(StubFetcher {
+            models: vec![UpstreamModel {
+                model_id: "claude-opus-4.8".to_string(),
+                model_name: Some("Claude Opus 4.8".to_string()),
+                max_input_tokens: Some(1_000_000),
+            }],
+        });
+        let sync = ModelSyncService::new(Arc::clone(&store), fetcher);
+        sync.sync_once(Some(1), Utc::now()).await.unwrap();
+
+        let out = store.load();
+        let row = out
+            .registry
+            .rows()
+            .iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        assert_eq!(
+            row.supports_reasoning,
+            Some(false),
+            "supportsReasoning 不应被同步抹掉"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        crate::anthropic::model_registry::install_registry(ModelRegistry::builtin());
+    }
+
+    // ===== 同步 → credentialSupport → 调度层过滤：整条链 =====
+
+    /// 只有 1 号凭据能拉到列表，其余一律失败。用来产生「只覆盖一个凭据」的
+    /// credentialSupport 记录 —— 这正是真实探针轮次的形状。
+    struct ProbeOnlyFetcher {
+        models: Vec<UpstreamModel>,
+    }
+
+    impl ModelListFetcher for ProbeOnlyFetcher {
+        fn fetch(&self, id: u64) -> BoxFuture<'_, Result<Vec<UpstreamModel>, String>> {
+            let models = if id == 1 { self.models.clone() } else { Vec::new() };
+            let ok = id == 1;
+            Box::pin(async move {
+                if ok {
+                    Ok(models)
+                } else {
+                    Err("本测试只允许探针凭据拉取".to_string())
+                }
+            })
+        }
+        fn candidate_credential_ids(&self) -> Vec<u64> {
+            vec![1, 2]
+        }
+        fn is_credential_usable(&self, id: u64) -> bool {
+            id == 1
+        }
+    }
+
+    fn live_cred(id: u64, token: &str, priority: u32) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.id = Some(id);
+        c.access_token = Some(token.to_string());
+        // 未过期 → acquire_context 不会去刷 token（测试环境没有上游）
+        c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        c.priority = priority;
+        c
+    }
+
+    /// **本轮收尾的重点：同步跑完之后，调度层的凭据过滤真的按新数据变了。**
+    ///
+    /// 此前这条链上每一段都有测试，唯独没有一条把它们串起来跑：
+    /// `sync_once` 写 `credentialSupport` → `AdminService::sync_models` 把它灌回
+    /// `MultiTokenManager` → `credential_matches_request` 依据它筛凭据。
+    /// 段段都绿而接缝错位（例如同步写的键格式与过滤读的不一致）是发现不了的。
+    ///
+    /// 断言方式刻意**不是**「刷新函数被调用了」，而是**同一个凭据 + 同一个模型，
+    /// 同步前后的过滤结果不同**：
+    /// - 同步前：1 号凭据无记录 → 放行 → 按 priority 选中 1 号；
+    /// - 同步后：1 号凭据有记录且不含该模型 → 拒绝 → 改选无记录的 2 号。
+    ///
+    /// 顺带钉住键/值的格式：键是凭据 id 的**字符串**，值是**上游 id**（带点号，
+    /// 不是对外的连字符形式）—— 这两处任何一处漂移，过滤都会静默失效（永远放行）。
+    #[tokio::test]
+    async fn sync_refresh_changes_credential_filtering_end_to_end() {
+        use crate::kiro::token_manager::credential_supports_model;
+
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // 探针（1 号）能看到的模型集里**没有** claude-sonnet-5。
+        // 「看得见」的那个刻意选带点号的上游 id：它的对外名是 claude-sonnet-4-5，
+        // 两者不同，于是下面「值必须是上游 id」的断言才真的能挡住键值格式漂移。
+        const PROBE_SEES: &str = "claude-sonnet-4.5";
+        const PROBE_DOES_NOT_SEE: &str = "claude-sonnet-5";
+
+        let token_manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![live_cred(1, "tok-probe", 1), live_cred(2, "tok-other", 10)],
+                None,
+                None,
+                true,
+            )
+            .unwrap(),
+        );
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("kiro-admin-models-e2e-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(ModelRegistryStore::new(path.clone()));
+
+        let sync_service = Arc::new(ModelSyncService::new(
+            Arc::clone(&store),
+            Arc::new(ProbeOnlyFetcher {
+                models: vec![UpstreamModel {
+                    model_id: PROBE_SEES.to_string(),
+                    model_name: Some("Claude Sonnet 4.5".to_string()),
+                    max_input_tokens: Some(200_000),
+                }],
+            }),
+        ));
+        let settings = Arc::new(parking_lot::RwLock::new(ModelSyncSettings {
+            enabled: true,
+            time: "04:00".to_string(),
+            probe_credential_id: Some(1),
+            allow_passthrough: false,
+        }));
+        let service = AdminService::new(Arc::clone(&token_manager), Vec::<String>::new())
+            .with_model_registry(Some(Arc::clone(&store)), Some(sync_service))
+            .with_model_sync_settings(settings);
+
+        // ---- 同步前：无记录 → 放行 → 选到高优先级的 1 号 ----
+        assert!(
+            token_manager.credential_support().is_empty(),
+            "前置条件：启动时没有任何 credentialSupport 记录"
+        );
+        assert!(
+            credential_supports_model(1, PROBE_DOES_NOT_SEE, &token_manager.credential_support()),
+            "无记录必须放行（保守，不误杀）"
+        );
+        let before = token_manager
+            .acquire_context(Some(PROBE_DOES_NOT_SEE), None)
+            .await
+            .expect("同步前应能选到凭据");
+        assert_eq!(before.id, 1, "同步前：1 号无记录、优先级更高，应被选中");
+
+        // ---- 跑一轮真同步（走的是 /models/sync 的生产路径）----
+        let summary = service.sync_models(false).await.expect("同步应成功");
+        assert_eq!(summary.round, "authoritative");
+        assert!(summary.trusted);
+
+        // ---- 落盘内容的格式：键是 id 字符串，值是上游 id ----
+        let support = token_manager.credential_support();
+        assert_eq!(
+            support.get("1").map(|v| v.as_slice()),
+            Some([PROBE_SEES.to_string()].as_slice()),
+            "刷新后的 credentialSupport 必须按「id 字符串 → 上游 id 列表」记录，实际: {:?}",
+            support
+        );
+        assert!(
+            !support.contains_key("2"),
+            "拉取失败的凭据不得留下记录（否则会被当成「不支持任何模型」永久踢出轮换）"
+        );
+
+        // ---- 同步后：同一个凭据 + 同一个模型，过滤结论反转 ----
+        assert!(
+            !credential_supports_model(1, PROBE_DOES_NOT_SEE, &support),
+            "1 号已有记录且不含该模型 → 必须被过滤掉"
+        );
+        assert!(
+            credential_supports_model(1, PROBE_SEES, &support),
+            "1 号对记录内的模型仍应放行"
+        );
+        let after = token_manager
+            .acquire_context(Some(PROBE_DOES_NOT_SEE), None)
+            .await
+            .expect("2 号无记录，仍应能选到凭据");
+        assert_eq!(
+            after.id, 2,
+            "同步后：1 号被 credentialSupport 过滤掉，调度层应改选 2 号 —— \
+             这一条才证明刷新真的传导到了过滤行为，而不只是「刷新函数被调用了」"
+        );
+        // 说明：这里不再断言「换个模型又会选回 1 号」——priority 模式下
+        // `acquire_context` 会优先复用 current_id（上一步已粘在 2 号），
+        // 那是负载均衡的既有语义，与本测试要证明的过滤传导无关。
+        // 「1 号对记录内的模型仍放行」由上面的 credential_supports_model 断言覆盖。
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 写入的文件必须能被 from_file 加载（落盘前校验的兜底断言）
+    #[test]
+    fn patched_file_still_loads() {
+        let mut file = empty_file();
+        patch_model_in_file(
+            &mut file,
+            "claude-opus-4.8",
+            &PatchModelRequest {
+                exposed_id: Some("claude-opus-4-8x".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let registry = ModelRegistry::from_file(file).unwrap();
+        assert!(registry
+            .rows()
+            .iter()
+            .any(|r| r.exposed_id == "claude-opus-4-8x"));
+    }
+
+    /// M1：`POST /models` 的未知字段必须明确报错（400），不能被 serde 静默丢弃
+    /// 后返回 200——用户会以为写进去了，实际值根本没进表。
+    #[test]
+    fn create_model_rejects_unknown_fields() {
+        let raw = r#"{"upstreamId":"claude-opus-9.1","origin":"builtin","enabld":true}"#;
+        let req: CreateModelRequest = serde_json::from_str(raw).unwrap();
+        let mut file = empty_file();
+        let err = create_model_in_file(&mut file, &req).unwrap_err();
+        match err {
+            AdminServiceError::InvalidModelField(msg) => {
+                assert!(msg.contains("origin"), "应点名被拒字段: {}", msg);
+                assert!(msg.contains("enabld"), "拼写错误的字段名也应被指出: {}", msg);
+            }
+            other => panic!("期望 InvalidModelField，实际 {:?}", other),
+        }
+        assert!(file.models.is_empty(), "被拒的请求不应留下任何部分写入");
+    }
+
+    fn model_sync_test_service() -> AdminService {
+        let token_manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![live_cred(1, "tok", 1)], None, None, true)
+                .unwrap(),
+        );
+        AdminService::new(token_manager, Vec::<String>::new())
+    }
+
+    /// M1：`PATCH /models/settings` 的未知字段必须明确报错，不能静默丢弃。
+    /// 实测 `allowUnknownModelPassthrough`（config.json 里的真实键名）与本接口的
+    /// `allowPassthrough` 只差一个写法，静默丢弃会让用户以为开关已打开。
+    #[tokio::test]
+    async fn set_model_sync_settings_rejects_unknown_fields() {
+        let service = model_sync_test_service();
+        let raw = r#"{"allowUnknownModelPassthrough":true}"#;
+        let req: SetModelSyncSettingsRequest = serde_json::from_str(raw).unwrap();
+        let err = service.set_model_sync_settings(req).await.unwrap_err();
+        match err {
+            AdminServiceError::InvalidModelField(msg) => {
+                assert!(msg.contains("allowUnknownModelPassthrough"), "应点名被拒字段: {}", msg)
+            }
+            other => panic!("期望 InvalidModelField，实际 {:?}", other),
+        }
+    }
+
+    /// M2：模型同步时间校验失败必须走 `InvalidModelField`，文案不得是「凭据无效」
+    /// 或提及「自动更新」——那是另一条路径（二进制自动更新时间）复用解析器的副作用，
+    /// 会把排查方向带偏到完全不相关的功能上。
+    #[tokio::test]
+    async fn set_model_sync_settings_invalid_time_uses_model_field_error_not_credential_wording() {
+        let service = model_sync_test_service();
+        let req = SetModelSyncSettingsRequest {
+            enabled: None,
+            time: Some("25:99".to_string()),
+            probe_credential_id: None,
+            probe_credential_id_set: false,
+            allow_passthrough: None,
+            extra: Default::default(),
+        };
+        let err = service.set_model_sync_settings(req).await.unwrap_err();
+        match err {
+            AdminServiceError::InvalidModelField(msg) => {
+                assert!(
+                    !msg.contains("凭据无效") && !msg.contains("自动更新"),
+                    "文案不应带偏到凭据/自动更新路径: {}",
+                    msg
+                );
+            }
+            other => panic!("期望 InvalidModelField，实际 {:?}", other),
+        }
+    }
 }
 
 #[cfg(test)]

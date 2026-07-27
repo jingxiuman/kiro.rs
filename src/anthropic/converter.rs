@@ -193,86 +193,77 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
+/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID。
+///
+/// 改造后查 `ModelRegistry`（内置默认 ⊕ models.json 覆盖），不再硬编码。
+/// 签名保持不变，既有调用点与测试无需改动。
+/// 注意：无法表达「命中但被禁用」——需要区分时用
+/// `model_registry::current_registry().resolve(...)`。
+///
+/// **本函数已无生产调用方，仅为既有测试保留**（生产链路一律直接用
+/// `current_registry().resolve(...)`，因为它还能区分 Disabled/Unknown）。
+/// 用 `#[cfg(test)]` 门禁而不只是写句注释：注释挡不住下一个人，编译门禁能——
+/// 谁要在生产代码里再引一次表，会直接编不过。
+#[cfg(test)]
 pub fn map_model(model: &str) -> Option<String> {
-    let model_lower = model.to_lowercase();
-
-    if model_lower.contains("fable") {
-        // Fable 5：与 Mythos 5 同底座；目前仅 5 代
-        Some("claude-fable-5".to_string())
-    } else if model_lower.contains("sonnet") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-sonnet-4.8".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
-        } else if model_lower.contains("sonnet-5")
-            || model_lower.contains("sonnet5")
-            || model_lower.contains("sonnet.5")
-        {
-            // 精确匹配 5 代，避免命中 legacy claude-3-5-sonnet
-            Some("claude-sonnet-5".to_string())
-        } else {
-            None
+    use super::model_registry::{allow_passthrough, current_registry, Resolution};
+    match current_registry().resolve(model, allow_passthrough()) {
+        Resolution::Mapped { upstream_id, .. } | Resolution::Passthrough { upstream_id, .. } => {
+            Some(upstream_id)
         }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-opus-4.8".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else {
-            None
-        }
-    } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else if model_lower.starts_with("gpt-5") {
-        // GPT-5.x models served by the Kiro backend (e.g. gpt-5.6-sol / terra / luna).
-        // Kiro advertises and accepts these ids verbatim, so pass them through unchanged.
-        // Scoped to gpt-5* so legacy ids like "gpt-4" stay unsupported.
-        Some(model_lower)
-    } else {
-        None
+        Resolution::Rejected(_) => None,
     }
 }
 
-/// 根据模型名称返回对应的上下文窗口大小
+/// 根据模型名称返回输入上下文窗口大小。
 ///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 / 4.8 同 1M
+/// 改造后查 `ModelRegistry`。**这是输入窗口，与 `/v1/models` 的
+/// `max_tokens`（输出上限）是两个不同的量。**
+///
+/// **本函数已无生产调用方，仅为既有测试保留。** 请求主链路一律使用
+/// `ConversionResult.context_window`：窗口在请求入口随模型一起解析一次，
+/// 向下传给 `StreamContext` / 非流式与 web-search 路径（spec §3.3）。
+/// 响应处理阶段再查一次表会导致热重载时「用旧表映射、用新表计量」。
+///
+/// 同 `map_model`，用 `#[cfg(test)]` 门禁把这条约束交给编译器执行，
+/// 而不是指望后来者读到这段注释。
+#[cfg(test)]
 pub fn get_context_window_size(model: &str) -> i32 {
-    match map_model(model) {
-        // GPT-5.6 family on Kiro ships a 272K context window.
-        Some(mapped) if mapped.starts_with("gpt") => 272_000,
-        Some(mapped)
-            if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-sonnet-4.8"
-                || mapped == "claude-sonnet-5"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8"
-                || mapped == "claude-fable-5" =>
-        {
-            1_000_000
-        }
-        _ => 200_000,
+    use super::model_registry::{allow_passthrough, current_registry, Resolution};
+    match current_registry().resolve(model, allow_passthrough()) {
+        Resolution::Mapped { context_window, .. }
+        | Resolution::Passthrough { context_window, .. } => context_window,
+        Resolution::Rejected(_) => 200_000,
     }
 }
 
 /// 是否为已确认接受 `additionalModelRequestFields.output_config` 的模型。
+///
+/// 三态语义（对应 `ModelRow.supports_reasoning`）：先查注册表里该 upstream_id
+/// 对应行的 `supportsReasoning`——`Some(true)`/`Some(false)` 是管理员或
+/// customModels 导入显式声明的能力，直接采信；`None`（内置模型的常态，
+/// 无需逐个补字段）回落到下面的硬编码判断，改造前后行为逐一致。
+///
+/// `model_id` 是 `resolve()` 之后的 upstream_id（见 `convert_request_with_mode`
+/// 第 1 步），不是客户端原始请求名，所以这里按 upstream_id 查表。
+fn model_supports_native_reasoning(model_id: &str) -> bool {
+    if let Some(row) = super::model_registry::current_registry().row_by_upstream(model_id)
+        && let Some(supports) = row.supports_reasoning
+    {
+        return supports;
+    }
+    model_supports_native_reasoning_builtin(model_id)
+}
+
+/// 硬编码的内置判断，`model_supports_native_reasoning` 在注册表未显式声明时
+/// 的回落逻辑。
 ///
 /// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6 接受
 /// `output_config`。Claude 5 系（fable-5 / mythos-5 / sonnet-5 / opus-5 / claude-5）
 /// 与 xhigh 能力一致，一并视为支持。其余（4.5 系、haiku、sonnet-4.8 等）保守视为
 /// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
 /// 若后续实测某模型 400，从这里去除即可。
-fn model_supports_native_reasoning(model_id: &str) -> bool {
+fn model_supports_native_reasoning_builtin(model_id: &str) -> bool {
     let m = model_id.to_ascii_lowercase();
     matches!(
         m.as_str(),
@@ -483,12 +474,19 @@ pub struct ConversionResult {
     /// Additional model request fields (including `output_config.effort`), translated from the
     /// `output_config` field of the client's Anthropic request. Not sent when empty.
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
+    /// 本次请求的输入上下文窗口。**在请求入口解析一次并向下传递**，
+    /// 响应处理阶段不再回头查全局注册表——否则一次热重载可能导致
+    /// 「用旧表映射、用新表计量」（spec §3.3）。
+    pub context_window: i32,
 }
 
 /// 转换错误
 #[derive(Debug)]
 pub enum ConversionError {
     UnsupportedModel(String),
+    /// 模型在表中存在但被人工禁用。与 UnsupportedModel 区分：
+    /// 「我配了它但不生效」和「我没配它」是不同的排查方向。
+    ModelDisabled(String),
     EmptyMessages,
     /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
     UnsupportedToolMapping(String),
@@ -498,6 +496,7 @@ impl std::fmt::Display for ConversionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
+            ConversionError::ModelDisabled(model) => write!(f, "模型已禁用: {}", model),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
             ConversionError::UnsupportedToolMapping(reason) => {
                 write!(f, "工具映射不支持: {}", reason)
@@ -591,9 +590,29 @@ pub fn convert_request_with_mode(
     req: &MessagesRequest,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<ConversionResult, ConversionError> {
-    // 1. 映射模型
-    let model_id = map_model(&req.model)
-        .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+    // 1. 解析模型：映射 + 窗口一次取齐（单请求内只取一次注册表快照，
+    // 避免响应处理阶段回头查表导致「用旧表映射、用新表计量」）
+    use super::model_registry::{allow_passthrough, current_registry, RejectReason, Resolution};
+    let (model_id, context_window) =
+        match current_registry().resolve(&req.model, allow_passthrough()) {
+            Resolution::Mapped {
+                upstream_id,
+                context_window,
+            } => (upstream_id, context_window),
+            Resolution::Passthrough {
+                upstream_id,
+                context_window,
+            } => {
+                super::model_registry::note_passthrough_model(&req.model);
+                (upstream_id, context_window)
+            }
+            Resolution::Rejected(RejectReason::Disabled) => {
+                return Err(ConversionError::ModelDisabled(req.model.clone()));
+            }
+            Resolution::Rejected(RejectReason::Unknown) => {
+                return Err(ConversionError::UnsupportedModel(req.model.clone()));
+            }
+        };
 
     // 2. 检查消息列表
     if req.messages.is_empty() {
@@ -731,6 +750,7 @@ pub fn convert_request_with_mode(
         tool_name_map,
         known_tool_names,
         additional_model_request_fields,
+        context_window,
     })
 }
 
@@ -1920,6 +1940,18 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+    }
+
+    /// 改造后 map_model 必须继续通过全部既有用例（查 registry 而非硬编码）
+    #[test]
+    fn map_model_still_matches_registry() {
+        assert_eq!(map_model("claude-opus-4-8"), Some("claude-opus-4.8".to_string()));
+        assert_eq!(map_model("gpt-5.9-nova"), Some("gpt-5.9-nova".to_string()));
+        assert_eq!(map_model("gpt-4"), None);
+        assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
+        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
+        assert_eq!(get_context_window_size("claude-haiku-4-5-20251001"), 200_000);
+        assert_eq!(get_context_window_size("完全未知的模型"), 200_000);
     }
 
     fn minimal_request_with_output_config(model: &str) -> MessagesRequest {
@@ -3406,5 +3438,141 @@ mod tests {
             Some("file content"),
             "text-only tool_result content should be preserved as-is"
         );
+    }
+
+    use crate::anthropic::model_registry::{install_registry, ModelRegistry};
+
+    fn minimal_request(model: &str) -> MessagesRequest {
+        let mut req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": model,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        req.model = model.to_string();
+        req
+    }
+
+    /// 被禁用的模型必须报 ModelDisabled，而不是 UnsupportedModel
+    #[test]
+    fn disabled_model_yields_model_disabled_error() {
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut r = ModelRegistry::builtin();
+        for row in r.rows_mut() {
+            if row.exposed_id == "claude-opus-4-6" {
+                row.enabled = false;
+            }
+        }
+        install_registry(r);
+
+        let err = convert_request(&minimal_request("claude-opus-4-6")).unwrap_err();
+        assert!(
+            matches!(err, ConversionError::ModelDisabled(ref m) if m == "claude-opus-4-6"),
+            "期望 ModelDisabled，实际 {:?}",
+            err
+        );
+        assert_eq!(err.to_string(), "模型已禁用: claude-opus-4-6");
+
+        install_registry(ModelRegistry::builtin());
+    }
+
+    /// `supportsReasoning = Some(true)` 让一个内置硬编码判断不支持的模型
+    /// 通过原生 reasoning 判定——registry 的显式声明必须比硬编码优先。
+    #[test]
+    fn registry_supports_reasoning_true_overrides_builtin_unsupported() {
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        assert!(
+            !model_supports_native_reasoning_builtin("claude-sonnet-4.8"),
+            "前置条件：sonnet-4.8 硬编码判断本应不支持"
+        );
+
+        let mut r = ModelRegistry::builtin();
+        for row in r.rows_mut() {
+            if row.upstream_id == "claude-sonnet-4.8" {
+                row.supports_reasoning = Some(true);
+            }
+        }
+        install_registry(r);
+
+        assert!(
+            model_supports_native_reasoning("claude-sonnet-4.8"),
+            "显式 supportsReasoning=true 应让本不支持的模型通过判定"
+        );
+
+        install_registry(ModelRegistry::builtin());
+    }
+
+    /// `supportsReasoning = Some(false)` 让一个内置硬编码支持的模型被显式关掉。
+    #[test]
+    fn registry_supports_reasoning_false_overrides_builtin_supported() {
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        assert!(
+            model_supports_native_reasoning_builtin("claude-opus-4.8"),
+            "前置条件：opus-4.8 硬编码判断本应支持"
+        );
+
+        let mut r = ModelRegistry::builtin();
+        for row in r.rows_mut() {
+            if row.upstream_id == "claude-opus-4.8" {
+                row.supports_reasoning = Some(false);
+            }
+        }
+        install_registry(r);
+
+        assert!(
+            !model_supports_native_reasoning("claude-opus-4.8"),
+            "显式 supportsReasoning=false 应让本支持的模型被关掉"
+        );
+
+        install_registry(ModelRegistry::builtin());
+    }
+
+    /// `supportsReasoning = None`（内置行的默认值）必须与改造前的硬编码判断
+    /// 逐一致——这是「内置模型不用逐个补字段」承诺的回归基线。
+    #[test]
+    fn registry_none_falls_back_to_builtin_and_matches_pre_change_behavior() {
+        // 不装表：内置默认注册表所有行 supports_reasoning 皆为 None，
+        // current_registry() 恒定读到内置默认，天然验证回落路径。
+        for m in [
+            "claude-opus-4.6",
+            "claude-opus-4.7",
+            "claude-opus-4.8",
+            "claude-sonnet-4.6",
+            "claude-fable-5",
+            "claude-sonnet-5",
+            "claude-sonnet-4.8",
+            "claude-sonnet-4.5",
+            "claude-opus-4.5",
+            "claude-haiku-4.5",
+        ] {
+            assert_eq!(
+                model_supports_native_reasoning(m),
+                model_supports_native_reasoning_builtin(m),
+                "{m}: registry 命中 None 时应与硬编码判断逐一致"
+            );
+        }
+    }
+
+    /// 转换结果必须携带窗口，供响应处理阶段使用（避免热重载导致映射/计量不一致）
+    #[test]
+    fn conversion_result_carries_context_window() {
+        // 这里**不需要** MODEL_GLOBALS_TEST_LOCK：本测试只读注册表、从不装表。
+        // 测试期 install_registry 写的是线程本地覆盖，进程级全局在整个测试进程里
+        // 恒为内置默认，所以并行的写者不可能让这里读到中间态。
+        // （改造前它确实需要这把锁——那时写者直接改进程级全局，是原始随机失败的来源之一。）
+        let result = convert_request(&minimal_request("claude-opus-4-8")).unwrap();
+        assert_eq!(result.context_window, 1_000_000);
+
+        let result = convert_request(&minimal_request("claude-haiku-4-5-20251001")).unwrap();
+        assert_eq!(result.context_window, 200_000);
     }
 }

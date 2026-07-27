@@ -3,7 +3,7 @@
 use axum::{
     Router, middleware,
     extract::DefaultBodyLimit,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
 };
 
 use super::{
@@ -12,6 +12,8 @@ use super::{
         assign_proxy_to_credential, batch_add_proxies, batch_import_credentials,
         check_all_proxies, check_proxy,
         check_rate_limit, check_update, clear_throttle, complete_social_login,
+        create_model, delete_alias, delete_model, get_model_registry, patch_model, set_model_sync_settings,
+        sync_models, upsert_alias,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
         export_credentials, force_refresh_token, get_account_throttle_config,
@@ -170,6 +172,14 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/by-model", get(stats_by_model))
         .route("/stats/by-credential", get(stats_by_credential))
         .route("/traces/failure-stats", get(trace_failure_stats))
+        .route("/models", get(get_model_registry).post(create_model))
+        .route("/models/sync", post(sync_models))
+        .route("/models/aliases", post(upsert_alias).delete(delete_alias))
+        .route("/models/settings", patch(set_model_sync_settings))
+        .route(
+            "/models/{upstream_id}",
+            patch(patch_model).delete(delete_model),
+        )
         .route("/traces", get(list_traces))
         .layer(middleware::from_fn_with_state(
             state.clone(),
