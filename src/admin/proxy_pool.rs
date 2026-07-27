@@ -10,7 +10,7 @@ use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// 健康检查探测端点：返回 204 No Content 的轻量公网地址，不依赖上游 Kiro。
@@ -111,6 +111,9 @@ pub struct ProxyPoolManager {
     path: Option<PathBuf>,
     /// TLS 后端，构建探测用 HTTP client 时需要
     tls_backend: TlsBackend,
+    /// 全量健康检查重入保护：后台定时与手动触发可能重叠，若并发探测同一瞬时故障
+    /// 会被计成多次连续失败并误达阈值。置位期间的重复调用直接跳过。
+    check_in_progress: AtomicBool,
 }
 
 /// 校验代理 URL 的 scheme 是否合法
@@ -151,6 +154,7 @@ impl ProxyPoolManager {
             next_id: AtomicU64::new(next_id),
             path,
             tls_backend,
+            check_in_progress: AtomicBool::new(false),
         }
     }
 
@@ -385,6 +389,24 @@ impl ProxyPoolManager {
     ///
     /// 仅探测当前 enabled 的条目；用户/自动禁用的条目跳过（手动重新启用会清零计数）。
     pub async fn check_all(&self) -> CheckSummary {
+        // 重入保护：已有检查在跑就跳过，避免并发探测把一次瞬时故障计成多次连续失败
+        if self
+            .check_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            tracing::debug!("代理健康检查已在进行中，跳过本次重入");
+            return CheckSummary::default();
+        }
+        // 守卫：无论后续如何返回都复位标记
+        struct Guard<'a>(&'a AtomicBool);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _guard = Guard(&self.check_in_progress);
+
         // 快照待探测的 (id, url)，避免长时间持锁
         let targets: Vec<(u64, String)> = self
             .entries
@@ -487,7 +509,8 @@ impl ProxyPoolManager {
     }
 
     /// 单个代理即时探测（供 UI「测试」按钮调用），回写结果并持久化。
-    pub async fn check_one(&self, id: u64) -> anyhow::Result<ProxyEntry> {
+    /// 返回 (条目快照, 本次是否新触发自动禁用)。newly_disabled 供上层处置（记事件 + 换绑）。
+    pub async fn check_one(&self, id: u64) -> anyhow::Result<(ProxyEntry, bool)> {
         let url = self
             .entries
             .lock()
@@ -498,18 +521,18 @@ impl ProxyPoolManager {
 
         let result = self.probe_one(&url).await;
 
-        let entry = {
+        let (entry, newly_disabled) = {
             let mut entries = self.entries.lock();
             let entry = entries
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("代理不存在: {}", id))?;
-            Self::apply_probe_result(entry, &result);
-            entry.clone()
+            let (_, newly_disabled) = Self::apply_probe_result(entry, &result);
+            (entry.clone(), newly_disabled)
         };
 
         self.persist()?;
-        Ok(entry)
+        Ok((entry, newly_disabled))
     }
 }
 

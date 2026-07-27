@@ -716,16 +716,29 @@ impl StreamOpsFeedback {
         })
     }
 
-    fn report_interrupted(&self, error: &str) {
+    /// 请求完整送达：提交一次代理成功（清零请求级失败计数）
+    fn report_success(&self) {
+        self.ops.report_proxy_success(self.proxy_url.as_deref());
+    }
+
+    /// 传输链路失败（连接已建立但响应未完整送达：流断开 / 上游截断）：
+    /// 提交一次代理失败（累计，达阈值自动禁用+换绑）
+    fn report_transport_failure(&self, error: &str) {
         self.ops
             .report_stream_interrupted(self.credential_id, self.proxy_url.as_deref(), error);
     }
 }
 
-/// Option 包一层的便捷调用
-fn report_stream_interruption(ops: &Option<StreamOpsFeedback>, error: &str) {
-    if let Some(fb) = ops {
-        fb.report_interrupted(error);
+/// 请求终态代理反馈：每个外部请求只调用一次。
+/// - `transport_failed = true`：连接已建立但响应未完整（流断开 / 上游截断）→ 计代理失败
+/// - `transport_failed = false`：请求完整送达 → 清零；
+///   上游内容错误（InvalidJson 等非传输问题）不应走这里，直接不调用即可（no-op）。
+fn report_stream_outcome(ops: &Option<StreamOpsFeedback>, transport_failed: bool, error: &str) {
+    let Some(fb) = ops else { return };
+    if transport_failed {
+        fb.report_transport_failure(error);
+    } else {
+        fb.report_success();
     }
 }
 
@@ -802,7 +815,8 @@ fn create_sse_stream(
                             // 发送最终事件并结束（记为 error）
                             let final_events = ctx.generate_final_events();
                             record_stream_usage(&hook, &ctx, credential_id, "error");
-                            report_stream_interruption(&ops_feedback, &e.to_string());
+                            // 连接已建立后断流 = 传输链路失败，计入所用代理
+                            report_stream_outcome(&ops_feedback, true, &e.to_string());
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
                             tracer.finalize(
                                 "interrupted",
@@ -824,18 +838,27 @@ fn create_sse_stream(
                             if let Some(message) = ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
-                                // 根因是上游截断（非客户端问题），归类 upstream_truncated 并带已发送字节数。
+                                // 区分两类：IncompleteJson = 上游截断（传输链路，计代理失败）；
+                                // InvalidJson = 上游返回完整但非法 JSON（内容问题，不罚代理）。
+                                let incomplete =
+                                    ctx.tool_json_error_incomplete().unwrap_or(true);
                                 record_stream_usage(&hook, &ctx, credential_id, "error");
-                                report_stream_interruption(&ops_feedback, &message);
+                                report_stream_outcome(&ops_feedback, incomplete, &message);
                                 tracer.finalize(
                                     "error",
-                                    Some(outcome::UPSTREAM_TRUNCATED),
+                                    Some(if incomplete {
+                                        outcome::UPSTREAM_TRUNCATED
+                                    } else {
+                                        outcome::UPSTREAM_INVALID
+                                    }),
                                     Some(&message),
                                     Some(sent_bytes),
                                     stream_trace_usage(&ctx),
                                 );
                             } else {
                                 record_stream_usage(&hook, &ctx, credential_id, "success");
+                                // 请求完整送达：提交一次代理成功（清零请求级失败计数）
+                                report_stream_outcome(&ops_feedback, false, "");
                                 tracer.finalize(
                                     "success",
                                     None,
@@ -928,6 +951,8 @@ async fn handle_non_stream_request(
     };
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    let ops_feedback =
+        StreamOpsFeedback::from_call(&provider, credential_id, call_result.proxy_url.clone());
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -935,6 +960,8 @@ async fn handle_non_stream_request(
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
             hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+            // 连接已建立后 body 读取失败 = 传输链路失败，计入所用代理
+            report_stream_outcome(&ops_feedback, true, &e.to_string());
             tracer.finalize(
                 "interrupted",
                 Some(outcome::STREAM_INTERRUPTED),
@@ -1074,12 +1101,19 @@ async fn handle_non_stream_request(
 
     // 工具调用 JSON 半截 / 非法：非流式路径尚未发送任何字节，直接回 502，
     // 明确暴露上游问题，而不是把无法解析的参数当成完整调用返回。
+    // 区分上游截断（传输，计代理失败 + upstream_truncated）与非法 JSON（内容，不罚代理 + upstream_invalid）。
     if let Some(err) = tool_json_error {
+        let incomplete = err.is_incomplete();
         let message = err.message();
         hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        report_stream_outcome(&ops_feedback, incomplete, &message);
         tracer.finalize(
             "error",
-            Some(outcome::BAD_REQUEST),
+            Some(if incomplete {
+                outcome::UPSTREAM_TRUNCATED
+            } else {
+                outcome::UPSTREAM_INVALID
+            }),
             Some(&message),
             None,
             TraceUsage::zero(),
@@ -1152,6 +1186,8 @@ async fn handle_non_stream_request(
         credits,
         "success",
     );
+    // 非流式请求完整送达：提交一次代理成功（清零请求级失败计数）
+    report_stream_outcome(&ops_feedback, false, "");
     tracer.finalize(
         "success",
         None,
@@ -1620,7 +1656,7 @@ fn create_buffered_sse_stream(
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "error");
-                                report_stream_interruption(&ops_feedback, &e.to_string());
+                                report_stream_outcome(&ops_feedback, true, &e.to_string());
                                 // 缓冲模式 chunk 读取失败：上游中途断流
                                 tracer.finalize(
                                     "interrupted",
@@ -1655,18 +1691,26 @@ fn create_buffered_sse_stream(
                                     credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
                                 };
                                 if let Some(message) = ctx.tool_json_error_message() {
-                                    // 上游截断（见实时流路径同名分支），归类 upstream_truncated
+                                    // 区分上游截断（传输，计代理失败）与上游非法 JSON（内容，不罚代理），
+                                    // 见实时流路径同名分支
+                                    let incomplete =
+                                        ctx.tool_json_error_incomplete().unwrap_or(true);
                                     hook.record(credential_id, i, o, cc, cr, credits, "error");
-                                    report_stream_interruption(&ops_feedback, &message);
+                                    report_stream_outcome(&ops_feedback, incomplete, &message);
                                     tracer.finalize(
                                         "error",
-                                        Some(outcome::UPSTREAM_TRUNCATED),
+                                        Some(if incomplete {
+                                            outcome::UPSTREAM_TRUNCATED
+                                        } else {
+                                            outcome::UPSTREAM_INVALID
+                                        }),
                                         Some(&message),
                                         Some(sent_bytes),
                                         trace_usage,
                                     );
                                 } else {
                                     hook.record(credential_id, i, o, cc, cr, credits, "success");
+                                    report_stream_outcome(&ops_feedback, false, "");
                                     tracer.finalize("success", None, None, None, trace_usage);
                                 }
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events

@@ -627,7 +627,6 @@ impl OpsRuntime {
 }
 
 /// 共享句柄
-pub type SharedOpsStore = Arc<OpsStore>;
 pub type SharedOpsRuntime = Arc<OpsRuntime>;
 
 #[cfg(test)]

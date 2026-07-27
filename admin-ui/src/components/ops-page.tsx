@@ -45,6 +45,7 @@ const ERROR_TYPE_LABELS: Record<string, string> = {
   bad_request: '请求错误',
   stream_interrupted: '流中断',
   upstream_truncated: '上游截断',
+  upstream_invalid: '上游非法JSON',
   unknown: '未知',
 }
 

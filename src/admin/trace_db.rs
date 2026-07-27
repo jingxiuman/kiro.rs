@@ -144,10 +144,12 @@ pub mod outcome {
     pub const UNKNOWN: &str = "unknown";
     /// 仅用作 record.error_type：流式响应已开始但上游中途断开
     pub const STREAM_INTERRUPTED: &str = "stream_interrupted";
-    /// 仅用作 record.error_type：流正常收尾但 tool_use 参数 JSON 被上游截断。
-    /// 根因与 stream_interrupted 同属上游/链路问题，单列一类以便与客户端
-    /// bad_request 区分（历史版本曾误归入 bad_request）。
+    /// 仅用作 record.error_type：流正常收尾但 tool_use 参数 JSON 被上游截断
+    /// （IncompleteJson）。属传输链路问题，计入代理健康，与客户端 bad_request 区分。
     pub const UPSTREAM_TRUNCATED: &str = "upstream_truncated";
+    /// 仅用作 record.error_type：上游返回了完整但非法的 tool_use JSON（InvalidJson）。
+    /// 属上游内容问题（非截断、非客户端错误），不计入代理健康。
+    pub const UPSTREAM_INVALID: &str = "upstream_invalid";
 }
 
 /// 把上游错误体截断到安全长度（按字符边界，避免切碎 UTF-8）

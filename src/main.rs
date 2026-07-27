@@ -166,16 +166,37 @@ async fn main() {
         config.tls_backend,
     ));
 
-    // Ops 事件存储：与 traces.db 同文件、独立连接（WAL 并发安全）
-    let ops_cache_dir = token_manager
+    // traces.db 路径。trace 与 ops 两个存储共用此文件（各持独立连接，WAL 并发安全），
+    // 且必须共享同一「持久化 / 内存兜底」决策：否则会出现「运维页有历史统计、
+    // 请求日志页却为空」的错位。因此先定 trace_store，再据其结果建 ops_store。
+    let traces_db_path = token_manager
         .cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let ops_store = Arc::new(
-        admin::OpsStore::open(ops_cache_dir.join("traces.db")).unwrap_or_else(|e| {
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("traces.db");
+
+    // 请求链路追踪存储（SQLite，traces.db）。失败不致命：trace 不可用但服务正常。
+    let trace_store: Option<admin::SharedTraceStore> = match admin::TraceStore::open(
+        traces_db_path.clone(),
+        config.trace_enabled,
+        config.trace_retention_days,
+    ) {
+        Ok(s) => Some(std::sync::Arc::new(s)),
+        Err(e) => {
+            tracing::warn!("打开 traces.db 失败，请求链路追踪不可用: {}", e);
+            None
+        }
+    };
+
+    // Ops 事件存储：trace 主库成功时用同一持久化文件；trace 降级到内存时 ops 也用内存，
+    // 保证两者查询落在同一数据库视图。
+    let ops_store = Arc::new(if trace_store.is_some() {
+        admin::OpsStore::open(traces_db_path.clone()).unwrap_or_else(|e| {
             tracing::warn!("打开 ops 存储失败，处置事件仅进程内可见: {}", e);
             admin::OpsStore::open_in_memory().expect("内存 ops 存储初始化失败")
-        }),
-    );
+        })
+    } else {
+        admin::OpsStore::open_in_memory().expect("内存 ops 存储初始化失败")
+    });
     let ops_runtime = Arc::new(admin::OpsRuntime::new(
         proxy_pool.clone(),
         token_manager.clone(),
@@ -235,19 +256,6 @@ async fn main() {
             tracing::info!("分组注册表：自动迁移 {} 个已用分组", added);
         }
     }
-
-    // 请求链路追踪存储（SQLite，traces.db）。失败不致命：trace 不可用但服务正常。
-    let trace_store: Option<admin::SharedTraceStore> = match admin::TraceStore::open(
-        cache_dir.join("traces.db"),
-        config.trace_enabled,
-        config.trace_retention_days,
-    ) {
-        Ok(s) => Some(std::sync::Arc::new(s)),
-        Err(e) => {
-            tracing::warn!("打开 traces.db 失败，请求链路追踪不可用: {}", e);
-            None
-        }
-    };
 
     // 启动后定期清理过期 usage_log 与 trace / ops 事件记录
     {

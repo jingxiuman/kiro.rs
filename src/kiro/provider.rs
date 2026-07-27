@@ -561,10 +561,11 @@ impl KiroProvider {
                         sink, attempt, ctx.id, endpoint_name, None,
                         outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start, proxy_url.as_deref(),
                     );
-                    // 请求级失败按所用代理反馈到代理池（连续失败达阈值自动禁用+换绑）
-                    if let Some(ops) = &self.ops {
-                        ops.report_proxy_failure(proxy_url.as_deref(), &e.to_string());
-                    }
+                    // 注：不在此处做代理级反馈。单个外部请求可能重试多跳，若每跳网络错误
+                    // 都记一次会把一次请求放大成多次「连续失败」；且纯连接失败已由 gstatic
+                    // 主动探测覆盖。代理健康的请求级信号统一由 handlers 在请求终态提交一次
+                    // （见 StreamOpsFeedback / 非流式 body 读取路径），只针对「连接已建立
+                    // 但响应未完整送达」这类探测看不到的失败。
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
@@ -586,9 +587,9 @@ impl KiroProvider {
                     outcome::SUCCESS, None, attempt_start, proxy_url.as_deref(),
                 );
                 self.token_manager.report_success(ctx.id);
-                if let Some(ops) = &self.ops {
-                    ops.report_proxy_success(proxy_url.as_deref());
-                }
+                // 注：2xx 仅代表响应头到达，流/响应体是否完整要到 handlers 消费结束才知道。
+                // 代理级成功反馈推迟到那时提交（否则串行场景会在每次中断前先被 2xx 清零，
+                // 自动禁用永远触发不了）。
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,

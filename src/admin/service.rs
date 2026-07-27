@@ -2640,11 +2640,15 @@ impl AdminService {
 
     /// 即时探测单个代理的连通性（供 UI「测试」按钮调用）
     pub async fn check_proxy(&self, id: u64) -> Result<ProxyCheckResponse, AdminServiceError> {
-        let entry = self
+        let (entry, newly_disabled) = self
             .proxy_pool
             .check_one(id)
             .await
             .map_err(|_| AdminServiceError::NotFound { id })?;
+        // 与后台检查一致：探测触发的自动禁用也记事件 + 解绑受影响凭据
+        if newly_disabled && let Some(ops) = &self.ops {
+            ops.handle_probe_auto_disable(entry.id, &entry.url);
+        }
         Ok(ProxyCheckResponse {
             id: entry.id,
             health: entry.health,
@@ -2658,6 +2662,12 @@ impl AdminService {
     /// 触发全部代理的健康检查
     pub async fn check_all_proxies(&self) -> ProxyCheckAllResponse {
         let summary = self.proxy_pool.check_all().await;
+        // 与后台调度器一致：手动全量检查触发的自动禁用也记事件 + 解绑受影响凭据
+        if let Some(ops) = &self.ops {
+            for (id, url) in &summary.newly_disabled {
+                ops.handle_probe_auto_disable(*id, url);
+            }
+        }
         ProxyCheckAllResponse {
             healthy: summary.healthy,
             unhealthy: summary.unhealthy,

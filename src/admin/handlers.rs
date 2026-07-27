@@ -1319,6 +1319,7 @@ pub async fn list_traces(
                         "outcome": a.outcome,
                         "errorSnippet": a.error_snippet,
                         "durationMs": a.duration_ms,
+                        "proxyUrl": a.proxy_url,
                     })
                 })
                 .collect();

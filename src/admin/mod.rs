@@ -39,6 +39,6 @@ pub use service::AdminService;
 // 调度器必须活在 admin 分支之外，但改开关的入口在 admin 里，两边得看同一份。
 pub use service::ModelSyncSettings;
 pub(crate) use service::parse_auto_apply_time;
-pub use ops::{OpsRuntime, OpsStore, SharedOpsRuntime, SharedOpsStore};
+pub use ops::{OpsRuntime, OpsStore};
 pub use usage_stats::{UsageAggregator, UsageRecorder};
 pub use trace_db::{SharedTraceStore, TraceStore};
