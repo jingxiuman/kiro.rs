@@ -166,7 +166,10 @@ async fn decode_round(
         let chunk = match chunk {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("web_search loop failed to read the response stream: {}", e);
+                tracing::error!(
+                    "web_search loop failed to read the response stream: {}",
+                    crate::http_client::describe_reqwest_error(&e)
+                );
                 stream_error = true;
                 break;
             }
