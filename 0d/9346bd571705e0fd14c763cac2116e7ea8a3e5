@@ -1,0 +1,19 @@
+docs/superpowers/plans/2026-07-26-ops-stream-phase-topology.md
+  s_96f46b5ba50f6b::t_1a2e9a57feb118 938-946
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "0d9346bd571705e0fd14c763cac2116e7ea8a3e5",
+  "prompts": {},
+  "sessions": {
+    "s_96f46b5ba50f6b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ea859f2e-7a59-46d2-9fa5-979a92997f3a",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
