@@ -1,0 +1,28 @@
+src/anthropic/handlers.rs
+  s_b2a249ac7d536c::t_78b0956dcf403a 2050-2059
+  s_b2a249ac7d536c::t_371cdfaa8b74f1 571-589,2060
+  s_b2a249ac7d536c::t_2e3623ace61e5b 2049
+  s_b2a249ac7d536c::t_e2886bc51a7fb8 2061
+Cargo.toml
+  s_b2a249ac7d536c::t_d5bb8aacc9d3a0 3
+admin-ui/package.json
+  s_b2a249ac7d536c::t_d5bb8aacc9d3a0 3
+Cargo.lock
+  s_b2a249ac7d536c::t_5b50e56ccf3edc 1050
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "cd5f8642f11f86306f1ae5bda6ebe14f5f6395ba",
+  "prompts": {},
+  "sessions": {
+    "s_b2a249ac7d536c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1dfe9aa-e54c-4dc3-b526-fc877a1bbd03",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
