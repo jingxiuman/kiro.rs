@@ -84,9 +84,11 @@ impl ClientCache {
 }
 
 /// API 调用结果，附带本次实际命中的上游凭据 ID（用于用量统计）
+/// 与实际使用的出口代理 URL（用于流中断时的代理级反馈；None = 直连）
 pub struct KiroCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    pub proxy_url: Option<String>,
 }
 
 /// Kiro API Provider
@@ -114,6 +116,8 @@ pub struct KiroProvider {
     /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，之后
     /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
     profile_resolution_attempted: Mutex<HashSet<u64>>,
+    /// 运维反馈编排（可选）：网络错误/成功按所用代理反馈到代理池
+    ops: Option<crate::admin::ops::SharedOpsRuntime>,
 }
 
 impl KiroProvider {
@@ -149,7 +153,19 @@ impl KiroProvider {
             endpoints,
             default_endpoint,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
+            ops: None,
         }
+    }
+
+    /// 注入运维反馈编排（main 在建好代理池/事件存储后调用）
+    pub fn with_ops(mut self, ops: crate::admin::ops::SharedOpsRuntime) -> Self {
+        self.ops = Some(ops);
+        self
+    }
+
+    /// 运维反馈编排句柄（流处理层在中断时需要按代理反馈）
+    pub fn ops_runtime(&self) -> Option<crate::admin::ops::SharedOpsRuntime> {
+        self.ops.clone()
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
@@ -470,7 +486,7 @@ impl KiroProvider {
                 Err(e) => {
                     Self::emit_attempt(
                         sink, attempt, 0, "", None, outcome::UNKNOWN,
-                        Some(&e.to_string()), attempt_start,
+                        Some(&e.to_string()), attempt_start, None,
                     );
                     if is_rate_limit_error(&e) {
                         return Err(e);
@@ -482,6 +498,7 @@ impl KiroProvider {
                     continue;
                 }
             };
+            let proxy_url = self.proxy_label(&ctx.credentials);
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
             self.ensure_profile_arn(&mut ctx).await?;
@@ -494,7 +511,7 @@ impl KiroProvider {
                 Err(e) => {
                     Self::emit_attempt(
                         sink, attempt, ctx.id, "", None, outcome::UNKNOWN,
-                        Some(&e.to_string()), attempt_start,
+                        Some(&e.to_string()), attempt_start, proxy_url.as_deref(),
                     );
                     last_error = Some(e);
                     self.token_manager.report_failure(ctx.id);
@@ -542,8 +559,12 @@ impl KiroProvider {
                     );
                     Self::emit_attempt(
                         sink, attempt, ctx.id, endpoint_name, None,
-                        outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start,
+                        outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start, proxy_url.as_deref(),
                     );
+                    // 请求级失败按所用代理反馈到代理池（连续失败达阈值自动禁用+换绑）
+                    if let Some(ops) = &self.ops {
+                        ops.report_proxy_failure(proxy_url.as_deref(), &e.to_string());
+                    }
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
@@ -562,12 +583,16 @@ impl KiroProvider {
             if status.is_success() {
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::SUCCESS, None, attempt_start,
+                    outcome::SUCCESS, None, attempt_start, proxy_url.as_deref(),
                 );
                 self.token_manager.report_success(ctx.id);
+                if let Some(ops) = &self.ops {
+                    ops.report_proxy_success(proxy_url.as_deref());
+                }
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
+                    proxy_url,
                 });
             }
 
@@ -585,7 +610,7 @@ impl KiroProvider {
                 );
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::QUOTA_EXHAUSTED, Some(&body), attempt_start,
+                    outcome::QUOTA_EXHAUSTED, Some(&body), attempt_start, proxy_url.as_deref(),
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
@@ -611,7 +636,7 @@ impl KiroProvider {
             if status.as_u16() == 400 {
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(400),
-                    outcome::BAD_REQUEST, Some(&body), attempt_start,
+                    outcome::BAD_REQUEST, Some(&body), attempt_start, proxy_url.as_deref(),
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -627,7 +652,7 @@ impl KiroProvider {
                 );
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::AUTH_FAILED, Some(&body), attempt_start,
+                    outcome::AUTH_FAILED, Some(&body), attempt_start, proxy_url.as_deref(),
                 );
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
@@ -692,7 +717,7 @@ impl KiroProvider {
                     );
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(429),
-                    outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
+                    outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start, proxy_url.as_deref(),
                 );
                 // 账号级风控通常不返回 Retry-After；此时使用本地实际冷却时间，
                 // 让下游网关在同一时段内也停止调度该虚拟账号。
@@ -724,7 +749,7 @@ impl KiroProvider {
                 );
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::BAD_REQUEST, Some(&body), attempt_start,
+                    outcome::BAD_REQUEST, Some(&body), attempt_start, proxy_url.as_deref(),
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -746,7 +771,7 @@ impl KiroProvider {
                     Some(status.as_u16()),
                     outcome::TRANSIENT,
                     Some(&body),
-                    attempt_start,
+                    attempt_start, proxy_url.as_deref(),
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -763,7 +788,7 @@ impl KiroProvider {
                 );
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::TRANSIENT, Some(&body), attempt_start,
+                    outcome::TRANSIENT, Some(&body), attempt_start, proxy_url.as_deref(),
                 );
                 last_error = if let Some(rate_limit) = rate_limit_error {
                     if !rate_limit.should_retry_locally() {
@@ -794,7 +819,7 @@ impl KiroProvider {
             if status.is_client_error() {
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::BAD_REQUEST, Some(&body), attempt_start,
+                    outcome::BAD_REQUEST, Some(&body), attempt_start, proxy_url.as_deref(),
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -809,7 +834,7 @@ impl KiroProvider {
             );
             Self::emit_attempt(
                 sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                outcome::UNKNOWN, Some(&body), attempt_start,
+                outcome::UNKNOWN, Some(&body), attempt_start, proxy_url.as_deref(),
             );
             last_error = Some(anyhow::anyhow!(
                 "{} API 请求失败: {} {}",
@@ -832,6 +857,13 @@ impl KiroProvider {
         }))
     }
 
+    /// 计算凭据本次实际使用的出口代理 URL（None = 直连）
+    fn proxy_label(&self, credentials: &KiroCredentials) -> Option<String> {
+        credentials
+            .effective_proxy(self.global_proxy.as_ref())
+            .map(|p| p.url)
+    }
+
     /// 向 trace sink 上报一跳结果（sink 为 None 时无开销）
     #[allow(clippy::too_many_arguments)]
     fn emit_attempt(
@@ -843,6 +875,7 @@ impl KiroProvider {
         outcome: &str,
         error_body: Option<&str>,
         started: Instant,
+        proxy_url: Option<&str>,
     ) {
         let Some(sink) = sink else { return };
         sink.on_attempt(TraceAttempt {
@@ -853,6 +886,7 @@ impl KiroProvider {
             outcome: outcome.to_string(),
             error_snippet: error_body.and_then(truncate_snippet),
             duration_ms: started.elapsed().as_millis() as u64,
+            proxy_url: proxy_url.map(|s| s.to_string()),
         });
     }
 

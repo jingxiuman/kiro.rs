@@ -657,6 +657,8 @@ async fn handle_stream_request(
     };
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    let ops_feedback =
+        StreamOpsFeedback::from_call(&provider, credential_id, call_result.proxy_url.clone());
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(
@@ -673,7 +675,8 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer);
+    let stream =
+        create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer, ops_feedback);
 
     // 返回 SSE 响应
     Response::builder()
@@ -688,6 +691,44 @@ async fn handle_stream_request(
 /// Ping 事件间隔（25秒）
 const PING_INTERVAL_SECS: u64 = 25;
 
+/// 流中断时的运维反馈句柄。
+///
+/// 流式响应 2xx 后 provider 已退出重试循环，中断只能在流处理层发现；
+/// 这里把「凭据 + 实际所用代理」带进流状态，中断时反馈给 [`OpsRuntime`]
+/// （计入代理请求级失败，达阈值自动禁用+换绑）。ops 未启用时为 None，零开销。
+pub(crate) struct StreamOpsFeedback {
+    ops: crate::admin::ops::SharedOpsRuntime,
+    credential_id: u64,
+    proxy_url: Option<String>,
+}
+
+impl StreamOpsFeedback {
+    /// 从 provider 与调用结果构造；ops 未注入时返回 None
+    pub(crate) fn from_call(
+        provider: &crate::kiro::provider::KiroProvider,
+        credential_id: u64,
+        proxy_url: Option<String>,
+    ) -> Option<Self> {
+        provider.ops_runtime().map(|ops| Self {
+            ops,
+            credential_id,
+            proxy_url,
+        })
+    }
+
+    fn report_interrupted(&self, error: &str) {
+        self.ops
+            .report_stream_interrupted(self.credential_id, self.proxy_url.as_deref(), error);
+    }
+}
+
+/// Option 包一层的便捷调用
+fn report_stream_interruption(ops: &Option<StreamOpsFeedback>, error: &str) {
+    if let Some(fb) = ops {
+        fb.report_interrupted(error);
+    }
+}
+
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
@@ -701,6 +742,7 @@ fn create_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
+    ops_feedback: Option<StreamOpsFeedback>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -713,8 +755,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, ops_feedback),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, ops_feedback)| async move {
             if finished {
                 return None;
             }
@@ -753,13 +795,14 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             // 发送最终事件并结束（记为 error）
                             let final_events = ctx.generate_final_events();
                             record_stream_usage(&hook, &ctx, credential_id, "error");
+                            report_stream_interruption(&ops_feedback, &e.to_string());
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
                             tracer.finalize(
                                 "interrupted",
@@ -772,7 +815,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)))
                         }
                         None => {
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
@@ -781,12 +824,14 @@ fn create_sse_stream(
                             if let Some(message) = ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
+                                // 根因是上游截断（非客户端问题），归类 upstream_truncated 并带已发送字节数。
                                 record_stream_usage(&hook, &ctx, credential_id, "error");
+                                report_stream_interruption(&ops_feedback, &message);
                                 tracer.finalize(
                                     "error",
-                                    Some(outcome::BAD_REQUEST),
+                                    Some(outcome::UPSTREAM_TRUNCATED),
                                     Some(&message),
-                                    None,
+                                    Some(sent_bytes),
                                     stream_trace_usage(&ctx),
                                 );
                             } else {
@@ -803,7 +848,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)))
                         }
                     }
                 }
@@ -811,7 +856,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)))
                 }
             }
         },
@@ -1467,6 +1512,8 @@ async fn handle_stream_request_buffered(
     };
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    let ops_feedback =
+        StreamOpsFeedback::from_call(&provider, credential_id, call_result.proxy_url.clone());
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(
@@ -1480,7 +1527,8 @@ async fn handle_stream_request_buffered(
     ctx.set_cache_usage(cache_usage);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
+    let stream =
+        create_buffered_sse_stream(response, ctx, hook, credential_id, tracer, ops_feedback);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1505,6 +1553,7 @@ fn create_buffered_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
+    ops_feedback: Option<StreamOpsFeedback>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1519,8 +1568,9 @@ fn create_buffered_sse_stream(
             credential_id,
             tracer,
             0u64,
+            ops_feedback,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, ops_feedback)| async move {
             if finished {
                 return None;
             }
@@ -1535,7 +1585,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)));
                     }
 
                     // 然后处理数据流
@@ -1570,6 +1620,7 @@ fn create_buffered_sse_stream(
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                report_stream_interruption(&ops_feedback, &e.to_string());
                                 // 缓冲模式 chunk 读取失败：上游中途断流
                                 tracer.finalize(
                                     "interrupted",
@@ -1588,7 +1639,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）。
@@ -1604,12 +1655,14 @@ fn create_buffered_sse_stream(
                                     credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
                                 };
                                 if let Some(message) = ctx.tool_json_error_message() {
+                                    // 上游截断（见实时流路径同名分支），归类 upstream_truncated
                                     hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                    report_stream_interruption(&ops_feedback, &message);
                                     tracer.finalize(
                                         "error",
-                                        Some(outcome::BAD_REQUEST),
+                                        Some(outcome::UPSTREAM_TRUNCATED),
                                         Some(&message),
-                                        None,
+                                        Some(sent_bytes),
                                         trace_usage,
                                     );
                                 } else {
@@ -1620,7 +1673,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)));
                             }
                         }
                     }

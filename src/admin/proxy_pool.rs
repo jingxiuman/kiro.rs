@@ -19,6 +19,9 @@ const PROXY_HEALTH_CHECK_URL: &str = "https://www.gstatic.com/generate_204";
 const PROXY_PROBE_TIMEOUT_SECS: u64 = 8;
 /// 连续探测失败阈值：达到后自动禁用（与凭据的 MAX_FAILURES_PER_CREDENTIAL 对齐）
 const MAX_PROXY_PROBE_FAILURES: u32 = 3;
+/// 请求级连续失败阈值：真实上游请求（含流中断）经该代理连续失败达到此值时自动禁用。
+/// 比探测阈值宽松：真实流量的失败包含上游自身抖动，误伤代价（换绑凭据）也更高。
+const MAX_PROXY_REQUEST_FAILURES: u32 = 5;
 
 /// 代理健康状态
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +61,14 @@ pub struct ProxyEntry {
     /// 是否由健康检查自动禁用（区别于用户手动禁用）
     #[serde(default)]
     pub auto_disabled: bool,
+    /// 请求级连续失败计数：真实上游请求经该代理失败（网络错误 / 流中断）累加，
+    /// 任一真实请求成功即清零。与探测计数独立——能通探测端点但连不上上游的
+    /// 代理只有这条通道能暴露。
+    #[serde(default)]
+    pub request_failures: u32,
+    /// 最近一次请求级失败原因（截断）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_request_error: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -83,6 +94,8 @@ pub struct CheckSummary {
     pub unhealthy: usize,
     /// 本轮新增的自动禁用数
     pub auto_disabled: usize,
+    /// 本轮新自动禁用的条目 (id, url)，供上层记事件 / 解绑凭据
+    pub newly_disabled: Vec<(u64, String)>,
 }
 
 /// 单个代理探测结果
@@ -169,6 +182,8 @@ impl ProxyPoolManager {
             last_checked_at: None,
             consecutive_failures: 0,
             auto_disabled: false,
+            request_failures: 0,
+            last_request_error: None,
         };
         entries.push(entry.clone());
         drop(entries);
@@ -207,6 +222,8 @@ impl ProxyPoolManager {
                 last_checked_at: None,
                 consecutive_failures: 0,
                 auto_disabled: false,
+                request_failures: 0,
+                last_request_error: None,
             };
             entries.push(entry.clone());
             added.push(entry);
@@ -248,6 +265,8 @@ impl ProxyPoolManager {
         if enabled {
             entry.auto_disabled = false;
             entry.consecutive_failures = 0;
+            entry.request_failures = 0;
+            entry.last_request_error = None;
         }
         drop(entries);
         self.persist()?;
@@ -397,6 +416,7 @@ impl ProxyPoolManager {
                     }
                     if newly_disabled {
                         summary.auto_disabled += 1;
+                        summary.newly_disabled.push((entry.id, entry.url.clone()));
                     }
                 }
             }
@@ -406,6 +426,64 @@ impl ProxyPoolManager {
             tracing::warn!("健康检查后持久化失败: {}", e);
         }
         summary
+    }
+
+    /// 请求级成功反馈：真实上游请求经该代理成功，清零请求级失败计数。
+    /// 仅在计数非零时才写状态与持久化，避免每个成功请求都触发磁盘写。
+    pub fn report_request_success(&self, url: &str) {
+        let mut changed = false;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.url == url) {
+                if entry.request_failures != 0 || entry.last_request_error.is_some() {
+                    entry.request_failures = 0;
+                    entry.last_request_error = None;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            if let Err(e) = self.persist() {
+                tracing::warn!("请求级反馈持久化失败: {}", e);
+            }
+        }
+    }
+
+    /// 请求级失败反馈：真实上游请求经该代理失败（网络错误 / 流中断）。
+    ///
+    /// 连续失败达 [`MAX_PROXY_REQUEST_FAILURES`] 且仍启用时自动禁用，
+    /// 返回被禁用条目的快照（供上层解绑凭据、记录处置事件）；否则返回 None。
+    pub fn report_request_failure(&self, url: &str, error: &str) -> Option<ProxyEntry> {
+        let disabled = {
+            let mut entries = self.entries.lock();
+            let entry = entries.iter_mut().find(|e| e.url == url)?;
+            entry.request_failures += 1;
+            entry.last_request_error =
+                Some(error.chars().take(200).collect::<String>());
+            tracing::warn!(
+                "代理 #{} 请求级失败（{}/{}）: {}",
+                entry.id,
+                entry.request_failures,
+                MAX_PROXY_REQUEST_FAILURES,
+                error
+            );
+            if entry.request_failures >= MAX_PROXY_REQUEST_FAILURES && entry.enabled {
+                entry.enabled = false;
+                entry.auto_disabled = true;
+                tracing::error!(
+                    "代理 #{} 连续 {} 次真实请求失败，已自动禁用",
+                    entry.id,
+                    entry.request_failures
+                );
+                Some(entry.clone())
+            } else {
+                None
+            }
+        };
+        if let Err(e) = self.persist() {
+            tracing::warn!("请求级反馈持久化失败: {}", e);
+        }
+        disabled
     }
 
     /// 单个代理即时探测（供 UI「测试」按钮调用），回写结果并持久化。
@@ -450,6 +528,8 @@ mod tests {
             last_checked_at: None,
             consecutive_failures: 0,
             auto_disabled: false,
+            request_failures: 0,
+            last_request_error: None,
         }
     }
 
@@ -501,6 +581,44 @@ mod tests {
         assert_eq!(entry.consecutive_failures, 0);
         assert_eq!(entry.health, ProxyHealth::Healthy);
         assert_eq!(entry.latency_ms, Some(123));
+    }
+
+    #[test]
+    fn request_failures_auto_disable_at_threshold_and_success_resets() {
+        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        let entry = mgr.add("socks5://127.0.0.1:1080".to_string(), None).unwrap();
+        let url = entry.url.clone();
+
+        // 前 N-1 次失败：计数累加，不禁用
+        for _ in 1..MAX_PROXY_REQUEST_FAILURES {
+            assert!(mgr.report_request_failure(&url, "error decoding response body").is_none());
+        }
+        // 一次成功清零
+        mgr.report_request_success(&url);
+        let e = mgr.list().into_iter().find(|e| e.id == entry.id).unwrap();
+        assert_eq!(e.request_failures, 0);
+        assert!(e.enabled);
+
+        // 连续 N 次失败：第 N 次返回被禁用的快照
+        for i in 1..=MAX_PROXY_REQUEST_FAILURES {
+            let disabled = mgr.report_request_failure(&url, "connect timeout");
+            if i < MAX_PROXY_REQUEST_FAILURES {
+                assert!(disabled.is_none());
+            } else {
+                let d = disabled.expect("达到阈值应自动禁用");
+                assert!(!d.enabled);
+                assert!(d.auto_disabled);
+            }
+        }
+        // 已禁用后继续失败不重复返回
+        assert!(mgr.report_request_failure(&url, "again").is_none());
+    }
+
+    #[test]
+    fn request_feedback_unknown_url_is_noop() {
+        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        assert!(mgr.report_request_failure("socks5://nope:1", "x").is_none());
+        mgr.report_request_success("socks5://nope:1");
     }
 
     #[test]

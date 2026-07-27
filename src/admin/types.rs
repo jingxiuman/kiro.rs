@@ -670,6 +670,11 @@ pub struct ProxyPoolEntry {
     pub consecutive_failures: u32,
     /// 是否由健康检查自动禁用
     pub auto_disabled: bool,
+    /// 请求级连续失败计数（真实上游流量反馈）
+    pub request_failures: u32,
+    /// 最近一次请求级失败原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_request_error: Option<String>,
 }
 
 /// 代理池列表响应

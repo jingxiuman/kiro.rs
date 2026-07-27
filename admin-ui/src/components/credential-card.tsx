@@ -68,7 +68,7 @@ interface CredentialCardProps {
   loadingBalance: boolean;
   onRefreshBalance: () => void;
   /** 该凭据的失败分类计数（来自 trace 聚合）；无数据时回退 totalFailureCount */
-  failureStats?: { auth: number; throttle: number; other: number };
+  failureStats?: { auth: number; throttle: number; other: number; interrupted?: number };
   /** 展示形态：卡片（默认）或紧凑列表行 */
   view?: "card" | "list";
 }
@@ -662,7 +662,7 @@ export function CredentialCard({
             type="button"
             onClick={() => setShowFailuresDialog(true)}
             className="mt-0.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-sm font-medium tabular-nums transition-colors hover:bg-accent"
-            title="鉴权失败 / 账号风控 / 其他（额度·瞬态·网络等）。点击查看失败日志详情"
+            title="鉴权失败 / 账号风控 / 中断·截断 / 其他（额度·瞬态·网络等）。点击查看失败日志详情"
           >
             {failureStats ? (
               <span className="tabular-nums">
@@ -670,6 +670,10 @@ export function CredentialCard({
                 <span className="text-muted-foreground/50">/</span>
                 <span className="text-amber-600 dark:text-amber-400">
                   {failureStats.throttle}
+                </span>
+                <span className="text-muted-foreground/50">/</span>
+                <span className="text-amber-500">
+                  {failureStats.interrupted ?? 0}
                 </span>
                 <span className="text-muted-foreground/50">/</span>
                 <span className="text-muted-foreground">
@@ -911,7 +915,7 @@ export function CredentialCard({
                   type="button"
                   onClick={() => setShowFailuresDialog(true)}
                   className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent"
-                  title="鉴权失败 / 账号风控 / 其他（额度·瞬态·网络等）。点击查看失败日志详情"
+                  title="鉴权失败 / 账号风控 / 中断·截断 / 其他（额度·瞬态·网络等）。点击查看失败日志详情"
                 >
                   {failureStats ? (
                     <span className="tabular-nums">
@@ -920,6 +924,8 @@ export function CredentialCard({
                       <span className="text-amber-600 dark:text-amber-400">
                         {failureStats.throttle}
                       </span>
+                      <span className="text-muted-foreground/50">/</span>
+                      <span className="text-amber-500">{failureStats.interrupted ?? 0}</span>
                       <span className="text-muted-foreground/50">/</span>
                       <span className="text-muted-foreground">{failureStats.other}</span>
                     </span>

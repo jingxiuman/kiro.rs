@@ -157,12 +157,38 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+
+    // 代理池提前到 admin 分支之外创建：请求级反馈（网络错误/流中断 → 自动禁用+换绑）
+    // 不依赖 admin 是否启用；AdminService 与 KiroProvider 共享同一实例。
+    let proxy_pool_path = token_manager.cache_dir().map(|d| d.join("proxy_pool.json"));
+    let proxy_pool = Arc::new(admin::proxy_pool::ProxyPoolManager::new(
+        proxy_pool_path,
+        config.tls_backend,
+    ));
+
+    // Ops 事件存储：与 traces.db 同文件、独立连接（WAL 并发安全）
+    let ops_cache_dir = token_manager
+        .cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let ops_store = Arc::new(
+        admin::OpsStore::open(ops_cache_dir.join("traces.db")).unwrap_or_else(|e| {
+            tracing::warn!("打开 ops 存储失败，处置事件仅进程内可见: {}", e);
+            admin::OpsStore::open_in_memory().expect("内存 ops 存储初始化失败")
+        }),
+    );
+    let ops_runtime = Arc::new(admin::OpsRuntime::new(
+        proxy_pool.clone(),
+        token_manager.clone(),
+        ops_store.clone(),
+    ));
+
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
-    );
+    )
+    .with_ops(ops_runtime.clone());
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -223,10 +249,11 @@ async fn main() {
         }
     };
 
-    // 启动后定期清理过期 usage_log 与 trace 记录
+    // 启动后定期清理过期 usage_log 与 trace / ops 事件记录
     {
         let recorder = usage_recorder.clone();
         let trace_store = trace_store.clone();
+        let ops_store = ops_store.clone();
         tokio::spawn(async move {
             let day = std::time::Duration::from_secs(24 * 3600);
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -234,6 +261,7 @@ async fn main() {
                 recorder.cleanup_old_logs();
                 if let Some(ts) = &trace_store {
                     ts.cleanup();
+                    ops_store.cleanup(ts.retention_days());
                 }
                 tokio::time::sleep(day).await;
             }
@@ -391,7 +419,8 @@ async fn main() {
                 )
             });
             let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
+                admin::AdminService::new(token_manager.clone(), endpoint_names.clone(), proxy_pool.clone())
+                    .with_ops(ops_runtime.clone())
                     .with_log_governance(
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),

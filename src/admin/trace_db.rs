@@ -41,6 +41,9 @@ pub struct TraceAttempt {
     pub error_snippet: Option<String>,
     /// 本跳耗时（毫秒）
     pub duration_ms: u64,
+    /// 本跳实际使用的出口代理 URL；None = 直连
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
 }
 
 /// 调用方使用的入口 Key 类型。
@@ -141,6 +144,10 @@ pub mod outcome {
     pub const UNKNOWN: &str = "unknown";
     /// 仅用作 record.error_type：流式响应已开始但上游中途断开
     pub const STREAM_INTERRUPTED: &str = "stream_interrupted";
+    /// 仅用作 record.error_type：流正常收尾但 tool_use 参数 JSON 被上游截断。
+    /// 根因与 stream_interrupted 同属上游/链路问题，单列一类以便与客户端
+    /// bad_request 区分（历史版本曾误归入 bad_request）。
+    pub const UPSTREAM_TRUNCATED: &str = "upstream_truncated";
 }
 
 /// 把上游错误体截断到安全长度（按字符边界，避免切碎 UTF-8）
@@ -240,17 +247,25 @@ impl TraceStore {
         })
     }
 
-    /// 旧库迁移：为 traces 表补齐新增列（幂等，缺哪列加哪列）。
-    /// 老版本的 traces.db 只有基础列，新增的 token/credits/first_token_ms/key_source 需在此 ALTER。
-    fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    /// 读取指定表的现有列名集合
+    fn table_columns(
+        conn: &Connection,
+        table: &str,
+    ) -> rusqlite::Result<std::collections::HashSet<String>> {
         let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
-        {
-            let mut stmt = conn.prepare("PRAGMA table_info(traces)")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            for name in rows {
-                existing.insert(name?);
-            }
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for name in rows {
+            existing.insert(name?);
         }
+        Ok(existing)
+    }
+
+    /// 旧库迁移：为 traces / trace_attempts 表补齐新增列（幂等，缺哪列加哪列）。
+    /// 老版本的 traces.db 只有基础列，新增的 token/credits/first_token_ms/key_source
+    /// 以及 attempt 级 proxy_url 需在此 ALTER。
+    fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+        let existing = Self::table_columns(conn, "traces")?;
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
@@ -278,6 +293,11 @@ impl TraceStore {
                 "UPDATE traces SET key_source = CASE WHEN key_id = 0 \
                  THEN 'masterApiKey' ELSE 'clientKey' END WHERE key_source IS NULL;",
             )?;
+        }
+        // trace_attempts 补列：proxy_url（老库无此列，历史行保持 NULL = 未知/直连）
+        let attempt_cols = Self::table_columns(conn, "trace_attempts")?;
+        if !attempt_cols.contains("proxy_url") {
+            conn.execute_batch("ALTER TABLE trace_attempts ADD COLUMN proxy_url TEXT;")?;
         }
         Ok(())
     }
@@ -354,8 +374,8 @@ impl TraceStore {
             for a in &rec.attempts {
                 tx.execute(
                     "INSERT OR REPLACE INTO trace_attempts (trace_id, attempt, credential_id, \
-                     endpoint, http_status, outcome, error_snippet, duration_ms) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                     endpoint, http_status, outcome, error_snippet, duration_ms, proxy_url) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                     rusqlite::params![
                         rec.trace_id,
                         a.attempt as i64,
@@ -365,6 +385,7 @@ impl TraceStore {
                         a.outcome,
                         a.error_snippet,
                         a.duration_ms as i64,
+                        a.proxy_url,
                     ],
                 )?;
             }
@@ -514,7 +535,7 @@ impl TraceStore {
         // 批量取每条 trace 的 attempts
         let mut attempt_stmt = conn.prepare(
             "SELECT attempt, credential_id, endpoint, http_status, outcome, error_snippet, \
-             duration_ms FROM trace_attempts WHERE trace_id = ? ORDER BY attempt ASC",
+             duration_ms, proxy_url FROM trace_attempts WHERE trace_id = ? ORDER BY attempt ASC",
         )?;
         for rec in &mut records {
             let attempts = attempt_stmt.query_map([&rec.trace_id], |row| {
@@ -526,6 +547,7 @@ impl TraceStore {
                     outcome: row.get(4)?,
                     error_snippet: row.get(5)?,
                     duration_ms: row.get::<_, i64>(6)? as u64,
+                    proxy_url: row.get(7)?,
                 })
             })?;
             rec.attempts = attempts.collect::<rusqlite::Result<_>>()?;
@@ -645,23 +667,50 @@ impl TraceStore {
                 _ => s.other += cnt,
             }
         }
+        // 流中断 / 上游截断只写 trace 顶层（attempts 里最后一跳仍是 success），
+        // 需要从 traces 表按最终凭据单独归集，否则凭据卡片看不到这类上游问题。
+        let mut trace_stmt = match conn.prepare(
+            "SELECT final_credential_id, COUNT(*) FROM traces \
+             WHERE error_type IN ('stream_interrupted', 'upstream_truncated') \
+             AND final_credential_id != 0 GROUP BY final_credential_id",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("trace failure_stats 中断统计 prepare 失败: {}", e);
+                return out;
+            }
+        };
+        let trace_rows = trace_stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+        });
+        match trace_rows {
+            Ok(rows) => {
+                for (cred, cnt) in rows.flatten() {
+                    out.entry(cred).or_default().interrupted += cnt;
+                }
+            }
+            Err(e) => tracing::warn!("trace failure_stats 中断统计查询失败: {}", e),
+        }
         out
     }
 }
 
-/// 按凭据的失败分类计数（鉴权 / 账号风控 / 其他）
+/// 按凭据的失败分类计数（鉴权 / 账号风控 / 流中断·上游截断 / 其他）
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FailureStats {
     pub auth: u64,
     pub throttle: u64,
     pub other: u64,
+    /// stream_interrupted + upstream_truncated（上游中途断流类）
+    #[serde(default)]
+    pub interrupted: u64,
 }
 
 /// 共享存储句柄
 pub type SharedTraceStore = Arc<TraceStore>;
 
-const SCHEMA: &str = "
+pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS traces (
     trace_id          TEXT PRIMARY KEY,
     ts                TEXT NOT NULL,
@@ -697,6 +746,7 @@ CREATE TABLE IF NOT EXISTS trace_attempts (
     outcome       TEXT NOT NULL,
     error_snippet TEXT,
     duration_ms   INTEGER NOT NULL,
+    proxy_url     TEXT,
     PRIMARY KEY (trace_id, attempt)
 );
 CREATE INDEX IF NOT EXISTS idx_attempts_trace ON trace_attempts(trace_id);
@@ -751,6 +801,7 @@ mod tests {
                     outcome: outcome::ACCOUNT_THROTTLED.to_string(),
                     error_snippet: Some("suspicious activity".to_string()),
                     duration_ms: 400,
+                    proxy_url: Some("socks5://p1:1080".to_string()),
                 },
                 TraceAttempt {
                     attempt: 1,
@@ -764,6 +815,7 @@ mod tests {
                     outcome: input.status.to_string(),
                     error_snippet: None,
                     duration_ms: 800,
+                    proxy_url: None,
                 },
             ],
         }
@@ -917,6 +969,61 @@ mod tests {
         });
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].trace_id, "cut");
+    }
+
+    #[test]
+    fn attempt_proxy_url_roundtrip() {
+        let store = mem_store();
+        store.insert(&sample(TraceSample {
+            trace_id: "t-proxy",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        }));
+        let out = store.query(&TraceQuery {
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(
+            out[0].attempts[0].proxy_url.as_deref(),
+            Some("socks5://p1:1080")
+        );
+        assert_eq!(out[0].attempts[1].proxy_url, None);
+    }
+
+    #[test]
+    fn failure_stats_counts_stream_interruptions_from_traces() {
+        let store = mem_store();
+        // 流中断：attempts 里唯一一跳是 success（2xx 已拿到），错误只在 trace 顶层
+        let mut rec = sample(TraceSample {
+            trace_id: "t-int",
+            status: "interrupted",
+            credential_id: 5,
+            model: "m1",
+        });
+        rec.error_type = Some(outcome::STREAM_INTERRUPTED.to_string());
+        rec.attempts = vec![TraceAttempt {
+            attempt: 0,
+            credential_id: 5,
+            endpoint: "ide".to_string(),
+            http_status: Some(200),
+            outcome: outcome::SUCCESS.to_string(),
+            error_snippet: None,
+            duration_ms: 800,
+            proxy_url: None,
+        }];
+        store.insert(&rec);
+        // 上游截断也应计入同一分类
+        let mut rec2 = rec.clone();
+        rec2.trace_id = "t-trunc".to_string();
+        rec2.final_status = "error".to_string();
+        rec2.error_type = Some(outcome::UPSTREAM_TRUNCATED.to_string());
+        store.insert(&rec2);
+
+        let stats = store.failure_stats();
+        let s = stats.get(&5).expect("凭据 5 应有统计");
+        assert_eq!(s.interrupted, 2, "流中断与上游截断都应计入 interrupted");
+        assert_eq!(s.auth + s.throttle + s.other, 0, "attempt 全 success 不应产生其他失败计数");
     }
 
     #[test]
