@@ -178,8 +178,10 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
-    /// 代理 IP 池管理器
-    proxy_pool: ProxyPoolManager,
+    /// 代理 IP 池管理器（与 KiroProvider 的请求级反馈共享同一实例）
+    proxy_pool: Arc<ProxyPoolManager>,
+    /// 运维反馈编排（可选）：探测自动禁用时记事件 + 解绑受影响凭据
+    ops: Option<crate::admin::ops::SharedOpsRuntime>,
     /// 在线镜像更新运行时配置
     update_config: Mutex<RuntimeUpdateConfig>,
     /// 最近一次"检查更新"结果（带 TTL，用于减少 GitHub API 调用）
@@ -502,13 +504,11 @@ impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
+        proxy_pool: Arc<ProxyPoolManager>,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
             .map(|d| d.join("kiro_balance_cache.json"));
-
-        let proxy_pool_path = token_manager.cache_dir().map(|d| d.join("proxy_pool.json"));
-        let token_manager_tls_backend = token_manager.config().tls_backend;
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
@@ -519,7 +519,8 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
-            proxy_pool: ProxyPoolManager::new(proxy_pool_path, token_manager_tls_backend),
+            proxy_pool,
+            ops: None,
             update_config: Mutex::new(update_config),
             update_check_cache: Mutex::new(None),
             idc_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -553,6 +554,17 @@ impl AdminService {
     /// 暴露 TokenManager 给 handlers（分组管理需要 count / rename / remove 凭据 groups 字段）
     pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
         &self.token_manager
+    }
+
+    /// 注入运维反馈编排（探测自动禁用时记事件 + 解绑凭据；ops 统计 API 也从这里取）
+    pub fn with_ops(mut self, ops: crate::admin::ops::SharedOpsRuntime) -> Self {
+        self.ops = Some(ops);
+        self
+    }
+
+    /// 运维编排句柄（供 handlers 访问 ops 统计）
+    pub fn ops(&self) -> Option<&crate::admin::ops::SharedOpsRuntime> {
+        self.ops.as_ref()
     }
 
     /// 注入日志治理句柄（trace 存储 + 用量记录器），用于运行时改保留期/开关。
@@ -936,6 +948,12 @@ impl AdminService {
                     summary.auto_disabled,
                     started.elapsed().as_secs_f32()
                 );
+                // 探测触发的自动禁用同样走处置流程：记事件 + 解绑受影响凭据
+                if let Some(ops) = &svc.ops {
+                    for (id, url) in &summary.newly_disabled {
+                        ops.handle_probe_auto_disable(*id, url);
+                    }
+                }
                 tokio::time::sleep(interval).await;
             }
         });
@@ -2492,6 +2510,8 @@ impl AdminService {
                     last_checked_at: p.last_checked_at,
                     consecutive_failures: p.consecutive_failures,
                     auto_disabled: p.auto_disabled,
+                    request_failures: p.request_failures,
+                    last_request_error: p.last_request_error,
                 }
             })
             .collect();
@@ -2523,6 +2543,8 @@ impl AdminService {
             last_checked_at: entry.last_checked_at,
             consecutive_failures: entry.consecutive_failures,
             auto_disabled: entry.auto_disabled,
+            request_failures: entry.request_failures,
+            last_request_error: entry.last_request_error,
         })
     }
 
@@ -2545,6 +2567,8 @@ impl AdminService {
                 last_checked_at: e.last_checked_at,
                 consecutive_failures: e.consecutive_failures,
                 auto_disabled: e.auto_disabled,
+                request_failures: e.request_failures,
+                last_request_error: e.last_request_error,
             })
             .collect();
         (result, errors)
@@ -2616,11 +2640,15 @@ impl AdminService {
 
     /// 即时探测单个代理的连通性（供 UI「测试」按钮调用）
     pub async fn check_proxy(&self, id: u64) -> Result<ProxyCheckResponse, AdminServiceError> {
-        let entry = self
+        let (entry, newly_disabled) = self
             .proxy_pool
             .check_one(id)
             .await
             .map_err(|_| AdminServiceError::NotFound { id })?;
+        // 与后台检查一致：探测触发的自动禁用也记事件 + 解绑受影响凭据
+        if newly_disabled && let Some(ops) = &self.ops {
+            ops.handle_probe_auto_disable(entry.id, &entry.url);
+        }
         Ok(ProxyCheckResponse {
             id: entry.id,
             health: entry.health,
@@ -2634,6 +2662,12 @@ impl AdminService {
     /// 触发全部代理的健康检查
     pub async fn check_all_proxies(&self) -> ProxyCheckAllResponse {
         let summary = self.proxy_pool.check_all().await;
+        // 与后台调度器一致：手动全量检查触发的自动禁用也记事件 + 解绑受影响凭据
+        if let Some(ops) = &self.ops {
+            for (id, url) in &summary.newly_disabled {
+                ops.handle_probe_auto_disable(*id, url);
+            }
+        }
         ProxyCheckAllResponse {
             healthy: summary.healthy,
             unhealthy: summary.unhealthy,
@@ -4446,7 +4480,7 @@ mod model_registry_tests {
             probe_credential_id: Some(1),
             allow_passthrough: false,
         }));
-        let service = AdminService::new(Arc::clone(&token_manager), Vec::<String>::new())
+        let service = AdminService::new(Arc::clone(&token_manager), Vec::<String>::new(), Arc::new(ProxyPoolManager::new(None, crate::model::config::TlsBackend::Rustls)))
             .with_model_registry(Some(Arc::clone(&store)), Some(sync_service))
             .with_model_sync_settings(settings);
 
@@ -4552,7 +4586,7 @@ mod model_registry_tests {
             MultiTokenManager::new(Config::default(), vec![live_cred(1, "tok", 1)], None, None, true)
                 .unwrap(),
         );
-        AdminService::new(token_manager, Vec::<String>::new())
+        AdminService::new(token_manager, Vec::<String>::new(), Arc::new(ProxyPoolManager::new(None, crate::model::config::TlsBackend::Rustls)))
     }
 
     /// M1：`PATCH /models/settings` 的未知字段必须明确报错，不能静默丢弃。

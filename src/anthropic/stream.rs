@@ -920,6 +920,13 @@ impl ToolJsonAccumulatorError {
         "upstream_tool_json_error"
     }
 
+    /// 是否为「上游中途截断」（IncompleteJson）。
+    /// true = 连接建立后流被截断（传输链路问题，计入代理健康 + 归类 upstream_truncated）；
+    /// false = 上游返回了完整但非法的 JSON（上游内容问题，不罚代理 + 归类 upstream_invalid）。
+    pub fn is_incomplete(&self) -> bool {
+        matches!(self, Self::IncompleteJson { .. })
+    }
+
     pub fn message(&self) -> String {
         match self {
             Self::InvalidJson {
@@ -1430,6 +1437,12 @@ impl StreamContext {
     /// 或在非流式路径返回 502。无错误时返回 `None`。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.tool_json_error.as_ref().map(|err| err.message())
+    }
+
+    /// 工具调用 JSON 错误是否为「上游截断」（IncompleteJson）。
+    /// 有错误时返回 Some(是否截断)；无错误返回 None。见 [`ToolJsonAccumulatorError::is_incomplete`]。
+    pub fn tool_json_error_incomplete(&self) -> Option<bool> {
+        self.tool_json_error.as_ref().map(|err| err.is_incomplete())
     }
 
     /// 创建 StreamContext。
@@ -2638,6 +2651,11 @@ impl BufferedStreamContext {
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.inner.tool_json_error_message()
+    }
+
+    /// 工具调用 JSON 错误是否为上游截断（转发内部 StreamContext）。
+    pub fn tool_json_error_incomplete(&self) -> Option<bool> {
+        self.inner.tool_json_error_incomplete()
     }
 }
 

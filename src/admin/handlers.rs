@@ -1319,6 +1319,7 @@ pub async fn list_traces(
                         "outcome": a.outcome,
                         "errorSnippet": a.error_snippet,
                         "durationMs": a.duration_ms,
+                        "proxyUrl": a.proxy_url,
                     })
                 })
                 .collect();
@@ -1366,6 +1367,7 @@ pub async fn trace_failure_stats(State(state): State<AdminState>) -> impl IntoRe
                     "auth": s.auth,
                     "throttle": s.throttle,
                     "other": s.other,
+                    "interrupted": s.interrupted,
                 }),
             )
         })
@@ -1693,4 +1695,102 @@ pub async fn set_model_sync_settings(
         .into_response(),
         Err(e) => e.into_http_response(),
     }
+}
+
+// ============ 运维（Ops）============
+
+/// 解析统计窗口参数 `hours`（默认 24，1..=744）
+fn parse_ops_hours(params: &std::collections::HashMap<String, String>) -> i64 {
+    params
+        .get("hours")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(24)
+        .clamp(1, 24 * 31)
+}
+
+/// ops 未启用时的统一响应
+fn ops_unavailable() -> axum::response::Response {
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "运维模块未启用"})),
+    )
+        .into_response()
+}
+
+/// GET /api/admin/ops/overview?hours=24
+/// 窗口内总体概览：状态分布、错误类型分布、时延特征
+pub async fn ops_overview(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(ops) = state.service.ops() else {
+        return ops_unavailable();
+    };
+    Json(ops.events().overview(parse_ops_hours(&params))).into_response()
+}
+
+/// GET /api/admin/ops/trend?hours=24
+/// 按小时的请求/错误/中断趋势
+pub async fn ops_trend(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(ops) = state.service.ops() else {
+        return ops_unavailable();
+    };
+    Json(ops.events().error_trend(parse_ops_hours(&params))).into_response()
+}
+
+/// GET /api/admin/ops/credentials?hours=24
+/// 按凭据的窗口统计（附 email）
+pub async fn ops_by_credential(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(ops) = state.service.ops() else {
+        return ops_unavailable();
+    };
+    let mut rows = ops.events().by_credential(parse_ops_hours(&params));
+    // email 补充：与凭据面板同源
+    let emails: std::collections::HashMap<u64, Option<String>> = state
+        .service
+        .get_all_credentials()
+        .credentials
+        .into_iter()
+        .map(|c| (c.id, c.email))
+        .collect();
+    for row in &mut rows {
+        row.email = emails.get(&row.credential_id).cloned().flatten();
+    }
+    Json(rows).into_response()
+}
+
+/// GET /api/admin/ops/proxies?hours=24
+/// 按代理的窗口统计 + 代理池当前状态（一次拉全，前端合并展示）
+pub async fn ops_by_proxy(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(ops) = state.service.ops() else {
+        return ops_unavailable();
+    };
+    let stats = ops.events().by_proxy(parse_ops_hours(&params));
+    let pool = state.service.get_proxy_pool();
+    Json(serde_json::json!({ "stats": stats, "pool": pool })).into_response()
+}
+
+/// GET /api/admin/ops/events?limit=100
+/// 最近的自动处置事件（代理自动禁用 / 换绑等）
+pub async fn ops_events(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(ops) = state.service.ops() else {
+        return ops_unavailable();
+    };
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100);
+    Json(ops.events().recent_events(limit)).into_response()
 }

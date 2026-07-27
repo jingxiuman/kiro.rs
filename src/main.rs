@@ -157,12 +157,59 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+
+    // 代理池提前到 admin 分支之外创建：请求级反馈（网络错误/流中断 → 自动禁用+换绑）
+    // 不依赖 admin 是否启用；AdminService 与 KiroProvider 共享同一实例。
+    let proxy_pool_path = token_manager.cache_dir().map(|d| d.join("proxy_pool.json"));
+    let proxy_pool = Arc::new(admin::proxy_pool::ProxyPoolManager::new(
+        proxy_pool_path,
+        config.tls_backend,
+    ));
+
+    // traces.db 路径。trace 与 ops 两个存储共用此文件（各持独立连接，WAL 并发安全），
+    // 且必须共享同一「持久化 / 内存兜底」决策：否则会出现「运维页有历史统计、
+    // 请求日志页却为空」的错位。因此先定 trace_store，再据其结果建 ops_store。
+    let traces_db_path = token_manager
+        .cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("traces.db");
+
+    // 请求链路追踪存储（SQLite，traces.db）。失败不致命：trace 不可用但服务正常。
+    let trace_store: Option<admin::SharedTraceStore> = match admin::TraceStore::open(
+        traces_db_path.clone(),
+        config.trace_enabled,
+        config.trace_retention_days,
+    ) {
+        Ok(s) => Some(std::sync::Arc::new(s)),
+        Err(e) => {
+            tracing::warn!("打开 traces.db 失败，请求链路追踪不可用: {}", e);
+            None
+        }
+    };
+
+    // Ops 事件存储：trace 主库成功时用同一持久化文件；trace 降级到内存时 ops 也用内存，
+    // 保证两者查询落在同一数据库视图。
+    let ops_store = Arc::new(if trace_store.is_some() {
+        admin::OpsStore::open(traces_db_path.clone()).unwrap_or_else(|e| {
+            tracing::warn!("打开 ops 存储失败，处置事件仅进程内可见: {}", e);
+            admin::OpsStore::open_in_memory().expect("内存 ops 存储初始化失败")
+        })
+    } else {
+        admin::OpsStore::open_in_memory().expect("内存 ops 存储初始化失败")
+    });
+    let ops_runtime = Arc::new(admin::OpsRuntime::new(
+        proxy_pool.clone(),
+        token_manager.clone(),
+        ops_store.clone(),
+    ));
+
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
-    );
+    )
+    .with_ops(ops_runtime.clone());
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -210,23 +257,11 @@ async fn main() {
         }
     }
 
-    // 请求链路追踪存储（SQLite，traces.db）。失败不致命：trace 不可用但服务正常。
-    let trace_store: Option<admin::SharedTraceStore> = match admin::TraceStore::open(
-        cache_dir.join("traces.db"),
-        config.trace_enabled,
-        config.trace_retention_days,
-    ) {
-        Ok(s) => Some(std::sync::Arc::new(s)),
-        Err(e) => {
-            tracing::warn!("打开 traces.db 失败，请求链路追踪不可用: {}", e);
-            None
-        }
-    };
-
-    // 启动后定期清理过期 usage_log 与 trace 记录
+    // 启动后定期清理过期 usage_log 与 trace / ops 事件记录
     {
         let recorder = usage_recorder.clone();
         let trace_store = trace_store.clone();
+        let ops_store = ops_store.clone();
         tokio::spawn(async move {
             let day = std::time::Duration::from_secs(24 * 3600);
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -234,6 +269,7 @@ async fn main() {
                 recorder.cleanup_old_logs();
                 if let Some(ts) = &trace_store {
                     ts.cleanup();
+                    ops_store.cleanup(ts.retention_days());
                 }
                 tokio::time::sleep(day).await;
             }
@@ -391,7 +427,8 @@ async fn main() {
                 )
             });
             let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
+                admin::AdminService::new(token_manager.clone(), endpoint_names.clone(), proxy_pool.clone())
+                    .with_ops(ops_runtime.clone())
                     .with_log_governance(
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),

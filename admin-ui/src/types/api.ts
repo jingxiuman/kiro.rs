@@ -169,6 +169,10 @@ export interface ProxyPoolEntry {
   lastCheckedAt?: string
   consecutiveFailures: number
   autoDisabled: boolean
+  /** 请求级连续失败计数（真实上游流量反馈；达阈值自动禁用） */
+  requestFailures: number
+  /** 最近一次请求级失败原因 */
+  lastRequestError?: string
 }
 
 // 代理池列表响应
@@ -475,6 +479,8 @@ export interface TraceAttempt {
   /** 上游错误体片段（已截断） */
   errorSnippet: string | null
   durationMs: number
+  /** 本跳实际使用的出口代理 URL；null/undefined = 直连 */
+  proxyUrl?: string | null
 }
 
 /** 一个外部请求的完整链路 */
@@ -538,15 +544,89 @@ export interface TracePage {
   total: number
 }
 
-/** 单凭据失败分类计数（鉴权 / 账号风控 / 其他） */
+/** 单凭据失败分类计数（鉴权 / 账号风控 / 流中断 / 其他） */
 export interface FailureStats {
   auth: number
   throttle: number
   other: number
+  /** 流中断 + 上游截断（stream_interrupted / upstream_truncated） */
+  interrupted: number
 }
 
 /** credentialId(字符串) → 失败分类计数 */
 export type FailureStatsMap = Record<string, FailureStats>
+
+// ============ 运维（Ops）============
+
+/** 窗口内错误类型分布 */
+export interface OpsErrorTypeCount {
+  errorType: string
+  count: number
+}
+
+/** 运维概览 */
+export interface OpsOverview {
+  windowHours: number
+  total: number
+  success: number
+  error: number
+  interrupted: number
+  byErrorType: OpsErrorTypeCount[]
+  avgDurationMs: number
+  avgFirstTokenMs?: number | null
+  /** 中断类请求的平均时长（集中在同一时长通常指向链路固定超时） */
+  interruptedAvgDurationMs?: number | null
+}
+
+/** 按小时趋势点 */
+export interface OpsTrendPoint {
+  bucketEpoch: number
+  total: number
+  success: number
+  error: number
+  interrupted: number
+}
+
+/** 按凭据统计行 */
+export interface OpsCredentialRow {
+  credentialId: number
+  email?: string | null
+  total: number
+  success: number
+  error: number
+  interrupted: number
+  authFailed: number
+  accountThrottled: number
+  networkError: number
+  otherFailed: number
+}
+
+/** 按代理统计行（proxyUrl 为空串 = 直连） */
+export interface OpsProxyRow {
+  proxyUrl: string
+  attempts: number
+  success: number
+  networkError: number
+  otherFailed: number
+  interrupted: number
+}
+
+/** 按代理统计响应（附代理池当前状态） */
+export interface OpsProxiesResponse {
+  stats: OpsProxyRow[]
+  pool: ProxyPoolResponse
+}
+
+/** 自动处置事件 */
+export interface OpsEvent {
+  id: number
+  ts: string
+  /** proxy_auto_disable / proxy_reassign / proxy_probe_disable */
+  category: string
+  severity: string
+  subject: string
+  message: string
+}
 
 // ============ 账号分组（独立实体）============
 

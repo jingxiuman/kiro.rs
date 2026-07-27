@@ -67,6 +67,10 @@ function outcomeStyle(outcome: string): {
       return { label: '请求错误', variant: 'destructive' }
     case 'stream_interrupted':
       return { label: '流中断', variant: 'warning' }
+    case 'upstream_truncated':
+      return { label: '上游截断', variant: 'warning' }
+    case 'upstream_invalid':
+      return { label: '上游非法JSON', variant: 'destructive' }
     default:
       return { label: outcome || '未知', variant: 'secondary' }
   }
@@ -144,6 +148,8 @@ const ERROR_TYPE_OPTIONS = [
   { value: 'network_error', label: '网络错误' },
   { value: 'bad_request', label: '请求错误' },
   { value: 'stream_interrupted', label: '流中断' },
+  { value: 'upstream_truncated', label: '上游截断' },
+  { value: 'upstream_invalid', label: '上游非法JSON' },
   { value: 'unknown', label: '未知' },
 ]
 
@@ -160,6 +166,10 @@ function AttemptRow({ a }: { a: TraceAttempt }) {
         {a.endpoint && <Badge variant="outline">{a.endpoint}</Badge>}
         <span className="text-muted-foreground">HTTP</span>
         <span className="font-mono">{a.httpStatus ?? '—'}</span>
+        <span className="text-muted-foreground">出口</span>
+        <span className="max-w-[220px] truncate font-mono text-[12px]" title={a.proxyUrl ?? '直连'}>
+          {a.proxyUrl ?? '直连'}
+        </span>
         <span className="ml-auto font-mono text-muted-foreground">
           {formatDuration(a.durationMs)}
         </span>

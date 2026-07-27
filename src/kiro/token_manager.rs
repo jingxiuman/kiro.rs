@@ -3081,6 +3081,32 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 把所有绑定 `old_url` 代理的凭据改绑 `new_url`（None = 清除绑定，回退全局代理）。
+    ///
+    /// 用于代理池自动禁用后的解绑/换绑：被禁用的代理若仍留在凭据上，
+    /// `effective_proxy` 不查池，请求会继续走坏代理。返回受影响的凭据 id。
+    pub fn reassign_proxy_url(
+        &self,
+        old_url: &str,
+        new_url: Option<String>,
+    ) -> anyhow::Result<Vec<u64>> {
+        let affected: Vec<u64> = {
+            let mut entries = self.entries.lock();
+            entries
+                .iter_mut()
+                .filter(|e| e.credentials.proxy_url.as_deref() == Some(old_url))
+                .map(|e| {
+                    e.credentials.proxy_url = new_url.clone();
+                    e.id
+                })
+                .collect()
+        };
+        if !affected.is_empty() {
+            self.persist_credentials()?;
+        }
+        Ok(affected)
+    }
+
     /// 列出所有凭据当前引用的分组名（去重排序）。
     /// 用于启动迁移到 GroupManager 注册表，以及前端的引用计数显示。
     pub fn list_credential_groups(&self) -> Vec<String> {
