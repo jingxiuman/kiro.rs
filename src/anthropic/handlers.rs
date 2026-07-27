@@ -2588,10 +2588,23 @@ mod tracer_tests {
             outcome::STREAM_INTERRUPTED,
             "上游断流不得被误记成客户端断开"
         );
+        assert_eq!(got[0].bytes, Some(512));
         let detail = got[0].detail.as_deref().unwrap_or("");
         assert!(
             detail.contains("client_gone=false"),
             "上游断流的 detail 必须明确 client_gone=false，实际: {detail}"
+        );
+        assert!(
+            detail.contains("bytes="),
+            "detail 必须带 bytes 判别位，实际: {detail}"
+        );
+        assert!(
+            detail.contains("idle_ms="),
+            "detail 必须带 idle_ms 判别位，实际: {detail}"
+        );
+        assert!(
+            detail.contains("err=connection reset"),
+            "detail 必须带上游错误文本，实际: {detail}"
         );
     }
 }
