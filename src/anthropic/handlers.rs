@@ -7,6 +7,7 @@ use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TracePhase, TraceRecord, TraceSink, outcome,
+    phase,
 };
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
@@ -30,7 +31,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{BufferedStreamContext, SseEvent, StreamContext, ToolJsonAccumulatorError};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -302,9 +303,6 @@ impl StreamPhaseGuard {
     }
 
     /// 更新已发送字节数与最后一个 chunk 的时刻（每个 chunk 后调用）
-    ///
-    /// 本 Task 尚未接入实际流路径（那是 Task 5 的工作），此处暂无调用点。
-    #[allow(dead_code)]
     pub fn set_bytes(&mut self, sent_bytes: u64) {
         self.sent_bytes = sent_bytes;
         self.last_chunk_at = Instant::now();
@@ -358,6 +356,33 @@ impl Drop for StreamPhaseGuard {
             )),
         );
     }
+}
+
+/// 首个 chunk 到达：关闭 first_token 段，打开 streaming 段。
+/// 幂等由调用方的 first_chunk 标志保证（两条流路径各自维护）。
+pub(crate) fn phase_on_first_chunk(tracer: &RequestTracer) {
+    tracer.close_phase(phase::FIRST_TOKEN, outcome::SUCCESS, Some(0), None);
+    tracer.open_phase(phase::STREAMING);
+}
+
+/// 流正常结束的 finish 段：按 tool_use 累积器结果开合。
+///
+/// streaming 段本身由 [`StreamPhaseGuard::into_completed`] 关闭，此处只管 finish——
+/// **调用方必须保证 guard 已经消费完毕再调用本函数**：`open_phase` 会覆盖当前打开的段，
+/// 若在 guard 消费前 open(FINISH)，guard 随后 close(STREAMING) 会因段名不匹配被静默
+/// 忽略，streaming 段就此丢失且无任何报错（这是本任务的第一个陷阱）。
+pub(crate) fn phase_on_finish(
+    tracer: &RequestTracer,
+    sent_bytes: u64,
+    tool_json_error: Option<&ToolJsonAccumulatorError>,
+    tool_json_message: Option<String>,
+) {
+    tracer.open_phase(phase::FINISH);
+    let finish_outcome = match tool_json_error {
+        Some(err) => crate::anthropic::stream::phase_outcome_for(err),
+        None => outcome::SUCCESS,
+    };
+    tracer.close_phase(phase::FINISH, finish_outcome, Some(sent_bytes), tool_json_message);
 }
 
 /// 取追踪器里最后一跳的 outcome（用于把 provider 的失败分类提升到 record.error_type）。
@@ -896,9 +921,13 @@ fn create_sse_stream(
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
 
+    // 段埋点：first_token 段在此打开，guard 承载 streaming 段（详见 StreamPhaseGuard 文档）。
+    tracer.open_phase(phase::FIRST_TOKEN);
+    let guard = StreamPhaseGuard::new(tracer.clone(), 0);
+
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, ops_feedback),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, ops_feedback)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, ops_feedback, true, Some(guard)),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, ops_feedback, mut first_chunk, mut guard)| async move {
             if finished {
                 return None;
             }
@@ -911,6 +940,13 @@ fn create_sse_stream(
                         Some(Ok(chunk)) => {
                             tracer.mark_first_token();
                             sent_bytes += chunk.len() as u64;
+                            if first_chunk {
+                                phase_on_first_chunk(&tracer);
+                                first_chunk = false;
+                            }
+                            if let Some(g) = guard.as_mut() {
+                                g.set_bytes(sent_bytes);
+                            }
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
@@ -937,10 +973,14 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
+                            // 按值消费 guard：本分支已显式处理结局，Drop 不得再判客户端断开。
+                            if let Some(g) = guard.take() {
+                                g.into_upstream_error(sent_bytes, &e);
+                            }
                             // 发送最终事件并结束（记为 error）
                             let final_events = ctx.generate_final_events();
                             record_stream_usage(&hook, &ctx, credential_id, "error");
@@ -958,12 +998,23 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)))
                         }
                         None => {
+                            // 流正常结束：先按值消费 guard 收尾 streaming 段，再打开 finish 段——
+                            // 顺序不可反（见 phase_on_finish 文档的陷阱说明）。
+                            if let Some(g) = guard.take() {
+                                g.into_completed(sent_bytes);
+                            }
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
+                            phase_on_finish(
+                                &tracer,
+                                sent_bytes,
+                                ctx.tool_json_error(),
+                                ctx.tool_json_error_message(),
+                            );
                             if let Some(message) = ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
@@ -1000,7 +1051,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)))
                         }
                     }
                 }
@@ -1008,7 +1059,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)))
                 }
             }
         },
@@ -1722,6 +1773,10 @@ fn create_buffered_sse_stream(
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
+    // 段埋点：first_token 段在此打开，guard 承载 streaming 段（详见 StreamPhaseGuard 文档）。
+    tracer.open_phase(phase::FIRST_TOKEN);
+    let guard = StreamPhaseGuard::new(tracer.clone(), 0);
+
     stream::unfold(
         (
             body_stream,
@@ -1734,8 +1789,10 @@ fn create_buffered_sse_stream(
             tracer,
             0u64,
             ops_feedback,
+            true,
+            Some(guard),
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, ops_feedback)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, ops_feedback, mut first_chunk, mut guard)| async move {
             if finished {
                 return None;
             }
@@ -1750,7 +1807,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)));
                     }
 
                     // 然后处理数据流
@@ -1759,6 +1816,13 @@ fn create_buffered_sse_stream(
                             Some(Ok(chunk)) => {
                                 tracer.mark_first_token();
                                 sent_bytes += chunk.len() as u64;
+                                if first_chunk {
+                                    phase_on_first_chunk(&tracer);
+                                    first_chunk = false;
+                                }
+                                if let Some(g) = guard.as_mut() {
+                                    g.set_bytes(sent_bytes);
+                                }
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {
                                     tracing::warn!("缓冲区溢出: {}", e);
@@ -1781,6 +1845,10 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
+                                // 按值消费 guard：本分支已显式处理结局，Drop 不得再判客户端断开。
+                                if let Some(g) = guard.take() {
+                                    g.into_upstream_error(sent_bytes, &e);
+                                }
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
@@ -1804,9 +1872,14 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)));
                             }
                             None => {
+                                // 流正常结束：先按值消费 guard 收尾 streaming 段，再打开 finish 段——
+                                // 顺序不可反（见 phase_on_finish 文档的陷阱说明）。
+                                if let Some(g) = guard.take() {
+                                    g.into_completed(sent_bytes);
+                                }
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）。
                                 // finish_and_get_all_events 内部会 finish() 累积器；若有半截 /
                                 // 非法工具调用 JSON，error 事件已随缓冲发出，这里据此记 error。
@@ -1819,6 +1892,12 @@ fn create_buffered_sse_stream(
                                     cache_read_tokens: cr.max(0) as u64,
                                     credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
                                 };
+                                phase_on_finish(
+                                    &tracer,
+                                    sent_bytes,
+                                    ctx.tool_json_error(),
+                                    ctx.tool_json_error_message(),
+                                );
                                 if let Some(message) = ctx.tool_json_error_message() {
                                     // 区分上游截断（传输，计代理失败）与上游非法 JSON（内容，不罚代理），
                                     // 见实时流路径同名分支
@@ -1846,7 +1925,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)));
                             }
                         }
                     }
@@ -2605,6 +2684,132 @@ mod tracer_tests {
         assert!(
             detail.contains("err=connection reset"),
             "detail 必须带上游错误文本，实际: {detail}"
+        );
+    }
+
+    /// 端到端验证 axum drop 前提：真实起一个 axum 服务，用裸 TCP socket 连接，
+    /// 读到几个 chunk 后直接 drop 掉 socket（不发 FIN 的优雅关闭，模拟客户端
+    /// 突然断开），等待服务端感知，断言 streaming 段被记成 client_disconnected
+    /// 且 bytes > 0（证明断开发生在已发出内容之后）。
+    ///
+    /// Task 4 的探针只证明了 `stream::unfold` 状态被 drop 时 Drop impl 会执行
+    /// （纯 Rust 语义）。它没有证明 axum 在客户端真实断开的连接上，会在 guard
+    /// 还能起作用的时机把响应 body 的 unfold 状态 drop 掉——这是本测试要补的那一环。
+    #[tokio::test]
+    async fn client_disconnect_end_to_end() {
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        // tracer 用内存 TraceStore，但本测试直接检视 tracer 的内存态 phases——
+        // client_disconnected 是 guard Drop 时写入 tracer.phases 的，与是否
+        // finalize() 落库无关（这正是原始事故的病灶：断连时 finalize 永不执行）。
+        let store = crate::admin::trace_db::TraceStore::open_in_memory()
+            .expect("打开内存 trace store 失败");
+        let tracer = std::sync::Arc::new(RequestTracer {
+            store: Some(std::sync::Arc::new(store)),
+            trace_id: "e2e-disconnect".to_string(),
+            ts: "now".to_string(),
+            key_id: 0,
+            key_source: TraceKeySource::MasterApiKey,
+            model: "m".to_string(),
+            is_stream: true,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+            phases: parking_lot::Mutex::new(Vec::new()),
+            open_phase: parking_lot::Mutex::new(None),
+        });
+        tracer.open_phase(phase::STREAMING);
+
+        // 路由：慢速 SSE 流，每 50ms 发一个 chunk，共 20 个；guard 挂在流状态里。
+        async fn slow_sse_handler(State(tracer): State<std::sync::Arc<RequestTracer>>) -> impl IntoResponse {
+            let guard = StreamPhaseGuard::new(tracer, 0);
+            let body = stream::unfold((0u32, Some(guard)), |(i, mut guard)| async move {
+                if i >= 20 {
+                    if let Some(g) = guard.take() {
+                        g.into_completed((i as u64) * 5);
+                    }
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let sent = (i + 1) as u64 * 5;
+                if let Some(g) = guard.as_mut() {
+                    g.set_bytes(sent);
+                }
+                let chunk: Result<Bytes, Infallible> = Ok(Bytes::from("event: ping\ndata: x\n\n"));
+                Some((chunk, (i + 1, guard)))
+            });
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(body))
+                .unwrap()
+        }
+
+        let app = axum::Router::new()
+            .route("/stream", get(slow_sse_handler))
+            .with_state(tracer.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定本地端口失败");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // 裸 socket 连接，发原始 HTTP 请求
+        let mut sock = TcpStream::connect(addr)
+            .await
+            .expect("连接测试服务器失败");
+        sock.write_all(
+            b"GET /stream HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .expect("发送请求失败");
+
+        // 读够至少 3 个 chunk 的时长（>150ms）再 drop，确保断开确实发生在
+        // 已发出内容之后——只看字节数不够，响应头本身就可能超过任意阈值。
+        let mut received = 0usize;
+        let read_until = tokio::time::Instant::now() + Duration::from_millis(220);
+        loop {
+            let mut buf = [0u8; 512];
+            let remaining = read_until.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, sock.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => received += n,
+                _ => break,
+            }
+        }
+        assert!(received > 0, "测试服务器应至少发出了响应头/若干个 chunk");
+
+        // 模拟客户端突然断开：直接 drop 掉 socket（不走 shutdown() 优雅关闭）
+        drop(sock);
+
+        // 等待服务端感知断开——服务端下一次写入会因连接已断失败，触发 axum 丢弃
+        // response body 的 unfold 状态，进而运行 guard 的 Drop。
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let phases = tracer.phases.lock();
+        let seg = phases
+            .iter()
+            .find(|p| p.phase == phase::STREAMING)
+            .expect("streaming 段应被记录——axum 应已在断连后 drop 了响应体");
+        assert_eq!(
+            seg.outcome,
+            outcome::CLIENT_DISCONNECTED,
+            "客户端主动断开应记为 client_disconnected，实际: {}",
+            seg.outcome
+        );
+        assert!(
+            seg.bytes.unwrap_or(0) > 0,
+            "断开必须发生在已发出内容之后，bytes 应 > 0，实际: {:?}",
+            seg.bytes
         );
     }
 }
