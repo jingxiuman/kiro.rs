@@ -1,0 +1,19 @@
+src/anthropic/handlers.rs
+  s_96f46b5ba50f6b::t_1233b6aca5b936 2591,2597-2608
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "90ca8af06aefb4a62ce8b98d8516f012887dbc82",
+  "prompts": {},
+  "sessions": {
+    "s_96f46b5ba50f6b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ea859f2e-7a59-46d2-9fa5-979a92997f3a",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
