@@ -1,0 +1,28 @@
+src/admin/trace_db.rs
+  s_96f46b5ba50f6b::t_362494583963b7 1095-1123
+  s_96f46b5ba50f6b::t_3dc109d3a49ff1 44
+admin-ui/src/components/trace-log-page.tsx
+  s_96f46b5ba50f6b::t_2d86f624e48beb 187
+  s_96f46b5ba50f6b::t_0411c2ed98f7a1 156-172
+src/kiro/provider.rs
+  s_96f46b5ba50f6b::t_617883e2ef727b 890-897
+  s_96f46b5ba50f6b::t_2d9fb963e663ba 1061-1098
+admin-ui/src/types/api.ts
+  s_96f46b5ba50f6b::t_158939132ac092 482
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "6ca2f9f84bc12a283a07460119b56c1b683c9ca0",
+  "prompts": {},
+  "sessions": {
+    "s_96f46b5ba50f6b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ea859f2e-7a59-46d2-9fa5-979a92997f3a",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
