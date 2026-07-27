@@ -43,7 +43,10 @@ import {
   useSetLogGovernanceConfig,
 } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { TraceAttempt, TraceQuery, TraceRecord } from '@/types/api'
+import { formatDuration } from '@/lib/format'
+import { TracePhaseLane } from '@/components/trace-phase-lane'
+import { usePhaseBaseline } from '@/hooks/use-ops'
+import type { PhaseBaselineRow, TraceAttempt, TraceQuery, TraceRecord } from '@/types/api'
 
 /** 失败分类 → 中文标签 + Badge 颜色 */
 function outcomeStyle(outcome: string): {
@@ -104,11 +107,6 @@ function formatTime(ts: string): string {
   const d = new Date(ts)
   if (isNaN(d.getTime())) return ts
   return d.toLocaleString('zh-CN', { hour12: false })
-}
-
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`
-  return `${(ms / 1000).toFixed(2)}s`
 }
 
 function formatTokens(n: number): string {
@@ -253,7 +251,7 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   )
 }
 
-function TraceRow({ rec }: { rec: TraceRecord }) {
+function TraceRow({ rec, baseline }: { rec: TraceRecord; baseline: PhaseBaselineRow[] | undefined }) {
   const [open, setOpen] = useState(false)
   const errStyle = rec.errorType ? outcomeStyle(rec.errorType) : null
   return (
@@ -302,7 +300,7 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
           {formatDuration(rec.durationMs)}
         </td>
       </tr>
-      {open && <ExpandedTraceRow rec={rec} />}
+      {open && <ExpandedTraceRow rec={rec} baseline={baseline} />}
     </>
   )
 }
@@ -317,18 +315,30 @@ function TraceCredentialCell({ rec }: { rec: TraceRecord }) {
   )
 }
 
-function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
+function ExpandedTraceRow({
+  rec,
+  baseline,
+}: {
+  rec: TraceRecord
+  baseline: PhaseBaselineRow[] | undefined
+}) {
   return (
     <tr className="border-b border-border/40 bg-secondary/20">
       <td colSpan={12} className="px-3 py-3">
-        <ExpandedDetail rec={rec} />
+        <ExpandedDetail rec={rec} baseline={baseline} />
       </td>
     </tr>
   )
 }
 
-/** 展开后的链路详情：错误摘要 + 每跳时间线 */
-function ExpandedDetail({ rec }: { rec: TraceRecord }) {
+/** 展开后的链路详情：错误摘要 + 每跳时间线 + 流生命周期泳道 */
+function ExpandedDetail({
+  rec,
+  baseline,
+}: {
+  rec: TraceRecord
+  baseline: PhaseBaselineRow[] | undefined
+}) {
   return (
     <div className="space-y-3">
       {rec.sessionId && (
@@ -369,6 +379,14 @@ function ExpandedDetail({ rec }: { rec: TraceRecord }) {
         ) : (
           rec.attempts.map((a) => <AttemptRow key={a.attempt} a={a} />)
         )}
+      </div>
+      <div className="mt-3 text-[13px] font-medium text-muted-foreground">流生命周期</div>
+      <div className="mt-2">
+        <TracePhaseLane
+          phases={rec.phases ?? []}
+          proxyUrl={rec.attempts[rec.attempts.length - 1]?.proxyUrl}
+          baseline={baseline}
+        />
       </div>
     </div>
   )
@@ -555,6 +573,7 @@ export function TraceLogPage() {
     offset: page * PAGE_SIZE,
   }
   const { data, isLoading, isFetching, refetch } = useTraces(query)
+  const { data: baseline } = usePhaseBaseline(24)
   const records = data?.records ?? []
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
@@ -624,7 +643,7 @@ export function TraceLogPage() {
                 </thead>
                 <tbody>
                   {records.map((rec) => (
-                    <TraceRow key={rec.traceId} rec={rec} />
+                    <TraceRow key={rec.traceId} rec={rec} baseline={baseline} />
                   ))}
                 </tbody>
               </table>

@@ -1323,6 +1323,22 @@ pub async fn list_traces(
                     })
                 })
                 .collect();
+            // 流生命周期分段；非流式请求为空数组（前端据此渲染「非流式请求，无流生命周期分段」）
+            let phases: Vec<serde_json::Value> = r
+                .phases
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "seq": p.seq,
+                        "phase": p.phase,
+                        "startedMs": p.started_ms,
+                        "durationMs": p.duration_ms,
+                        "outcome": p.outcome,
+                        "bytes": p.bytes,
+                        "detail": p.detail,
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "traceId": r.trace_id,
                 "ts": r.ts,
@@ -1348,6 +1364,7 @@ pub async fn list_traces(
                 "firstTokenMs": r.first_token_ms,
                 "sessionId": r.session_id,
                 "attempts": attempts,
+                "phases": phases,
             })
         })
         .collect();
