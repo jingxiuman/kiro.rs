@@ -1,0 +1,19 @@
+src/admin/trace_db.rs
+  s_2213ae2063357a::t_7a42b33e1add0b 229-230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "cf584c414e6e0bc3b1675c640063021b88bfa255",
+  "prompts": {},
+  "sessions": {
+    "s_2213ae2063357a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4ebbe863-4b82-43a3-aea4-ab0f02ce26dc",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
