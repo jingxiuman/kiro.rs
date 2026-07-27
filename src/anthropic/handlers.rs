@@ -568,6 +568,25 @@ pub(super) fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
+    // 上游临时过载（AWS Kiro：500 MODEL_TEMPORARILY_UNAVAILABLE / "high load"）。
+    // provider 已按瞬态错误重试 4 次仍失败。映射为 529 overloaded_error 而非 502：
+    // 529 是 Anthropic 语义的"过载"，上游网关/客户端据此走"退避重试 / 切换账号"，
+    // 而 502(bad gateway) 常被判为"该上游坏了"，反而放大故障转移。
+    if err_str.contains("MODEL_TEMPORARILY_UNAVAILABLE")
+        || err_str.contains("high load")
+    {
+        tracing::warn!(error = %err, "上游临时过载（映射为 529 overloaded_error）");
+        let status = StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+        return (
+            status,
+            Json(ErrorResponse::new(
+                "overloaded_error",
+                "Upstream model temporarily unavailable due to high load. Retry later.",
+            )),
+        )
+            .into_response();
+    }
+
     tracing::error!("Kiro API 调用失败: {}", err);
     (
         StatusCode::BAD_GATEWAY,
@@ -2025,6 +2044,19 @@ mod tests {
             "ValidationException: transient backend issue".to_string()
         ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn upstream_overload_maps_to_529_overloaded_error() {
+        // AWS Kiro 高负载：500 MODEL_TEMPORARILY_UNAVAILABLE → 529（而非 502），
+        // 便于上游网关识别为过载并退避/切换账号。
+        let resp = map_provider_error(anyhow::anyhow!(
+            "流式 API 请求失败: 500 Internal Server Error \
+             {\"message\":\"Encountered unexpectedly high load when processing the request, please try again.\",\
+             \"reason\":\"MODEL_TEMPORARILY_UNAVAILABLE\"}"
+                .to_string()
+        ));
+        assert_eq!(resp.status().as_u16(), 529);
     }
 
     #[test]
