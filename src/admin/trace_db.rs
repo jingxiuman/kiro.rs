@@ -41,7 +41,7 @@ pub struct TraceAttempt {
     pub error_snippet: Option<String>,
     /// 本跳耗时（毫秒）
     pub duration_ms: u64,
-    /// 本跳实际使用的出口代理 URL；None = 直连
+    /// 本跳出口：`"direct"` = 直连；`None` = 未知（该列存在前的历史行）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
 }
@@ -1091,5 +1091,34 @@ mod tests {
         let out = truncate_snippet(&long).unwrap();
         assert!(out.ends_with("…(truncated)"));
         assert!(out.len() <= ERROR_SNIPPET_MAX + 20);
+    }
+
+    #[test]
+    fn proxy_url_tri_state() {
+        let store = mem_store();
+        let mut rec = sample(TraceSample {
+            trace_id: "t-tri",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        });
+        // 第 0 跳：走代理；第 1 跳：真直连（字面量 direct）
+        rec.attempts[0].proxy_url = Some("socks5://p1:1080".to_string());
+        rec.attempts[1].proxy_url = Some("direct".to_string());
+        store.insert(&rec);
+
+        let out = store.query(&TraceQuery {
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(
+            out[0].attempts[0].proxy_url.as_deref(),
+            Some("socks5://p1:1080")
+        );
+        assert_eq!(
+            out[0].attempts[1].proxy_url.as_deref(),
+            Some("direct"),
+            "真直连必须写成字面量 direct，不能塌陷成 NULL"
+        );
     }
 }

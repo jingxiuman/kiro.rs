@@ -887,7 +887,14 @@ impl KiroProvider {
             outcome: outcome.to_string(),
             error_snippet: error_body.and_then(truncate_snippet),
             duration_ms: started.elapsed().as_millis() as u64,
-            proxy_url: proxy_url.map(|s| s.to_string()),
+            // 直连落库为字面量 direct；NULL 只保留给「该列存在前的历史行」= 未知。
+            // 注意：仅在此处映射。上游 proxy_url 的 Option 语义还被 OpsRuntime
+            // 的代理健康统计消费，在那里 None 必须继续表示「无代理可罚」。
+            proxy_url: Some(
+                proxy_url
+                    .unwrap_or(crate::kiro::model::credentials::KiroCredentials::PROXY_DIRECT)
+                    .to_string(),
+            ),
         });
     }
 
@@ -1049,5 +1056,43 @@ mod rate_limit_tests {
     fn current_acquire_rate_limit_is_detected_before_outer_retry() {
         let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
         assert!(is_rate_limit_error(&error));
+    }
+}
+
+#[cfg(test)]
+mod emit_attempt_tests {
+    use super::*;
+    use crate::admin::trace_db::{TraceAttempt, TraceSink};
+    use parking_lot::Mutex;
+    use std::time::Instant;
+
+    struct CollectSink(Mutex<Vec<TraceAttempt>>);
+
+    impl TraceSink for CollectSink {
+        fn on_attempt(&self, attempt: TraceAttempt) {
+            self.0.lock().push(attempt);
+        }
+    }
+
+    #[test]
+    fn emit_attempt_maps_none_proxy_to_direct_literal() {
+        let sink = CollectSink(Mutex::new(Vec::new()));
+        KiroProvider::emit_attempt(
+            Some(&sink),
+            0,
+            7,
+            "ide",
+            Some(200),
+            crate::admin::trace_db::outcome::SUCCESS,
+            None,
+            Instant::now(),
+            None, // 直连
+        );
+        let got = sink.0.lock();
+        assert_eq!(
+            got[0].proxy_url.as_deref(),
+            Some("direct"),
+            "直连必须落库为 direct 字面量，NULL 只留给历史行"
+        );
     }
 }

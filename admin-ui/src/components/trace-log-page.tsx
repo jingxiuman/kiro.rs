@@ -153,6 +153,23 @@ const ERROR_TYPE_OPTIONS = [
   { value: 'unknown', label: '未知' },
 ]
 
+/** 出口三态：direct = 直连；null/undefined = 未知（该列存在前的历史行）；其余 = 代理 URL */
+function ProxyLabel({ url }: { url?: string | null }) {
+  if (url == null) {
+    return (
+      <span className="font-mono text-[12px] text-muted-foreground/60" title="该记录早于出口埋点，真实出口不可知">
+        未知
+      </span>
+    )
+  }
+  const text = url === 'direct' ? '直连' : url
+  return (
+    <span className="max-w-[220px] truncate font-mono text-[12px]" title={text}>
+      {text}
+    </span>
+  )
+}
+
 /** 单跳明细行 */
 function AttemptRow({ a }: { a: TraceAttempt }) {
   const style = outcomeStyle(a.outcome)
@@ -167,9 +184,7 @@ function AttemptRow({ a }: { a: TraceAttempt }) {
         <span className="text-muted-foreground">HTTP</span>
         <span className="font-mono">{a.httpStatus ?? '—'}</span>
         <span className="text-muted-foreground">出口</span>
-        <span className="max-w-[220px] truncate font-mono text-[12px]" title={a.proxyUrl ?? '直连'}>
-          {a.proxyUrl ?? '直连'}
-        </span>
+        <ProxyLabel url={a.proxyUrl} />
         <span className="ml-auto font-mono text-muted-foreground">
           {formatDuration(a.durationMs)}
         </span>

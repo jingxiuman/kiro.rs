@@ -479,7 +479,7 @@ export interface TraceAttempt {
   /** 上游错误体片段（已截断） */
   errorSnippet: string | null
   durationMs: number
-  /** 本跳实际使用的出口代理 URL；null/undefined = 直连 */
+  /** 本跳出口：'direct' = 直连；null/undefined = 未知（该列存在前的历史行）；其余为代理 URL */
   proxyUrl?: string | null
 }
 
