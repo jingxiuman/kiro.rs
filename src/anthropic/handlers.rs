@@ -130,6 +130,8 @@ pub(crate) struct RequestTracer {
     key_source: TraceKeySource,
     model: String,
     is_stream: bool,
+    /// Claude Code 会话 id（metadata.user_id 的 `_session_<uuid>`），可为 None
+    session_id: Option<String>,
     started_at: Instant,
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
@@ -161,6 +163,17 @@ struct RequestTraceOptions {
     key_ctx: KeyContext,
     model: String,
     is_stream: bool,
+    session_id: Option<String>,
+}
+
+/// 从请求 metadata.user_id 提取 Claude Code 会话 id（`_session_<uuid>`）。
+/// 无 metadata / 非该格式时返回 None。
+fn session_id_of(payload: &super::types::MessagesRequest) -> Option<String> {
+    payload
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .and_then(super::cache_metering::extract_session_id)
 }
 
 impl RequestTracer {
@@ -173,6 +186,7 @@ impl RequestTracer {
             key_source: options.key_ctx.key_source,
             model: options.model,
             is_stream: options.is_stream,
+            session_id: options.session_id,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
@@ -259,6 +273,7 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
+            session_id: self.session_id.clone(),
             attempts,
             phases,
         };
@@ -773,6 +788,7 @@ pub async fn post_messages(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
+                session_id: session_id_of(&payload),
             },
         ));
         handle_stream_request(
@@ -799,6 +815,7 @@ pub async fn post_messages(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
+                session_id: session_id_of(&payload),
             },
         ));
         handle_non_stream_request(
@@ -1688,6 +1705,7 @@ pub async fn post_messages_cc(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
+                session_id: session_id_of(&payload),
             },
         ));
         handle_stream_request_buffered(
@@ -1714,6 +1732,7 @@ pub async fn post_messages_cc(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
+                session_id: session_id_of(&payload),
             },
         ));
         handle_non_stream_request(
@@ -2533,6 +2552,7 @@ mod tracer_tests {
             key_source: TraceKeySource::MasterApiKey,
             model: "m".to_string(),
             is_stream: true,
+            session_id: None,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
@@ -2818,6 +2838,7 @@ mod tracer_tests {
             key_source: TraceKeySource::MasterApiKey,
             model: "m".to_string(),
             is_stream: true,
+            session_id: None,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),

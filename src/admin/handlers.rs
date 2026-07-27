@@ -1346,6 +1346,7 @@ pub async fn list_traces(
                 "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
                 "credits": r.credits,
                 "firstTokenMs": r.first_token_ms,
+                "sessionId": r.session_id,
                 "attempts": attempts,
             })
         })
@@ -1793,4 +1794,16 @@ pub async fn ops_events(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100);
     Json(ops.events().recent_events(limit)).into_response()
+}
+
+/// GET /api/admin/ops/phase-baseline?hours=24
+/// 按 (段, 出口) 的窗口失败率——错误详情里对照「这个出口平时就这样吗」的基线
+pub async fn ops_phase_baseline(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(ops) = state.service.ops() else {
+        return ops_unavailable();
+    };
+    Json(ops.events().phase_baseline(parse_ops_hours(&params))).into_response()
 }

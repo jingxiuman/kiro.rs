@@ -518,6 +518,8 @@ export interface TraceRecord {
   credits?: number
   /** 首 Token 延迟（毫秒，仅流式有值） */
   firstTokenMs?: number | null
+  /** Claude Code 会话 id（metadata.user_id 的 _session_<uuid>）；同一 Key 上区分会话/子代理 */
+  sessionId?: string | null
   attempts: TraceAttempt[]
 }
 

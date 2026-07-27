@@ -331,6 +331,24 @@ function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
 function ExpandedDetail({ rec }: { rec: TraceRecord }) {
   return (
     <div className="space-y-3">
+      {rec.sessionId && (
+        <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
+          <span>会话</span>
+          <span
+            className="cursor-pointer font-mono text-foreground/80"
+            title={`完整会话 id: ${rec.sessionId}（点击复制）`}
+            onClick={() => {
+              navigator.clipboard?.writeText(rec.sessionId ?? '')
+              toast.success('已复制会话 id')
+            }}
+          >
+            {rec.sessionId.slice(0, 8)}
+          </span>
+          <span className="text-muted-foreground/60">
+            —— compact 前后对比此 id 是否变化，可判断是否换了会话
+          </span>
+        </div>
+      )}
       {rec.errorMessage && (
         <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[13px] text-destructive">
           {rec.errorMessage}

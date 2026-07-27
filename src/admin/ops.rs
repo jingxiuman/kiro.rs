@@ -480,6 +480,57 @@ impl OpsStore {
         out.sort_by(|a, b| b.attempts.cmp(&a.attempts));
         out
     }
+
+    /// 按 (段, 出口) 统计窗口内的失败率。
+    /// 出口取该 trace 最后一跳的 proxy_url —— 流生命周期发生在最终成功建连的那一跳上。
+    pub fn phase_baseline(&self, hours: i64) -> Vec<PhaseBaselineRow> {
+        let cutoff = Self::window_cutoff(hours);
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT p.phase, \
+                    COALESCE((SELECT a.proxy_url FROM trace_attempts a \
+                              WHERE a.trace_id = p.trace_id \
+                              ORDER BY a.attempt DESC LIMIT 1), '') AS proxy, \
+                    COUNT(*) AS total, \
+                    SUM(CASE WHEN p.outcome NOT IN ('success', 'client_disconnected') THEN 1 ELSE 0 END) AS failed \
+             FROM trace_phases p \
+             JOIN traces t ON t.trace_id = p.trace_id \
+             WHERE t.ts_epoch >= ?1 \
+             GROUP BY p.phase, proxy",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("phase_baseline 查询失败: {}", e);
+                return Vec::new();
+            }
+        };
+        let rows = stmt.query_map([cutoff], |row| {
+            Ok(PhaseBaselineRow {
+                phase: row.get(0)?,
+                proxy_url: row.get(1)?,
+                total: row.get::<_, i64>(2)? as u64,
+                failed: row.get::<_, i64>(3)? as u64,
+            })
+        });
+        match rows {
+            Ok(r) => r.filter_map(|x| x.ok()).collect(),
+            Err(e) => {
+                tracing::warn!("phase_baseline 读取失败: {}", e);
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// 某段 × 某出口的窗口失败率，用于错误详情里的对照基线
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseBaselineRow {
+    pub phase: String,
+    /// 出口：'direct' = 直连；'' = 未知（该列存在前的历史行）
+    pub proxy_url: String,
+    pub total: u64,
+    pub failed: u64,
 }
 
 const EVENTS_SCHEMA: &str = "
@@ -684,6 +735,18 @@ mod tests {
             .unwrap();
     }
 
+    fn insert_phase(store: &OpsStore, trace_id: &str, seq: u32, phase: &str, outcome: &str) {
+        store
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO trace_phases (trace_id, seq, phase, started_ms, duration_ms, outcome) \
+                 VALUES (?1, ?2, ?3, 0, 100, ?4)",
+                rusqlite::params![trace_id, seq as i64, phase, outcome],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn events_roundtrip_and_cleanup() {
         let store = mem_store_with_traces();
@@ -758,5 +821,48 @@ mod tests {
         assert_eq!(c5.interrupted, 1);
         assert_eq!(c5.error, 1);
         assert_eq!(c5.auth_failed, 1);
+    }
+
+    #[test]
+    fn phase_baseline_groups_by_phase_and_proxy() {
+        let store = mem_store_with_traces();
+        // 出口 A：3 条 streaming，其中 1 条中断
+        for (i, oc) in ["success", "success", "stream_interrupted"].iter().enumerate() {
+            let id = format!("a{}", i);
+            insert_trace(&store, &id, 60, "success", None, 1, 100);
+            insert_attempt(&store, &id, "success", 1, Some("socks5://a:1080"));
+            insert_phase(&store, &id, 0, "streaming", oc);
+        }
+        // 出口 B：1 条 streaming，全成功
+        insert_trace(&store, "b0", 60, "success", None, 2, 100);
+        insert_attempt(&store, "b0", "success", 2, Some("socks5://b:1080"));
+        insert_phase(&store, "b0", 0, "streaming", "success");
+
+        let rows = store.phase_baseline(24);
+        let a = rows
+            .iter()
+            .find(|r| r.phase == "streaming" && r.proxy_url == "socks5://a:1080")
+            .expect("应有出口 A 的 streaming 行");
+        assert_eq!(a.total, 3);
+        assert_eq!(a.failed, 1);
+
+        let b = rows
+            .iter()
+            .find(|r| r.phase == "streaming" && r.proxy_url == "socks5://b:1080")
+            .expect("应有出口 B 的 streaming 行");
+        assert_eq!(b.failed, 0);
+    }
+
+    #[test]
+    fn client_disconnect_not_counted_as_failure_in_baseline() {
+        let store = mem_store_with_traces();
+        insert_trace(&store, "c0", 60, "success", None, 1, 100);
+        insert_attempt(&store, "c0", "success", 1, Some("socks5://a:1080"));
+        insert_phase(&store, "c0", 0, "streaming", "client_disconnected");
+
+        let rows = store.phase_baseline(24);
+        let row = rows.iter().find(|r| r.phase == "streaming").unwrap();
+        assert_eq!(row.failed, 0, "客户端断开不是故障，不得计入失败率");
+        assert_eq!(row.total, 1, "但仍计入总数");
     }
 }
