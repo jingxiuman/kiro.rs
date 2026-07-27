@@ -1,0 +1,55 @@
+src/admin/handlers.rs
+  s_2213ae2063357a::t_5164b0deb512c4 1322
+src/anthropic/handlers.rs
+  s_2213ae2063357a::t_987f8febc9174e 1694-1697,1699,1702-1706,1713
+  s_2213ae2063357a::t_888ae2d5c91cd5 1189-1190
+  s_2213ae2063357a::t_47951324a0962a 818-819
+  s_2213ae2063357a::t_25a49a0f7572d0 954-955,963-964
+  s_2213ae2063357a::t_ee534c6945c409 841-844,846,849-853,860-861
+  s_2213ae2063357a::t_4395c82540f176 1104,1106,1109,1112-1116
+  s_2213ae2063357a::t_a24324c77373cb 719-726,732-741
+  s_2213ae2063357a::t_e6e115711563b8 1659
+src/anthropic/stream.rs
+  s_2213ae2063357a::t_d66a962dee938a 1442-1447
+  s_2213ae2063357a::t_a7eb37d4ddda84 2655-2659
+  s_2213ae2063357a::t_c2f718fed485a6 923-929
+src/admin/proxy_pool.rs
+  s_2213ae2063357a::t_75150b68b7bae4 13
+  s_2213ae2063357a::t_7afae173ec358f 392-409
+  s_2213ae2063357a::t_4f6d36943c6132 114-116
+  s_2213ae2063357a::t_2e900ffd846cdd 157
+  s_2213ae2063357a::t_6f5eeba4a6a61a 512-513,524,530-531,535
+src/kiro/provider.rs
+  s_2213ae2063357a::t_82d49e9181dbca 564-568
+  s_2213ae2063357a::t_615874d45bd10e 590-592
+src/admin/trace_db.rs
+  s_2213ae2063357a::t_14477cb7bfbb67 147-148,150-152
+admin-ui/src/components/ops-page.tsx
+  s_2213ae2063357a::t_d133e561785111 48
+src/main.rs
+  s_2213ae2063357a::t_ba8e9c37391af9 169-172,174-193,196-199
+admin-ui/src/components/trace-log-page.tsx
+  s_2213ae2063357a::t_37865eceddfdcc 152
+  s_2213ae2063357a::t_390ff10a8f272e 72-73
+  s_2213ae2063357a::t_35d0c06aa359c0 169-172
+src/admin/mod.rs
+  s_2213ae2063357a::t_8999b29639329d 42
+src/admin/service.rs
+  s_2213ae2063357a::t_88e7fe7858632f 2643,2648-2651,2665-2670
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "3958720d4643760cbaed06936762ac9ffaff80a5",
+  "prompts": {},
+  "sessions": {
+    "s_2213ae2063357a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4ebbe863-4b82-43a3-aea4-ab0f02ce26dc",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
