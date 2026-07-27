@@ -1,0 +1,21 @@
+admin-ui/src/components/ops-page.tsx
+  s_b2a249ac7d536c::t_df5614d56f6314 385-485
+  s_b2a249ac7d536c::t_11c8a23b31116e 599
+  s_b2a249ac7d536c::t_0d5f0f7e09a77d 30-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "944babe09018f9e7c3df187b6c1a441e10a91221",
+  "prompts": {},
+  "sessions": {
+    "s_b2a249ac7d536c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1dfe9aa-e54c-4dc3-b526-fc877a1bbd03",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
