@@ -271,11 +271,19 @@ impl TraceSink for RequestTracer {
     }
 }
 
-/// 挂在流状态里的哨兵：流被 drop 而未显式 disarm 时，说明客户端提前断开。
+/// 挂在流状态里的哨兵：流被 drop 而未经由终态方法收尾时，说明客户端提前断开。
 ///
 /// 需要它的原因：客户端断开时 axum 直接 drop response body，unfold 的
 /// `None` 分支永不执行，`finalize` 也就永不调用——该请求会在 traces 里完全消失。
 /// Drop 是唯一能观测到这件事的位置。
+///
+/// **方向性风险与防线**：`armed` 默认 `true`——任何未经解释的 drop 都会被记成
+/// `client_disconnected`。这是刻意的：判定必须"宁可冤枉（错记成客户端断开），
+/// 不可漏放（把真实的上游故障悄悄吞掉、代理逃过追责）"。防线是两个按值消费的
+/// 终态方法 `into_completed` / `into_upstream_error`——它们各自解除 `armed`
+/// 后再记录真实结果，编译器保证调用后 guard 被移走、`Drop` 变成 no-op。
+/// 未来新增任何"流退出"分支，都必须经过这两个方法之一；否则一次遗漏就会把
+/// 真实的上游故障悄悄记成客户端断开。
 pub(crate) struct StreamPhaseGuard {
     tracer: std::sync::Arc<RequestTracer>,
     sent_bytes: u64,
@@ -307,9 +315,30 @@ impl StreamPhaseGuard {
         self.last_chunk_at.elapsed().as_millis() as u64
     }
 
-    /// 正常收尾 / 上游断流已被显式处理，解除哨兵
-    pub fn disarm(&mut self) {
+    /// 流正常结束：按值消费 guard，记 streaming 段成功。
+    pub fn into_completed(mut self, sent_bytes: u64) {
+        self.armed = false; // 先解除，随后的 Drop 成为 no-op
+        self.tracer.close_phase(
+            crate::admin::trace_db::phase::STREAMING,
+            crate::admin::trace_db::outcome::SUCCESS,
+            Some(sent_bytes),
+            None,
+        );
+    }
+
+    /// 上游断流：按值消费 guard，记 stream_interrupted 并写齐三个判别位。
+    pub fn into_upstream_error(mut self, sent_bytes: u64, err: &dyn std::fmt::Display) {
         self.armed = false;
+        let idle_ms = self.idle_ms();
+        self.tracer.close_phase(
+            crate::admin::trace_db::phase::STREAMING,
+            crate::admin::trace_db::outcome::STREAM_INTERRUPTED,
+            Some(sent_bytes),
+            Some(format!(
+                "client_gone=false bytes={} idle_ms={} err={}",
+                sent_bytes, idle_ms, err
+            )),
+        );
     }
 }
 
@@ -2507,6 +2536,19 @@ mod tracer_tests {
             "客户端断开必须与上游断流区分，否则会冤枉代理"
         );
         assert_eq!(got[0].bytes, Some(4096));
+        let detail = got[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("client_gone=true"),
+            "detail 必须带 client_gone 判别位，实际: {detail}"
+        );
+        assert!(
+            detail.contains("idle_ms="),
+            "detail 必须带 idle_ms 判别位，实际: {detail}"
+        );
+        assert!(
+            detail.contains("bytes="),
+            "detail 必须带 bytes 判别位，实际: {detail}"
+        );
     }
 
     #[test]
@@ -2514,12 +2556,42 @@ mod tracer_tests {
         let t = std::sync::Arc::new(detached_tracer());
         t.open_phase(phase::STREAMING);
         {
-            let mut guard = StreamPhaseGuard::new(t.clone(), 4096);
-            guard.disarm(); // 正常收尾时显式解除
+            let guard = StreamPhaseGuard::new(t.clone(), 4096);
+            guard.into_completed(4096); // 正常收尾：按值消费，解除哨兵
         }
-        assert!(
-            t.phases.lock().is_empty(),
+        let got = t.phases.lock();
+        assert_eq!(
+            got.len(),
+            1,
+            "正常收尾应记一段 streaming 成功，而不是空白"
+        );
+        assert_eq!(
+            got[0].outcome,
+            outcome::SUCCESS,
             "正常收尾不得被误记成客户端断开"
+        );
+        assert_eq!(got[0].bytes, Some(4096));
+    }
+
+    #[test]
+    fn upstream_error_does_not_mark_client_disconnect() {
+        let t = std::sync::Arc::new(detached_tracer());
+        t.open_phase(phase::STREAMING);
+        {
+            let guard = StreamPhaseGuard::new(t.clone(), 512);
+            guard.into_upstream_error(512, &"connection reset");
+        }
+        let got = t.phases.lock();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].outcome,
+            outcome::STREAM_INTERRUPTED,
+            "上游断流不得被误记成客户端断开"
+        );
+        let detail = got[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("client_gone=false"),
+            "上游断流的 detail 必须明确 client_gone=false，实际: {detail}"
         );
     }
 }
