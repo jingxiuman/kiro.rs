@@ -271,6 +271,66 @@ impl TraceSink for RequestTracer {
     }
 }
 
+/// 挂在流状态里的哨兵：流被 drop 而未显式 disarm 时，说明客户端提前断开。
+///
+/// 需要它的原因：客户端断开时 axum 直接 drop response body，unfold 的
+/// `None` 分支永不执行，`finalize` 也就永不调用——该请求会在 traces 里完全消失。
+/// Drop 是唯一能观测到这件事的位置。
+pub(crate) struct StreamPhaseGuard {
+    tracer: std::sync::Arc<RequestTracer>,
+    sent_bytes: u64,
+    last_chunk_at: Instant,
+    armed: bool,
+}
+
+impl StreamPhaseGuard {
+    pub fn new(tracer: std::sync::Arc<RequestTracer>, sent_bytes: u64) -> Self {
+        Self {
+            tracer,
+            sent_bytes,
+            last_chunk_at: Instant::now(),
+            armed: true,
+        }
+    }
+
+    /// 更新已发送字节数与最后一个 chunk 的时刻（每个 chunk 后调用）
+    ///
+    /// 本 Task 尚未接入实际流路径（那是 Task 5 的工作），此处暂无调用点。
+    #[allow(dead_code)]
+    pub fn set_bytes(&mut self, sent_bytes: u64) {
+        self.sent_bytes = sent_bytes;
+        self.last_chunk_at = Instant::now();
+    }
+
+    /// 距上一个 chunk 的间隔——区分「突然断」与「先卡死再断」
+    pub fn idle_ms(&self) -> u64 {
+        self.last_chunk_at.elapsed().as_millis() as u64
+    }
+
+    /// 正常收尾 / 上游断流已被显式处理，解除哨兵
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StreamPhaseGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.tracer.close_phase(
+            crate::admin::trace_db::phase::STREAMING,
+            crate::admin::trace_db::outcome::CLIENT_DISCONNECTED,
+            Some(self.sent_bytes),
+            Some(format!(
+                "client_gone=true bytes={} idle_ms={}",
+                self.sent_bytes,
+                self.idle_ms()
+            )),
+        );
+    }
+}
+
 /// 取追踪器里最后一跳的 outcome（用于把 provider 的失败分类提升到 record.error_type）。
 /// 返回 'static str（outcome 常量），无 attempt 时返回 None。
 fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
@@ -2402,5 +2462,64 @@ mod tracer_tests {
         let got = t.phases.lock();
         assert_eq!(got.len(), 1, "只应记录后一个 open 对应的段");
         assert_eq!(got[0].phase, phase::STREAMING);
+    }
+
+    /// 探针：验证 stream 被 drop 时，unfold 状态里的 Drop impl 会执行。
+    /// 这是 `StreamPhaseGuard` 方案的前提——若此断言失败，客户端断开检测需改用其它手段。
+    #[test]
+    fn dropped_unfold_state_runs_drop_impl() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Marker(Arc<AtomicBool>);
+        impl Drop for Marker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let marker = Marker(flag.clone());
+
+        let s = futures::stream::unfold(marker, |m| async move { Some((1u8, m)) });
+        let s = Box::pin(s);
+        drop(s); // 模拟客户端断开：整个 stream 被丢弃
+
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "unfold 状态被 drop 时 Drop impl 应执行；若此断言失败，客户端断开检测需改用其它手段"
+        );
+    }
+
+    #[test]
+    fn client_disconnect_marks_phase_and_does_not_charge_proxy() {
+        let t = std::sync::Arc::new(detached_tracer());
+        t.open_phase(phase::STREAMING);
+        {
+            let _guard = StreamPhaseGuard::new(t.clone(), 4096);
+            // guard 在此作用域结束时 drop —— 模拟客户端断开
+        }
+        let got = t.phases.lock();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].outcome,
+            outcome::CLIENT_DISCONNECTED,
+            "客户端断开必须与上游断流区分，否则会冤枉代理"
+        );
+        assert_eq!(got[0].bytes, Some(4096));
+    }
+
+    #[test]
+    fn normal_completion_does_not_mark_client_disconnect() {
+        let t = std::sync::Arc::new(detached_tracer());
+        t.open_phase(phase::STREAMING);
+        {
+            let mut guard = StreamPhaseGuard::new(t.clone(), 4096);
+            guard.disarm(); // 正常收尾时显式解除
+        }
+        assert!(
+            t.phases.lock().is_empty(),
+            "正常收尾不得被误记成客户端断开"
+        );
     }
 }
