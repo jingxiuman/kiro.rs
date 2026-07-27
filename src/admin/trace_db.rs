@@ -226,6 +226,8 @@ impl TraceStore {
         // WAL：并发读不阻塞写；synchronous=NORMAL：写吞吐与崩溃安全的平衡
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // 同一文件还有 OpsStore（ops_events）这个独立写入方，写锁瞬时冲突时等待而非报错
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
         Self::migrate(&conn)?;
         Ok(Self {
