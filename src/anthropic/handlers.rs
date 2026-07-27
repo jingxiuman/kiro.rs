@@ -6,7 +6,7 @@ use std::time::Instant;
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::admin::trace_db::{
-    SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
+    SharedTraceStore, TraceAttempt, TraceKeySource, TracePhase, TraceRecord, TraceSink, outcome,
 };
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
@@ -133,6 +133,10 @@ pub(crate) struct RequestTracer {
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
+    /// 已关闭的流生命周期段
+    phases: parking_lot::Mutex<Vec<TracePhase>>,
+    /// 当前打开的段：(段名, 起点)
+    open_phase: parking_lot::Mutex<Option<(&'static str, Instant)>>,
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -171,6 +175,8 @@ impl RequestTracer {
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            phases: parking_lot::Mutex::new(Vec::new()),
+            open_phase: parking_lot::Mutex::new(None),
         }
     }
 
@@ -180,6 +186,38 @@ impl RequestTracer {
         if slot.is_none() {
             *slot = Some(Instant::now());
         }
+    }
+
+    /// 打开一个流生命周期段。重复 open 会覆盖前一个未关闭的段（视为埋点漏关，丢弃之）。
+    pub fn open_phase(&self, name: &'static str) {
+        *self.open_phase.lock() = Some((name, Instant::now()));
+    }
+
+    /// 关闭当前段并入队。名字不匹配或未 open 时静默忽略——埋点错误不得影响主流程。
+    pub fn close_phase(
+        &self,
+        name: &'static str,
+        outcome: &str,
+        bytes: Option<u64>,
+        detail: Option<String>,
+    ) {
+        let Some((open_name, started)) = self.open_phase.lock().take() else {
+            return;
+        };
+        if open_name != name {
+            return;
+        }
+        let mut phases = self.phases.lock();
+        let seq = phases.len() as u32;
+        phases.push(TracePhase {
+            seq,
+            phase: name.to_string(),
+            started_ms: started.duration_since(self.started_at).as_millis() as u64,
+            duration_ms: started.elapsed().as_millis() as u64,
+            outcome: outcome.to_string(),
+            bytes,
+            detail,
+        });
     }
 
     /// 组装并落库一条完整链路。store 为 None 时不做任何事。
@@ -193,6 +231,7 @@ impl RequestTracer {
     ) {
         let Some(store) = &self.store else { return };
         let attempts = std::mem::take(&mut *self.attempts.lock());
+        let phases = std::mem::take(&mut *self.phases.lock());
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
         let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
         let first_token_ms = self
@@ -220,8 +259,7 @@ impl RequestTracer {
             credits: usage.credits,
             first_token_ms,
             attempts,
-            // Task 3 起填充：流生命周期分段
-            phases: Vec::new(),
+            phases,
         };
         store.insert(&rec);
     }
@@ -2273,5 +2311,63 @@ mod tests {
             zh.0.error.message, en.0.error.message,
             "两条路由的文案不得合并：客户端可能在匹配其中一份"
         );
+    }
+}
+
+#[cfg(test)]
+mod tracer_tests {
+    use super::*;
+    use crate::admin::trace_db::{outcome, phase};
+
+    /// 构造一个 store 为 None 的 tracer：验证 phase API 在未启用 trace 时不 panic
+    fn detached_tracer() -> RequestTracer {
+        RequestTracer {
+            store: None,
+            trace_id: "t".to_string(),
+            ts: "now".to_string(),
+            key_id: 0,
+            key_source: TraceKeySource::MasterApiKey,
+            model: "m".to_string(),
+            is_stream: true,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+            phases: parking_lot::Mutex::new(Vec::new()),
+            open_phase: parking_lot::Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn phases_accumulate_in_order_with_seq() {
+        let t = detached_tracer();
+        t.open_phase(phase::FIRST_TOKEN);
+        t.close_phase(phase::FIRST_TOKEN, outcome::SUCCESS, Some(0), None);
+        t.open_phase(phase::STREAMING);
+        t.close_phase(phase::STREAMING, outcome::SUCCESS, Some(20211), None);
+        t.open_phase(phase::FINISH);
+        t.close_phase(
+            phase::FINISH,
+            outcome::UPSTREAM_TRUNCATED,
+            Some(20211),
+            Some("buffered 331 bytes".to_string()),
+        );
+
+        let got = t.phases.lock();
+        assert_eq!(got.len(), 3);
+        assert_eq!(
+            got.iter().map(|p| p.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "seq 必须连续递增"
+        );
+        assert_eq!(got[2].outcome, outcome::UPSTREAM_TRUNCATED);
+        assert_eq!(got[2].bytes, Some(20211));
+    }
+
+    #[test]
+    fn close_without_open_is_ignored_not_panic() {
+        let t = detached_tracer();
+        // 异常路径：埋点漏了 open 直接 close，不得 panic、不得写入半截段
+        t.close_phase(phase::STREAMING, outcome::SUCCESS, None, None);
+        assert!(t.phases.lock().is_empty());
     }
 }
