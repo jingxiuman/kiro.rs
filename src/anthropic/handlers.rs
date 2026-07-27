@@ -2370,4 +2370,37 @@ mod tracer_tests {
         t.close_phase(phase::STREAMING, outcome::SUCCESS, None, None);
         assert!(t.phases.lock().is_empty());
     }
+
+    #[test]
+    fn close_with_mismatched_name_is_ignored_and_does_not_wedge_tracer() {
+        let t = detached_tracer();
+        // 异常路径：open 了 A，却拿 B 来 close——名字不匹配，静默忽略，且
+        // open_phase 已经被 .take() 出来丢弃，不会残留一个「一直开着」的段。
+        t.open_phase(phase::FIRST_TOKEN);
+        t.close_phase(phase::STREAMING, outcome::SUCCESS, None, None);
+        assert!(
+            t.phases.lock().is_empty(),
+            "名字不匹配不得写入任何段"
+        );
+
+        // 证明没有被腐蚀：mismatch 之后重新 open/close 仍能正常记录，seq 从 0 开始。
+        t.open_phase(phase::FIRST_TOKEN);
+        t.close_phase(phase::FIRST_TOKEN, outcome::SUCCESS, Some(1), None);
+        let got = t.phases.lock();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].seq, 0, "mismatch 不得腐蚀 seq 计数器");
+    }
+
+    #[test]
+    fn reopen_without_close_discards_previous_open_segment() {
+        let t = detached_tracer();
+        // 文档语义：重复 open 视为埋点漏关，丢弃前一个未关闭的段。
+        t.open_phase(phase::FIRST_TOKEN);
+        t.open_phase(phase::STREAMING);
+        t.close_phase(phase::STREAMING, outcome::SUCCESS, None, None);
+
+        let got = t.phases.lock();
+        assert_eq!(got.len(), 1, "只应记录后一个 open 对应的段");
+        assert_eq!(got[0].phase, phase::STREAMING);
+    }
 }
