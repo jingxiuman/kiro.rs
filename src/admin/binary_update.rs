@@ -23,7 +23,10 @@ use crate::admin::error::AdminServiceError;
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 
 /// GitHub Releases 仓库 owner/repo。
-const GITHUB_REPO: &str = "ZyphrZero/kiro.rs";
+///
+/// 指向本 fork 而非上游：在线更新是「下载 release 二进制原地替换当前 exe」，
+/// 若指向上游，本 fork 的改动（运维模块等）会在下次自动更新时被上游二进制覆盖。
+const GITHUB_REPO: &str = "jingxiuman/kiro.rs";
 
 /// release 包内（解压后）二进制文件名。Linux/macOS 是 `kiro-rs`，
 /// Windows 是 `kiro-rs.exe`。
