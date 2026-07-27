@@ -20,6 +20,7 @@
 - `client_gone` 判定取保守方向：仅在明确检测到客户端断开时判定，其余归上游断。宁可冤枉代理，不可漏放。
 - 新表通过 `SCHEMA` 常量里的 `CREATE TABLE IF NOT EXISTS` 建立。已验证 `TraceStore::open`（`src/admin/trace_db.rs:233`）与 `open_in_memory`（`:245`）均执行 `execute_batch(SCHEMA)`，老库自动补表，**无需改 `migrate()`**。
 - Rust 测试：`cargo test <name> -- --nocapture`。**验证在制品是否可编译用 `cargo test --no-run`，不要用 `cargo build`**（`cargo build` 不编译测试代码，会给假信号）。
+- **本 crate 是 bin-only，没有 lib target。`cargo test --lib` 会直接报 `no library targets found`（已实测）。需要限定 target 时用 `cargo test --bin kiro-rs <name>`。**
 - 前端构建：`cd admin-ui && npm run build`（即 `tsc -b && vite build`）。
 - 每个 Task 结束提交一次。
 
@@ -46,48 +47,12 @@
 那里 `let Some(url) = proxy_url else { return }` 依赖 `None` 表示直连。
 **若在上游改成 `Some("direct")`，代理池会去给一个名叫 "direct" 的不存在代理记失败计数。**
 
-- [ ] **Step 1: 写失败测试**
+> **TDD 节奏说明：** 缺陷在**写入侧**（`emit_attempt` 丢掉了直连信息），所以红灯测试是 Step 1。
+> Step 5 的存储层测试是**回归断言**，不驱动实现——它锁住「存储层不得把 direct 塌陷成 NULL」
+> 这个不变量，防止日后有人在 insert/query 里加「空值归一」之类的好心优化。
+> 按 Step 1→11 顺序执行即可。
 
-在 `src/admin/trace_db.rs` 的 `mod tests` 末尾新增：
-
-```rust
-    #[test]
-    fn proxy_url_tri_state() {
-        let store = mem_store();
-        let mut rec = sample(TraceSample {
-            trace_id: "t-tri",
-            status: "success",
-            credential_id: 5,
-            model: "m1",
-        });
-        // 第 0 跳：走代理；第 1 跳：真直连（字面量 direct）
-        rec.attempts[0].proxy_url = Some("socks5://p1:1080".to_string());
-        rec.attempts[1].proxy_url = Some("direct".to_string());
-        store.insert(&rec);
-
-        let out = store.query(&TraceQuery {
-            limit: 50,
-            ..Default::default()
-        });
-        assert_eq!(
-            out[0].attempts[0].proxy_url.as_deref(),
-            Some("socks5://p1:1080")
-        );
-        assert_eq!(
-            out[0].attempts[1].proxy_url.as_deref(),
-            Some("direct"),
-            "真直连必须写成字面量 direct，不能塌陷成 NULL"
-        );
-    }
-```
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `cargo test proxy_url_tri_state -- --nocapture`
-Expected: 此步骤应当 **PASS**——因为它只测存储层往返，存储层本就透传。
-若 PASS，说明存储层无需改动，缺口在写入侧。**继续 Step 3，不要跳过。**
-
-- [ ] **Step 3: 写写入侧的失败测试**
+- [ ] **Step 1: 写失败测试（红灯）**
 
 在 `src/kiro/provider.rs` 文件末尾（若无 `mod tests` 则新建）：
 
@@ -131,12 +96,12 @@ mod emit_attempt_tests {
 }
 ```
 
-- [ ] **Step 4: 运行测试确认失败**
+- [ ] **Step 2: 运行测试确认失败**
 
 Run: `cargo test emit_attempt_maps_none_proxy_to_direct_literal -- --nocapture`
 Expected: FAIL，断言显示 `left: None, right: Some("direct")`
 
-- [ ] **Step 5: 实现映射**
+- [ ] **Step 3: 实现映射**
 
 `src/kiro/provider.rs:888`，把：
 
@@ -157,10 +122,50 @@ Expected: FAIL，断言显示 `left: None, right: Some("direct")`
             ),
 ```
 
-- [ ] **Step 6: 运行测试确认通过**
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cargo test emit_attempt_maps_none_proxy_to_direct_literal -- --nocapture`
+Expected: PASS
+
+- [ ] **Step 5: 补存储层回归断言**
+
+在 `src/admin/trace_db.rs` 的 `mod tests` 末尾新增：
+
+```rust
+    #[test]
+    fn proxy_url_tri_state() {
+        let store = mem_store();
+        let mut rec = sample(TraceSample {
+            trace_id: "t-tri",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        });
+        // 第 0 跳：走代理；第 1 跳：真直连（字面量 direct）
+        rec.attempts[0].proxy_url = Some("socks5://p1:1080".to_string());
+        rec.attempts[1].proxy_url = Some("direct".to_string());
+        store.insert(&rec);
+
+        let out = store.query(&TraceQuery {
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(
+            out[0].attempts[0].proxy_url.as_deref(),
+            Some("socks5://p1:1080")
+        );
+        assert_eq!(
+            out[0].attempts[1].proxy_url.as_deref(),
+            Some("direct"),
+            "真直连必须写成字面量 direct，不能塌陷成 NULL"
+        );
+    }
+```
+
+- [ ] **Step 6: 运行两个测试**
 
 Run: `cargo test emit_attempt -- --nocapture && cargo test proxy_url_tri_state -- --nocapture`
-Expected: 两个都 PASS
+Expected: 两个都 PASS。`proxy_url_tri_state` 本就该通过——它记录不变量，不驱动改动。
 
 - [ ] **Step 7: 确认 ops 侧未被波及**
 
@@ -506,7 +511,7 @@ CREATE INDEX IF NOT EXISTS idx_phases_phase_outcome ON trace_phases(phase, outco
 
 - [ ] **Step 10: 运行全部测试**
 
-Run: `cargo test --lib trace_db -- --nocapture`
+Run: `cargo test --bin kiro-rs trace_db -- --nocapture`
 Expected: `phases_roundtrip`、`cleanup_removes_phases` 与所有既有 trace_db 测试全部 PASS
 
 - [ ] **Step 11: 提交**
@@ -1039,18 +1044,77 @@ Expected: 两个 PASS
 若 `ctx` 只暴露 `tool_json_error_message()` 而无 `tool_json_error()`，
 在 `stream.rs` 里补一个 `pub fn tool_json_error(&self) -> Option<&ToolJsonAccumulatorError> { self.tool_json_error.as_ref() }`。
 
-- [ ] **Step 6: 缓冲流接线**
+- [ ] **Step 6: 抽出共享埋点逻辑**
 
-`create_buffered_sse_stream`（`handlers.rs:1586`）里的等价三处（`mark_first_token` 在 `:1631`，
-`Some(Err(e))` 在 `:1653`），照 Step 5 的同样形状加。
-**照抄而非抽公共函数**——两条路径的状态元组结构不同，强抽会引入不必要的泛型。
+Step 5 的三处埋点会在缓冲流路径上原样重复。**不要照抄**——把三个决策点抽成
+不依赖状态元组形状的自由函数，两条路径各自调用。
 
-- [ ] **Step 7: 全量编译与测试**
+在 `src/anthropic/handlers.rs` 的 `StreamPhaseGuard` 之后新增：
+
+```rust
+/// 首个 chunk 到达：关闭 first_token 段，打开 streaming 段。
+/// 幂等由调用方的 first_chunk 标志保证。
+pub(crate) fn phase_on_first_chunk(tracer: &RequestTracer) {
+    tracer.close_phase(phase::FIRST_TOKEN, outcome::SUCCESS, Some(0), None);
+    tracer.open_phase(phase::STREAMING);
+}
+
+/// 上游断流：关闭 streaming 段，写齐三个判别位。
+pub(crate) fn phase_on_stream_error(
+    tracer: &RequestTracer,
+    sent_bytes: u64,
+    idle_ms: u64,
+    err: &dyn std::fmt::Display,
+) {
+    tracer.close_phase(
+        phase::STREAMING,
+        outcome::STREAM_INTERRUPTED,
+        Some(sent_bytes),
+        Some(format!(
+            "client_gone=false bytes={} idle_ms={} err={}",
+            sent_bytes, idle_ms, err
+        )),
+    );
+}
+
+/// 流正常结束：关闭 streaming 段，再按 tool_use 累积器结果开合 finish 段。
+pub(crate) fn phase_on_stream_end(
+    tracer: &RequestTracer,
+    sent_bytes: u64,
+    tool_json_error: Option<&ToolJsonAccumulatorError>,
+    tool_json_message: Option<String>,
+) {
+    tracer.close_phase(phase::STREAMING, outcome::SUCCESS, Some(sent_bytes), None);
+    tracer.open_phase(phase::FINISH);
+    let finish_outcome = match tool_json_error {
+        Some(err) => crate::anthropic::stream::phase_outcome_for(err),
+        None => outcome::SUCCESS,
+    };
+    tracer.close_phase(
+        phase::FINISH,
+        finish_outcome,
+        Some(sent_bytes),
+        tool_json_message,
+    );
+}
+```
+
+这三个函数只接 `&RequestTracer` 和标量，**与两条路径的状态元组形状无关**，
+所以不需要泛型或 trait object。把 Step 5 里的内联代码替换成对它们的调用。
+
+- [ ] **Step 7: 缓冲流接线**
+
+`create_buffered_sse_stream`（`handlers.rs:1586`）：`mark_first_token` 在 `:1631`、
+`Some(Err(e))` 在 `:1653`。在这两处及流结束处分别调用 Step 6 抽出的
+`phase_on_first_chunk` / `phase_on_stream_error` / `phase_on_stream_end`，
+并同样把 `StreamPhaseGuard` 放进该路径的流状态里。
+
+- [ ] **Step 8: 全量编译与测试**
 
 Run: `cargo test --no-run 2>&1 | tail -5 && cargo test -- --nocapture 2>&1 | tail -20`
 Expected: 编译通过，全部测试 PASS
 
-- [ ] **Step 8: 提交**
+- [ ] **Step 9: 提交**
 
 ```bash
 git add src/anthropic/handlers.rs src/anthropic/stream.rs
