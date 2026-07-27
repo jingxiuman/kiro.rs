@@ -27,7 +27,14 @@ import {
   useOpsProxies,
   useOpsTrend,
 } from '@/hooks/use-ops'
-import type { OpsCredentialRow, OpsEvent, OpsProxyRow, ProxyPoolEntry } from '@/types/api'
+import { useTraces } from '@/hooks/use-traces'
+import type {
+  OpsCredentialRow,
+  OpsEvent,
+  OpsProxyRow,
+  ProxyPoolEntry,
+  TraceRecord,
+} from '@/types/api'
 import { cn, formatNumber } from '@/lib/utils'
 
 const WINDOWS: { label: string; hours: number }[] = [
@@ -375,6 +382,107 @@ function ProxyTable({
   )
 }
 
+/** 最近上游错误：错误内容明细（复用 traces API，逐跳展示错误体与出口代理） */
+function RecentErrorList() {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  // traces API 无时间窗参数，按最近 N 条失败取；与上方窗口统计互补（那边看量，这边看内容）
+  const { data } = useTraces({ onlyFailed: true, limit: 30 })
+  const records = data?.records ?? []
+
+  const toggle = (id: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+
+  return (
+    <Card>
+      <CardContent className="p-4">
+        <div className="mb-3 flex items-center gap-2">
+          <span className="text-sm font-medium">最近上游错误</span>
+          <span className="text-[11px] text-muted-foreground">
+            最近 {records.length} 条失败请求（点击展开每跳错误体与出口）
+          </span>
+        </div>
+        {records.length === 0 ? (
+          <div className="py-6 text-center text-sm text-muted-foreground">暂无失败请求</div>
+        ) : (
+          <div className="space-y-1.5">
+            {records.map((r: TraceRecord) => {
+              const open = expanded.has(r.traceId)
+              return (
+                <div
+                  key={r.traceId}
+                  className="rounded-lg border border-border/50 bg-secondary/30 text-[13px]"
+                >
+                  <button
+                    type="button"
+                    onClick={() => toggle(r.traceId)}
+                    className="flex w-full flex-wrap items-center gap-2 p-2.5 text-left hover:bg-secondary/50"
+                  >
+                    <Badge
+                      variant={
+                        r.errorType === 'stream_interrupted' ||
+                        r.errorType === 'upstream_truncated'
+                          ? 'warning'
+                          : 'destructive'
+                      }
+                    >
+                      {ERROR_TYPE_LABELS[r.errorType ?? ''] ?? r.errorType ?? r.finalStatus}
+                    </Badge>
+                    <span className="font-mono text-[12px] text-muted-foreground">{r.model}</span>
+                    {r.finalCredentialId > 0 && (
+                      <span className="text-[12px] text-muted-foreground">
+                        凭据 #{r.finalCredentialId}
+                        {r.finalEmail ? ` ${r.finalEmail}` : ''}
+                      </span>
+                    )}
+                    <span className="ml-auto shrink-0 font-mono text-[11px] text-muted-foreground">
+                      {formatDuration(r.durationMs)} · {new Date(r.ts).toLocaleString('zh-CN')}
+                    </span>
+                  </button>
+                  <div className="break-all px-2.5 pb-2.5 text-muted-foreground">
+                    {r.errorMessage ?? '（无错误信息）'}
+                  </div>
+                  {open && r.attempts.length > 0 && (
+                    <div className="space-y-1.5 border-t border-border/40 p-2.5">
+                      {r.attempts.map((a) => (
+                        <div key={a.attempt} className="rounded-md bg-background/60 p-2">
+                          <div className="flex flex-wrap items-center gap-2 text-[12px]">
+                            <span className="font-mono text-muted-foreground">#{a.attempt}</span>
+                            <Badge variant="outline">{a.outcome}</Badge>
+                            <span className="text-muted-foreground">
+                              凭据 #{a.credentialId} · HTTP {a.httpStatus ?? '—'}
+                            </span>
+                            <span className="text-muted-foreground">出口</span>
+                            <span
+                              className="max-w-[200px] truncate font-mono"
+                              title={a.proxyUrl ?? '直连'}
+                            >
+                              {a.proxyUrl ?? '直连'}
+                            </span>
+                          </div>
+                          {a.errorSnippet && (
+                            <pre className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-muted-foreground">
+                              {a.errorSnippet}
+                            </pre>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
 /** 自动处置事件列表 */
 function EventList({ events }: { events: OpsEvent[] }) {
   return (
@@ -488,6 +596,7 @@ export function OpsPage() {
 
       <CredentialTable rows={credentials ?? []} />
       <ProxyTable stats={proxies?.stats ?? []} pool={proxies?.pool.proxies ?? []} />
+      <RecentErrorList />
       <EventList events={events ?? []} />
     </div>
   )

@@ -317,7 +317,7 @@ function GithubButton() {
       className="hidden xl:inline-flex"
     >
       <a
-        href="https://github.com/ZyphrZero/kiro.rs"
+        href="https://github.com/jingxiuman/kiro.rs"
         target="_blank"
         rel="noopener noreferrer"
         aria-label="GitHub 仓库"
