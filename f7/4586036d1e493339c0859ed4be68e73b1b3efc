@@ -1,0 +1,106 @@
+src/kiro/model/credentials.rs
+  s_de555678f0c332::t_8d48d4c343def5 309,344
+src/admin/proxy_pool.rs
+  s_3abfacbc70cc70::t_e56fb2b9199c39 325-326,642-643,649-650
+src/anthropic/openai.rs
+  s_de555678f0c332::t_4919011ac1a832 254-255,305-306,475-476
+src/anthropic/metadata.rs
+  s_de555678f0c332::t_a251bf24c6568b 1-41,44-63
+  s_de555678f0c332::t_b484736152f779 42-43
+src/kiro/token_manager.rs
+  s_de555678f0c332::t_4919011ac1a832 1108-1109,1524,2502-2503,2634-2635,2663-2664
+src/anthropic/responses.rs
+  s_de555678f0c332::t_4919011ac1a832 225-226,634-635,740-741
+  s_de555678f0c332::t_a353f74a331d1f 21
+src/anthropic/handlers.rs
+  s_de555678f0c332::t_4919011ac1a832 104-105,1350-1351,1599
+  s_de555678f0c332::t_7c98317614a211 133
+  s_de555678f0c332::t_7f1ca038a359f2 2201-2214
+  s_de555678f0c332::t_a251bf24c6568b 169-170,176
+  s_3abfacbc70cc70::t_8cdc3080e3ab75 2200,2215-2216
+src/admin/usage_stats.rs
+  s_de555678f0c332::t_a353f74a331d1f 506,546
+  s_de555678f0c332::t_4919011ac1a832 77-78,155-156,525-526
+src/admin/ops.rs
+  s_3abfacbc70cc70::t_e56fb2b9199c39 412,482
+src/anthropic/mod.rs
+  s_de555678f0c332::t_a251bf24c6568b 27
+src/token.rs
+  s_de555678f0c332::t_4919011ac1a832 115-116,152
+  s_de555678f0c332::t_a353f74a331d1f 145,153
+src/anthropic/cache_metering.rs
+  s_de555678f0c332::t_4919011ac1a832 127-129
+  s_de555678f0c332::t_a251bf24c6568b 27-28,1272-1276,1278-1281
+  s_de555678f0c332::t_7c98317614a211 534
+  s_de555678f0c332::t_19a9e714e80898 1187-1189,1191,1193
+src/anthropic/model_registry_store.rs
+  s_de555678f0c332::t_a353f74a331d1f 32
+src/anthropic/model_sync.rs
+  s_de555678f0c332::t_4919011ac1a832 358-360
+src/main.rs
+  s_de555678f0c332::t_4919011ac1a832 585-587,617-619
+src/admin/trace_db.rs
+  s_de555678f0c332::t_4919011ac1a832 262-264
+src/anthropic/websearch.rs
+  s_de555678f0c332::t_a47038b450999a 519,524,586
+  s_de555678f0c332::t_a353f74a331d1f 157-158
+  s_de555678f0c332::t_4919011ac1a832 204,263
+src/admin/binary_update.rs
+  s_de555678f0c332::t_4919011ac1a832 204-205
+src/model/config.rs
+  s_de555678f0c332::t_4919011ac1a832 9,11
+  s_de555678f0c332::t_a353f74a331d1f 402
+src/anthropic/stream.rs
+  s_de555678f0c332::t_a353f74a331d1f 772
+  s_de555678f0c332::t_a251bf24c6568b 1309-1312,1430-1434,1512,1524,1526-1527,4770,4787,4796-4798
+  s_de555678f0c332::t_4919011ac1a832 165,341,387,702-703,1744-1745,1786-1787,2034-2035,2333-2334,2336-2337,2427-2428,2626-2628
+  s_de555678f0c332::t_7f1ca038a359f2 2511-2512,4802-4893
+  s_3abfacbc70cc70::t_211d16916bdc1c 4894
+src/kiro/model/usage_limits.rs
+  s_de555678f0c332::t_4919011ac1a832 233-234,259-260
+src/anthropic/websearch_loop.rs
+  s_de555678f0c332::t_4919011ac1a832 222-223
+src/anthropic/model_registry.rs
+  s_de555678f0c332::t_4919011ac1a832 15,18,28,30,661-662
+  s_de555678f0c332::t_a353f74a331d1f 597-598,603
+src/kiro/model/requests/conversation.rs
+  s_de555678f0c332::t_4919011ac1a832 166
+src/anthropic/converter.rs
+  s_de555678f0c332::t_a251bf24c6568b 20
+  s_de555678f0c332::t_4919011ac1a832 157-158,515-516,974-975
+  s_de555678f0c332::t_a353f74a331d1f 1562
+src/anthropic/middleware.rs
+  s_de555678f0c332::t_4919011ac1a832 127-128
+src/kiro/machine_id.rs
+  s_de555678f0c332::t_4919011ac1a832 56-57,62-63,70-71
+src/kiro/auth/social.rs
+  s_de555678f0c332::t_4919011ac1a832 224
+src/admin/service.rs
+  s_3abfacbc70cc70::t_e56fb2b9199c39 316,1084-1085,1181-1182,2045-2046,2416-2417,2426-2427,2430-2431,2434-2435,3111,3114,3118,3120,3373,3674-3675,3680-3681,3686-3687,3692-3693
+src/kiro/endpoint/ide.rs
+  s_de555678f0c332::t_4919011ac1a832 117-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "f74586036d1e493339c0859ed4be68e73b1b3efc",
+  "prompts": {},
+  "sessions": {
+    "s_3abfacbc70cc70": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "734fde98-8bbd-4110-85b1-91cfb2a253fc",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    },
+    "s_de555678f0c332": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa768-08be-74f2-8682-1a57fe550528",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
