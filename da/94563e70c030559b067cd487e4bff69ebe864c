@@ -1,0 +1,19 @@
+docs/superpowers/specs/2026-07-27-upstream-073-absorb-design.md
+  s_3abfacbc70cc70::t_5eb8c8e40edc69 1-86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "da94563e70c030559b067cd487e4bff69ebe864c",
+  "prompts": {},
+  "sessions": {
+    "s_3abfacbc70cc70": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "734fde98-8bbd-4110-85b1-91cfb2a253fc",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
