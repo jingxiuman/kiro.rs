@@ -27,13 +27,12 @@ use uuid::Uuid;
 
 use super::handlers::post_messages;
 use super::middleware::{AppState, KeyContext};
-use super::types::{Message, MessagesRequest, OutputConfig, SystemMessage, Tool};
+use super::types::{
+    DEFAULT_MAX_TOKENS, Message, MessagesRequest, OutputConfig, SystemMessage, Tool,
+};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
-
-/// 未显式给出 max_tokens 时的默认输出上限
-const DEFAULT_MAX_TOKENS: i32 = 32000;
 
 // ============================ 请求类型 ============================
 

@@ -34,8 +34,8 @@ use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext, ToolJsonAccumulatorError};
 use super::types::{
-    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
-    OutputConfig, Thinking,
+    CountTokensRequest, CountTokensResponse, DEFAULT_MAX_TOKENS, ErrorResponse, MessagesRequest,
+    Model, ModelsResponse, OutputConfig, Thinking,
 };
 use super::websearch;
 
@@ -654,6 +654,20 @@ pub async fn get_models() -> impl IntoResponse {
     })
 }
 
+/// 校验 max_tokens：必须为正数
+///
+/// 上游对 `max_tokens <= 0` 会返回难以定位的错误，这里在入口处提前拒绝。
+fn validate_max_tokens(max_tokens: i32) -> Result<(), ErrorResponse> {
+    if max_tokens <= 0 {
+        Err(ErrorResponse::new(
+            "invalid_request_error",
+            "max_tokens must be greater than 0",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
@@ -674,6 +688,9 @@ pub async fn post_messages(
         image_largest_b64_kb = %(img_stats.largest_b64_bytes / 1024),
         "Received POST /v1/messages request"
     );
+    if let Err(error) = validate_max_tokens(payload.max_tokens) {
+        return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+    }
     if img_stats.total_b64_bytes > IMAGE_BUDGET_WARN_BYTES {
         tracing::warn!(
             image_count = %img_stats.count,
@@ -1602,6 +1619,9 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+    if let Err(error) = validate_max_tokens(payload.max_tokens) {
+        return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+    }
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
 
     // 检查 KiroProvider 是否可用
@@ -2571,6 +2591,19 @@ mod tests {
             zh.0.error.message, en.0.error.message,
             "两条路由的文案不得合并：客户端可能在匹配其中一份"
         );
+    }
+
+    /// max_tokens 必须为正数：0 与负数应被拒绝，正数放行。
+    #[test]
+    fn max_tokens_must_be_positive() {
+        assert!(validate_max_tokens(1).is_ok());
+        assert!(validate_max_tokens(DEFAULT_MAX_TOKENS).is_ok());
+
+        let err = validate_max_tokens(0).expect_err("0 必须被拒绝");
+        assert_eq!(err.error.error_type, "invalid_request_error");
+        assert_eq!(err.error.message, "max_tokens must be greater than 0");
+
+        assert!(validate_max_tokens(-1).is_err());
     }
 }
 
