@@ -393,7 +393,13 @@ pub struct ModelTestResponse {
     pub model_id: String,
     /// 注册表解析后真正下发给上游的 ID
     pub resolved_model_id: String,
-    /// 请求名是否被识别为 thinking 变体
+    /// 请求名是否被识别为 thinking 变体。
+    ///
+    /// **只反映名字解析，不代表本次探针请求真的开了 thinking**：探针发的是最小
+    /// 请求体（`additional_model_request_fields: None`、无 system 前缀），而生产
+    /// 链路的 thinking 由 `converter::build_additional_model_request_fields` 与
+    /// system 提示前缀共同决定。所以本端点验证的是「这个模型名能不能打通」，
+    /// 不是「thinking 参数会不会被上游接受」。
     pub thinking: bool,
     /// 本次实际使用的凭据 ID
     pub credential_id: u64,

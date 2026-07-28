@@ -41,7 +41,7 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 ///   未初始化时行为等同于改造前的硬编码模型表。
 #[allow(dead_code)]
 pub fn create_router_with_provider(
-    kiro_provider: Option<KiroProvider>,
+    kiro_provider: Option<std::sync::Arc<KiroProvider>>,
     extract_thinking: bool,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Router {
@@ -60,7 +60,7 @@ pub fn create_router_with_provider(
 /// 创建 Anthropic API 路由（供 main.rs 使用）
 #[allow(clippy::too_many_arguments)]
 pub fn create_router(
-    kiro_provider: Option<KiroProvider>,
+    kiro_provider: Option<std::sync::Arc<KiroProvider>>,
     extract_thinking: bool,
     tool_compatibility_mode: ToolCompatibilityMode,
     client_keys: Option<SharedClientKeyManager>,

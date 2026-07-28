@@ -209,13 +209,18 @@ async fn main() {
         ops_store.clone(),
     ));
 
-    let kiro_provider = KiroProvider::with_proxy(
-        token_manager.clone(),
-        proxy_config.clone(),
-        endpoints,
-        config.default_endpoint.clone(),
-    )
-    .with_ops(ops_runtime.clone());
+    // Arc 共享：Anthropic 路由与 AdminService 必须拿到**同一个** provider 实例，
+    // 否则 Admin 的 POST /models/test 测的就不是生产链路（另起一个 provider 会换掉
+    // client 缓存，账号池状态也不同源）。
+    let kiro_provider = Arc::new(
+        KiroProvider::with_proxy(
+            token_manager.clone(),
+            proxy_config.clone(),
+            endpoints,
+            config.default_endpoint.clone(),
+        )
+        .with_ops(ops_runtime.clone()),
+    );
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -408,7 +413,7 @@ async fn main() {
     );
 
     let anthropic_app = anthropic::create_router(
-        Some(kiro_provider),
+        Some(kiro_provider.clone()),
         config.extract_thinking,
         config.tool_compatibility_mode,
         Some(client_key_manager.clone()),
@@ -445,7 +450,9 @@ async fn main() {
                         Some(model_sync_service.clone()),
                     )
                     // 与调度器共用 holder，见上面 model_sync_settings 的注释。
-                    .with_model_sync_settings(model_sync_settings.clone());
+                    .with_model_sync_settings(model_sync_settings.clone())
+                    // POST /models/test 发真实请求用，与 /v1/messages 同一实例。
+                    .with_kiro_provider(kiro_provider.clone());
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,

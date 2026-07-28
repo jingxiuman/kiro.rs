@@ -34,8 +34,8 @@ use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext, ToolJsonAccumulatorError};
 use super::types::{
-    CountTokensRequest, CountTokensResponse, DEFAULT_MAX_TOKENS, ErrorResponse, MessagesRequest,
-    Model, ModelsResponse, OutputConfig, Thinking,
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
 };
 use super::websearch;
 
@@ -2597,7 +2597,7 @@ mod tests {
     #[test]
     fn max_tokens_must_be_positive() {
         assert!(validate_max_tokens(1).is_ok());
-        assert!(validate_max_tokens(DEFAULT_MAX_TOKENS).is_ok());
+        assert!(validate_max_tokens(super::super::types::DEFAULT_MAX_TOKENS).is_ok());
 
         let err = validate_max_tokens(0).expect_err("0 必须被拒绝");
         assert_eq!(err.error.error_type, "invalid_request_error");
