@@ -1,0 +1,36 @@
+src/admin/service.rs
+  s_3abfacbc70cc70::t_70a31d27df7e41 962,966-967,975-977
+  s_3abfacbc70cc70::t_4d7952f245cae1 978
+src/admin/proxy_pool.rs
+  s_3abfacbc70cc70::t_60ae2170142bd0 277,318,741
+  s_3abfacbc70cc70::t_e4fbeb45481888 26-36
+  s_3abfacbc70cc70::t_d801123109a1cb 142-153
+  s_3abfacbc70cc70::t_0614eb27985e0c 442-447,470,473,475-476,484-545
+  s_3abfacbc70cc70::t_dc4650bc512dd3 766,774,787
+  s_3abfacbc70cc70::t_ed4cad273d06c3 362-363,571-576,580-590,599-601,607-614,616-626,679,715
+  s_3abfacbc70cc70::t_3b59662e41a218 546-547,852-1074
+  s_3abfacbc70cc70::t_3fd9f5df05a3f5 181-184
+  s_3abfacbc70cc70::t_e6b36dfae51262 83-140
+  s_3abfacbc70cc70::t_0a361c81ffd4d8 141,548
+src/admin/ops.rs
+  s_3abfacbc70cc70::t_70a31d27df7e41 38-39,632-644
+  s_3abfacbc70cc70::t_865d13c271bc4e 645-646
+docs/superpowers/specs/2026-07-28-proxy-auto-recovery-design.md
+  s_3abfacbc70cc70::t_846f9976ceef57 99-102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "bbb24313cd09b440b7baa69f6e0b0a75f65e3210",
+  "prompts": {},
+  "sessions": {
+    "s_3abfacbc70cc70": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "734fde98-8bbd-4110-85b1-91cfb2a253fc",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
