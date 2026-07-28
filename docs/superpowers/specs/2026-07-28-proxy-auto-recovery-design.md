@@ -96,7 +96,10 @@ level 0→5m、1→10m、2→20m、3→40m、4→80m、5→160m、6 及以上→
 发生在**自动禁用**时（两条路径共用）：
 
 - `last_recovered_at` 存在且距今 < 24 小时 → `backoff_level += 1`（上次恢复是假的，抖动还在）
-- `last_recovered_at` 不存在，或距今 ≥ 24 小时 → `backoff_level = 1`（独立事件，重新开始数）
+- `last_recovered_at` 不存在，或距今 ≥ 24 小时 → `backoff_level = 0`（独立事件，重新开始数）
+
+置 0 而不是 1：level 0 对应 5 分钟，即「与主检查同频」这个既定参数。若新故障从 level 1
+起步，首次恢复探测要等 10 分钟，与参数表矛盾。
 
 置 `next_probe_at = now + 新档位对应的间隔`。
 

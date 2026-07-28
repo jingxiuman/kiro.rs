@@ -959,16 +959,22 @@ impl AdminService {
                 let started = std::time::Instant::now();
                 let summary = svc.proxy_pool.check_all().await;
                 tracing::info!(
-                    "代理池健康检查完成：健康 {}，异常 {}，本轮自动禁用 {}，耗时 {:.1}s",
+                    "代理池健康检查完成：健康 {}，异常 {}，本轮自动禁用 {}，恢复探测 {}，放回 {}，耗时 {:.1}s",
                     summary.healthy,
                     summary.unhealthy,
                     summary.auto_disabled,
+                    summary.recovery_probed,
+                    summary.newly_recovered.len(),
                     started.elapsed().as_secs_f32()
                 );
                 // 探测触发的自动禁用同样走处置流程：记事件 + 解绑受影响凭据
                 if let Some(ops) = &svc.ops {
                     for (id, url) in &summary.newly_disabled {
                         ops.handle_probe_auto_disable(*id, url);
+                    }
+                    // 放回只记事件，不动凭据绑定（见 handle_probe_auto_recover）
+                    for (id, url) in &summary.newly_recovered {
+                        ops.handle_probe_auto_recover(*id, url);
                     }
                 }
                 tokio::time::sleep(interval).await;

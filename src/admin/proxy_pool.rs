@@ -23,6 +23,17 @@ const MAX_PROXY_PROBE_FAILURES: u32 = 3;
 /// 比探测阈值宽松：真实流量的失败包含上游自身抖动，误伤代价（换绑凭据）也更高。
 const MAX_PROXY_REQUEST_FAILURES: u32 = 5;
 
+/// 恢复探针基础间隔（秒），与主健康检查同频。退避档位 0 即此值。
+const PROXY_RECOVERY_BASE_INTERVAL_SECS: u64 = 300;
+/// 放回账号池所需的连续探测成功次数。
+/// 比禁用阈值（3 次失败）严格：下线宽容、上线严格，一次偶然成功不足以证明恢复。
+const PROXY_RECOVERY_SUCCESSES: u32 = 2;
+/// 恢复探针退避上限（秒，4 小时）。防止坏代理被反复放回祸害生产流量。
+const PROXY_RECOVERY_MAX_INTERVAL_SECS: u64 = 4 * 3600;
+/// 同场故障判定窗口（秒，24 小时）。
+/// 放回后在此窗口内又挂 = 上次恢复是假的，退避档位递增；超出则视为独立故障，档位归零。
+const PROXY_RECOVERY_INCIDENT_WINDOW_SECS: i64 = 24 * 3600;
+
 /// 代理健康状态
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -69,6 +80,77 @@ pub struct ProxyEntry {
     /// 最近一次请求级失败原因（截断）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_request_error: Option<String>,
+    /// 自动恢复探针状态。仅对 `auto_disabled` 的条目有意义。
+    #[serde(default)]
+    pub recovery: RecoveryState,
+}
+
+/// 自动恢复探针的状态。
+///
+/// 单独成结构而不是往 [`ProxyEntry`] 上再摊四个字段：恢复逻辑自成一体，
+/// 独立结构让它能脱离整个 `ProxyPoolManager` 单测。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RecoveryState {
+    /// 连续探测成功次数。放回后清零；中途任何一次失败也清零。
+    pub consecutive_successes: u32,
+    /// 退避档位。探针放回后又在窗口内被自动禁用则递增。
+    pub backoff_level: u32,
+    /// 下次允许探测的时间（RFC3339）。`None` = 立即可探。
+    pub next_probe_at: Option<String>,
+    /// 最近一次被探针放回的时间，用于判定「是不是同一场故障」。
+    pub last_recovered_at: Option<String>,
+}
+
+/// 退避档位对应的探测间隔（秒）。`min(300 × 2^level, 4h)`。
+fn recovery_backoff_secs(level: u32) -> u64 {
+    // level 上界钳制：避免 1u64 << level 在大档位上溢出（档位本身有 4h 封顶，
+    // 但溢出是 UB 级别的问题，不能靠"档位不会涨那么高"来兜）
+    let shift = level.min(32);
+    PROXY_RECOVERY_BASE_INTERVAL_SECS
+        .saturating_mul(1u64 << shift)
+        .min(PROXY_RECOVERY_MAX_INTERVAL_SECS)
+}
+
+/// 自动禁用时装配恢复探针：推进退避档位、安排下次探测。
+///
+/// 两条自动禁用路径（探测失败 / 请求级失败）共用，保证退避语义只有一处实现。
+fn arm_recovery_on_auto_disable(entry: &mut ProxyEntry, now: chrono::DateTime<chrono::Utc>) {
+    let same_incident = entry
+        .recovery
+        .last_recovered_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .is_some_and(|t| {
+            (now - t.with_timezone(&chrono::Utc)).num_seconds() < PROXY_RECOVERY_INCIDENT_WINDOW_SECS
+        });
+    entry.recovery.backoff_level = if same_incident {
+        entry.recovery.backoff_level.saturating_add(1)
+    } else {
+        // 独立故障从 0 起步：level 0 = 基础间隔，即「与主检查同频」这个既定参数
+        0
+    };
+    entry.recovery.consecutive_successes = 0;
+    entry.recovery.next_probe_at = Some(next_probe_at(entry.recovery.backoff_level, now));
+}
+
+/// 按当前退避档位算出下次探测时刻（RFC3339）
+fn next_probe_at(level: u32, now: chrono::DateTime<chrono::Utc>) -> String {
+    (now + chrono::Duration::seconds(recovery_backoff_secs(level) as i64)).to_rfc3339()
+}
+
+/// 该条目本轮是否该做恢复探测。
+///
+/// `next_probe_at` 为 `None`（历史数据没有这个字段，或刚从旧版本升上来）视为立即可探——
+/// 宁可多探一次，也不要因为缺字段让代理永远卡在禁用态。解析失败同理。
+fn recovery_probe_due(entry: &ProxyEntry, now: chrono::DateTime<chrono::Utc>) -> bool {
+    match entry.recovery.next_probe_at.as_deref() {
+        None => true,
+        Some(raw) => match chrono::DateTime::parse_from_rfc3339(raw) {
+            Ok(t) => now >= t.with_timezone(&chrono::Utc),
+            Err(_) => true,
+        },
+    }
 }
 
 fn default_true() -> bool {
@@ -96,6 +178,10 @@ pub struct CheckSummary {
     pub auto_disabled: usize,
     /// 本轮新自动禁用的条目 (id, url)，供上层记事件 / 解绑凭据
     pub newly_disabled: Vec<(u64, String)>,
+    /// 本轮被恢复探针探测的条目数（已自动禁用、且退避时间已到的）
+    pub recovery_probed: usize,
+    /// 本轮被探针放回账号池的条目 (id, url)，供上层记事件
+    pub newly_recovered: Vec<(u64, String)>,
 }
 
 /// 单个代理探测结果
@@ -188,6 +274,7 @@ impl ProxyPoolManager {
             auto_disabled: false,
             request_failures: 0,
             last_request_error: None,
+            recovery: RecoveryState::default(),
         };
         entries.push(entry.clone());
         drop(entries);
@@ -228,6 +315,7 @@ impl ProxyPoolManager {
                 auto_disabled: false,
                 request_failures: 0,
                 last_request_error: None,
+                recovery: RecoveryState::default(),
             };
             entries.push(entry.clone());
             added.push(entry);
@@ -271,6 +359,8 @@ impl ProxyPoolManager {
             entry.consecutive_failures = 0;
             entry.request_failures = 0;
             entry.last_request_error = None;
+            // 人工介入即重置：包括退避档位。管理员手动放回，不应背负历史抖动的惩罚。
+            entry.recovery = RecoveryState::default();
         }
         drop(entries);
         self.persist()?;
@@ -349,8 +439,12 @@ impl ProxyPoolManager {
     /// 将一次探测结果回写到指定条目，并按需触发自动禁用。
     ///
     /// 返回 `(变为不健康, 本次新自动禁用)` 供摘要统计。
-    fn apply_probe_result(entry: &mut ProxyEntry, result: &ProbeResult) -> (bool, bool) {
-        entry.last_checked_at = Some(chrono::Utc::now().to_rfc3339());
+    fn apply_probe_result(
+        entry: &mut ProxyEntry,
+        result: &ProbeResult,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> (bool, bool) {
+        entry.last_checked_at = Some(now.to_rfc3339());
         match result {
             ProbeResult::Ok { latency_ms } => {
                 entry.health = ProxyHealth::Healthy;
@@ -373,14 +467,81 @@ impl ProxyPoolManager {
                 if entry.consecutive_failures >= MAX_PROXY_PROBE_FAILURES && entry.enabled {
                     entry.enabled = false;
                     entry.auto_disabled = true;
+                    arm_recovery_on_auto_disable(entry, now);
                     newly_disabled = true;
                     tracing::error!(
-                        "代理 #{} 连续探测失败 {} 次，已自动禁用",
+                        "代理 #{} 连续探测失败 {} 次，已自动禁用（{}s 后开始恢复探测）",
                         entry.id,
-                        entry.consecutive_failures
+                        entry.consecutive_failures,
+                        recovery_backoff_secs(entry.recovery.backoff_level)
                     );
                 }
                 (true, newly_disabled)
+            }
+        }
+    }
+
+    /// 应用一次**恢复探测**的结果，返回该条目是否在本次被放回账号池。
+    ///
+    /// 与 [`Self::apply_probe_result`] 分开的理由：两者的判据方向相反。在线探测
+    /// 累加失败计数、向下线收敛；恢复探测累加成功计数、向上线收敛。塞进一个函数
+    /// 会变成一堆 `if entry.enabled` 分支，且 `consecutive_failures` 的语义会被
+    /// 两个方向争抢。
+    ///
+    /// 恢复探测**不**触碰 `consecutive_failures`：那是在线探测的账本，
+    /// 一条已经下线的代理再累加它没有意义。
+    fn apply_recovery_probe_result(
+        entry: &mut ProxyEntry,
+        result: &ProbeResult,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        entry.last_checked_at = Some(now.to_rfc3339());
+        match result {
+            ProbeResult::Ok { latency_ms } => {
+                entry.health = ProxyHealth::Healthy;
+                entry.latency_ms = Some(*latency_ms);
+                entry.recovery.consecutive_successes += 1;
+                if entry.recovery.consecutive_successes < PROXY_RECOVERY_SUCCESSES {
+                    tracing::info!(
+                        "代理 #{} 恢复探测成功（{}/{}），未达放回阈值",
+                        entry.id,
+                        entry.recovery.consecutive_successes,
+                        PROXY_RECOVERY_SUCCESSES
+                    );
+                    entry.recovery.next_probe_at =
+                        Some(next_probe_at(entry.recovery.backoff_level, now));
+                    return false;
+                }
+                // 放回：两个失败计数都必须清零。request_failures 不清零的话，
+                // 恢复后第一个真实请求失败就会撞上 MAX_PROXY_REQUEST_FAILURES 的旧值。
+                entry.enabled = true;
+                entry.auto_disabled = false;
+                entry.consecutive_failures = 0;
+                entry.request_failures = 0;
+                entry.last_request_error = None;
+                entry.recovery.consecutive_successes = 0;
+                entry.recovery.next_probe_at = None;
+                entry.recovery.last_recovered_at = Some(now.to_rfc3339());
+                // backoff_level 有意保留：下次再挂时才按 24h 窗口决定升还是归零
+                tracing::info!(
+                    "代理 #{} 连续 {} 次恢复探测成功，已放回账号池",
+                    entry.id,
+                    PROXY_RECOVERY_SUCCESSES
+                );
+                true
+            }
+            ProbeResult::Err { error } => {
+                entry.health = ProxyHealth::Unhealthy;
+                entry.latency_ms = None;
+                entry.recovery.consecutive_successes = 0;
+                entry.recovery.next_probe_at = Some(next_probe_at(entry.recovery.backoff_level, now));
+                tracing::debug!(
+                    "代理 #{} 恢复探测仍失败（{}s 后重试）: {}",
+                    entry.id,
+                    recovery_backoff_secs(entry.recovery.backoff_level),
+                    error
+                );
+                false
             }
         }
     }
@@ -407,13 +568,26 @@ impl ProxyPoolManager {
         }
         let _guard = Guard(&self.check_in_progress);
 
-        // 快照待探测的 (id, url)，避免长时间持锁
-        let targets: Vec<(u64, String)> = self
+        let now = chrono::Utc::now();
+
+        // 快照待探测的 (id, url, 是否恢复探测)，避免长时间持锁。
+        // 两个集合互斥：在线的走 enabled，待恢复的走 auto_disabled && !enabled，
+        // 所以一次并发探测能同时覆盖，不会对同一条目重复探。
+        let targets: Vec<(u64, String, bool)> = self
             .entries
             .lock()
             .iter()
-            .filter(|e| e.enabled)
-            .map(|e| (e.id, e.url.clone()))
+            .filter_map(|e| {
+                if e.enabled {
+                    Some((e.id, e.url.clone(), false))
+                } else if e.auto_disabled && recovery_probe_due(e, now) {
+                    Some((e.id, e.url.clone(), true))
+                } else {
+                    // 用户手动禁用（auto_disabled == false）永不进入恢复探测；
+                    // 退避时间未到的也跳过本轮
+                    None
+                }
+            })
             .collect();
 
         if targets.is_empty() {
@@ -422,24 +596,34 @@ impl ProxyPoolManager {
 
         let probes = targets
             .iter()
-            .map(|(id, url)| async move { (*id, self.probe_one(url).await) });
+            .map(|(id, url, is_recovery)| async move {
+                (*id, *is_recovery, self.probe_one(url).await)
+            });
         let results = futures::future::join_all(probes).await;
 
         let mut summary = CheckSummary::default();
         {
             let mut entries = self.entries.lock();
-            for (id, result) in &results {
-                if let Some(entry) = entries.iter_mut().find(|e| e.id == *id) {
-                    let (unhealthy, newly_disabled) = Self::apply_probe_result(entry, result);
-                    if unhealthy {
-                        summary.unhealthy += 1;
-                    } else {
-                        summary.healthy += 1;
+            for (id, is_recovery, result) in &results {
+                let Some(entry) = entries.iter_mut().find(|e| e.id == *id) else {
+                    continue;
+                };
+                if *is_recovery {
+                    summary.recovery_probed += 1;
+                    if Self::apply_recovery_probe_result(entry, result, now) {
+                        summary.newly_recovered.push((entry.id, entry.url.clone()));
                     }
-                    if newly_disabled {
-                        summary.auto_disabled += 1;
-                        summary.newly_disabled.push((entry.id, entry.url.clone()));
-                    }
+                    continue;
+                }
+                let (unhealthy, newly_disabled) = Self::apply_probe_result(entry, result, now);
+                if unhealthy {
+                    summary.unhealthy += 1;
+                } else {
+                    summary.healthy += 1;
+                }
+                if newly_disabled {
+                    summary.auto_disabled += 1;
+                    summary.newly_disabled.push((entry.id, entry.url.clone()));
                 }
             }
         }
@@ -492,6 +676,7 @@ impl ProxyPoolManager {
             if entry.request_failures >= MAX_PROXY_REQUEST_FAILURES && entry.enabled {
                 entry.enabled = false;
                 entry.auto_disabled = true;
+                arm_recovery_on_auto_disable(entry, chrono::Utc::now());
                 tracing::error!(
                     "代理 #{} 连续 {} 次真实请求失败，已自动禁用",
                     entry.id,
@@ -527,7 +712,7 @@ impl ProxyPoolManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("代理不存在: {}", id))?;
-            let (_, newly_disabled) = Self::apply_probe_result(entry, &result);
+            let (_, newly_disabled) = Self::apply_probe_result(entry, &result, chrono::Utc::now());
             (entry.clone(), newly_disabled)
         };
 
@@ -553,6 +738,7 @@ mod tests {
             auto_disabled: false,
             request_failures: 0,
             last_request_error: None,
+            recovery: RecoveryState::default(),
         }
     }
 
@@ -577,7 +763,7 @@ mod tests {
         };
         // 前两次失败：计数累加，仍启用
         for n in 1..MAX_PROXY_PROBE_FAILURES {
-            let (unhealthy, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &err);
+            let (unhealthy, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &err, chrono::Utc::now());
             assert!(unhealthy);
             assert!(!disabled);
             assert_eq!(entry.consecutive_failures, n);
@@ -585,7 +771,7 @@ mod tests {
             assert!(!entry.auto_disabled);
         }
         // 第 N 次失败：自动禁用
-        let (_, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &err);
+        let (_, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &err, chrono::Utc::now());
         assert!(disabled);
         assert_eq!(entry.consecutive_failures, MAX_PROXY_PROBE_FAILURES);
         assert!(!entry.enabled);
@@ -598,7 +784,7 @@ mod tests {
         entry.consecutive_failures = 2;
         entry.health = ProxyHealth::Unhealthy;
         let ok = ProbeResult::Ok { latency_ms: 123 };
-        let (unhealthy, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &ok);
+        let (unhealthy, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &ok, chrono::Utc::now());
         assert!(!unhealthy);
         assert!(!disabled);
         assert_eq!(entry.consecutive_failures, 0);
@@ -662,5 +848,228 @@ mod tests {
         assert!(e.enabled);
         assert!(!e.auto_disabled);
         assert_eq!(e.consecutive_failures, 0);
+    }
+
+    // ===== 自动恢复探针 =====
+
+    fn auto_disabled_entry(url: &str) -> ProxyEntry {
+        let mut e = make_entry(url);
+        e.enabled = false;
+        e.auto_disabled = true;
+        e.health = ProxyHealth::Unhealthy;
+        e.consecutive_failures = MAX_PROXY_PROBE_FAILURES;
+        e
+    }
+
+    fn ok_probe() -> ProbeResult {
+        ProbeResult::Ok { latency_ms: 42 }
+    }
+
+    fn err_probe() -> ProbeResult {
+        ProbeResult::Err {
+            error: "connect timeout".to_string(),
+        }
+    }
+
+    /// 用户手动禁用的条目（auto_disabled == false）永远不进恢复探测集合。
+    /// 这是「自动下线、人工上线」语义的硬边界：管理员关掉的东西不许自己爬回来。
+    #[test]
+    fn manually_disabled_proxy_is_never_probed_for_recovery() {
+        let mut manual = make_entry("socks5://127.0.0.1:1080");
+        manual.enabled = false;
+        manual.auto_disabled = false;
+
+        // 筛选条件与 check_all 中一致
+        let now = chrono::Utc::now();
+        assert!(
+            !(manual.auto_disabled && recovery_probe_due(&manual, now)),
+            "手动禁用的代理不得进入恢复探测集合"
+        );
+
+        let auto = auto_disabled_entry("socks5://127.0.0.1:1081");
+        assert!(
+            auto.auto_disabled && recovery_probe_due(&auto, now),
+            "自动禁用且未安排过下次探测的代理应立即可探"
+        );
+    }
+
+    /// 连续成功 1 次不放回，第 2 次才放回。
+    #[test]
+    fn recovery_requires_two_consecutive_successes() {
+        let mut e = auto_disabled_entry("socks5://127.0.0.1:1080");
+        let now = chrono::Utc::now();
+
+        assert!(
+            !ProxyPoolManager::apply_recovery_probe_result(&mut e, &ok_probe(), now),
+            "第 1 次成功不得放回"
+        );
+        assert!(!e.enabled, "未达阈值前必须保持禁用");
+        assert_eq!(e.recovery.consecutive_successes, 1);
+        assert!(
+            e.recovery.next_probe_at.is_some(),
+            "未达阈值时要安排下次探测，否则下一轮会被 due 判定挡住或永久卡住"
+        );
+
+        assert!(
+            ProxyPoolManager::apply_recovery_probe_result(&mut e, &ok_probe(), now),
+            "第 2 次成功必须放回"
+        );
+        assert!(e.enabled);
+    }
+
+    /// 中途失败清零成功计数：1 次成功 + 1 次失败 + 1 次成功 ≠ 放回。
+    #[test]
+    fn failed_probe_resets_success_streak() {
+        let mut e = auto_disabled_entry("socks5://127.0.0.1:1080");
+        let now = chrono::Utc::now();
+
+        ProxyPoolManager::apply_recovery_probe_result(&mut e, &ok_probe(), now);
+        assert_eq!(e.recovery.consecutive_successes, 1);
+
+        ProxyPoolManager::apply_recovery_probe_result(&mut e, &err_probe(), now);
+        assert_eq!(e.recovery.consecutive_successes, 0, "失败必须清零连续成功计数");
+
+        assert!(
+            !ProxyPoolManager::apply_recovery_probe_result(&mut e, &ok_probe(), now),
+            "清零后的第 1 次成功不得放回"
+        );
+        assert!(!e.enabled);
+    }
+
+    /// 放回时的完整终态。request_failures 尤其关键：不清零的话恢复后第一个
+    /// 真实请求失败就会撞上 MAX_PROXY_REQUEST_FAILURES 的旧值，立刻又被禁用。
+    #[test]
+    fn recovery_clears_both_failure_counters_and_stamps_time() {
+        let mut e = auto_disabled_entry("socks5://127.0.0.1:1080");
+        e.request_failures = MAX_PROXY_REQUEST_FAILURES;
+        e.last_request_error = Some("stream aborted".to_string());
+        e.recovery.backoff_level = 3;
+        let now = chrono::Utc::now();
+
+        ProxyPoolManager::apply_recovery_probe_result(&mut e, &ok_probe(), now);
+        assert!(ProxyPoolManager::apply_recovery_probe_result(
+            &mut e,
+            &ok_probe(),
+            now
+        ));
+
+        assert!(e.enabled, "必须放回");
+        assert!(!e.auto_disabled, "自动禁用标记必须清除");
+        assert_eq!(e.consecutive_failures, 0);
+        assert_eq!(e.request_failures, 0, "请求级计数必须清零");
+        assert!(e.last_request_error.is_none());
+        assert_eq!(e.recovery.consecutive_successes, 0);
+        assert!(e.recovery.next_probe_at.is_none(), "放回后不该再排探测");
+        assert!(e.recovery.last_recovered_at.is_some(), "必须打放回时间戳");
+        assert_eq!(
+            e.recovery.backoff_level, 3,
+            "退避档位在放回时保留，下次再挂才按 24h 窗口决定升降"
+        );
+    }
+
+    /// 放回后在 24h 窗口内又挂 → 档位递增（上次恢复是假的）。
+    /// 超出窗口 → 档位归零（独立故障，重新按 5 分钟同频起步）。
+    #[test]
+    fn backoff_level_advances_within_incident_window_and_resets_outside() {
+        let now = chrono::Utc::now();
+
+        let mut recent = auto_disabled_entry("socks5://127.0.0.1:1080");
+        recent.recovery.backoff_level = 2;
+        recent.recovery.last_recovered_at =
+            Some((now - chrono::Duration::hours(1)).to_rfc3339());
+        arm_recovery_on_auto_disable(&mut recent, now);
+        assert_eq!(recent.recovery.backoff_level, 3, "窗口内复发必须升档");
+
+        let mut stale = auto_disabled_entry("socks5://127.0.0.1:1081");
+        stale.recovery.backoff_level = 5;
+        stale.recovery.last_recovered_at =
+            Some((now - chrono::Duration::hours(25)).to_rfc3339());
+        arm_recovery_on_auto_disable(&mut stale, now);
+        assert_eq!(stale.recovery.backoff_level, 0, "超窗口视为独立故障，档位归零");
+
+        let mut fresh = auto_disabled_entry("socks5://127.0.0.1:1082");
+        arm_recovery_on_auto_disable(&mut fresh, now);
+        assert_eq!(
+            fresh.recovery.backoff_level, 0,
+            "从未恢复过的代理首次禁用从 0 起步（= 与主检查同频）"
+        );
+    }
+
+    /// 退避间隔翻倍并在 4 小时封顶。
+    #[test]
+    fn backoff_interval_doubles_and_caps() {
+        assert_eq!(recovery_backoff_secs(0), PROXY_RECOVERY_BASE_INTERVAL_SECS);
+        assert_eq!(recovery_backoff_secs(1), 600);
+        assert_eq!(recovery_backoff_secs(2), 1200);
+        assert_eq!(recovery_backoff_secs(5), 9600);
+        assert_eq!(
+            recovery_backoff_secs(6),
+            PROXY_RECOVERY_MAX_INTERVAL_SECS,
+            "第 6 档（19200s）应被 4h 上限压住"
+        );
+        assert_eq!(
+            recovery_backoff_secs(u32::MAX),
+            PROXY_RECOVERY_MAX_INTERVAL_SECS,
+            "极端档位不得溢出，必须落在上限"
+        );
+    }
+
+    /// next_probe_at 未到时本轮跳过；到了才探。
+    #[test]
+    fn recovery_probe_respects_next_probe_at() {
+        let now = chrono::Utc::now();
+        let mut e = auto_disabled_entry("socks5://127.0.0.1:1080");
+
+        e.recovery.next_probe_at = Some((now + chrono::Duration::minutes(3)).to_rfc3339());
+        assert!(!recovery_probe_due(&e, now), "退避时间未到必须跳过");
+
+        e.recovery.next_probe_at = Some((now - chrono::Duration::seconds(1)).to_rfc3339());
+        assert!(recovery_probe_due(&e, now), "退避时间已过必须探测");
+
+        e.recovery.next_probe_at = Some("not-a-timestamp".to_string());
+        assert!(
+            recovery_probe_due(&e, now),
+            "时间戳损坏时宁可多探一次，也不能让代理永久卡在禁用态"
+        );
+    }
+
+    /// 手动启用清空整个恢复状态，包括退避档位——人工介入不该背负历史抖动的惩罚。
+    #[test]
+    fn manual_enable_clears_recovery_state() {
+        let mgr = ProxyPoolManager::new(None, TlsBackend::default());
+        let entry = mgr.add("socks5://127.0.0.1:1080".to_string(), None).unwrap();
+        {
+            let mut entries = mgr.entries.lock();
+            let e = entries.iter_mut().find(|e| e.id == entry.id).unwrap();
+            e.enabled = false;
+            e.auto_disabled = true;
+            e.recovery.backoff_level = 4;
+            e.recovery.consecutive_successes = 1;
+            e.recovery.next_probe_at = Some(chrono::Utc::now().to_rfc3339());
+            e.recovery.last_recovered_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+
+        mgr.set_enabled(entry.id, true).unwrap();
+
+        let e = mgr.list().into_iter().find(|e| e.id == entry.id).unwrap();
+        assert!(e.enabled);
+        assert!(!e.auto_disabled);
+        assert_eq!(
+            e.recovery,
+            RecoveryState::default(),
+            "手动启用必须把恢复状态整体归位，含退避档位"
+        );
+    }
+
+    /// 旧 proxy_pool.json 没有 recovery 字段，必须能反序列化并落到默认值。
+    #[test]
+    fn old_json_without_recovery_field_deserializes() {
+        let json = r#"[{"id":1,"url":"socks5://127.0.0.1:1080","enabled":false,"autoDisabled":true}]"#;
+        let entries: Vec<ProxyEntry> = serde_json::from_str(json).unwrap();
+        assert_eq!(entries[0].recovery, RecoveryState::default());
+        assert!(
+            recovery_probe_due(&entries[0], chrono::Utc::now()),
+            "旧数据没有 next_probe_at，应视为立即可探"
+        );
     }
 }

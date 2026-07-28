@@ -35,6 +35,8 @@ pub mod event_category {
     pub const PROXY_REASSIGN: &str = "proxy_reassign";
     /// 健康检查（探测）触发的代理自动禁用
     pub const PROXY_PROBE_DISABLE: &str = "proxy_probe_disable";
+    /// 恢复探针把自动禁用的代理放回账号池
+    pub const PROXY_AUTO_RECOVER: &str = "proxy_auto_recover";
 }
 
 /// 一条处置/异常事件
@@ -625,6 +627,21 @@ impl OpsRuntime {
             &format!("代理 {} 连续探测失败，已自动禁用", proxy_url),
         );
         self.reassign_after_disable(proxy_url, proxy_id);
+    }
+
+    /// 恢复探针把代理放回账号池后：只记事件。
+    ///
+    /// **不换绑凭据**——当初被 [`Self::reassign_after_disable`] 迁走的凭据留在新代理上。
+    /// 恢复的是「可用性」（重新进入可分配池），不是「谁绑在谁上」。它们已经在新代理上
+    /// 跑得好好的，再搬一次只是多一次扰动。
+    pub fn handle_probe_auto_recover(&self, proxy_id: u64, proxy_url: &str) {
+        tracing::info!("代理 #{} 已通过恢复探测，放回账号池: {}", proxy_id, proxy_url);
+        self.events.record_event(
+            event_category::PROXY_AUTO_RECOVER,
+            "info",
+            &format!("proxy#{}", proxy_id),
+            &format!("代理 {} 连续探测成功，已自动放回账号池（凭据绑定不变）", proxy_url),
+        );
     }
 
     /// 代理被自动禁用后：把绑定它的凭据换绑到池内其它可用代理（无可用则清除、
