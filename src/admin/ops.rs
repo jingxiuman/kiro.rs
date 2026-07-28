@@ -641,7 +641,13 @@ impl OpsRuntime {
         {
             Ok(affected) if affected.is_empty() => {}
             Ok(affected) => {
-                let target = replacement.as_deref().unwrap_or("（无可用代理，回退全局/直连）");
+                let target = replacement.as_deref().unwrap_or(
+                if crate::http_client::require_proxy() {
+                    "（无可用代理；requireProxy 已开启，这些凭据的请求将被拒绝而非裸连）"
+                } else {
+                    "（无可用代理，回退全局/直连）"
+                },
+            );
                 tracing::warn!(
                     "代理 #{} 自动禁用：凭据 {:?} 已换绑到 {}",
                     proxy_id,

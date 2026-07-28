@@ -9,6 +9,7 @@ use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TracePhase, TraceRecord, TraceSink, outcome,
     phase,
 };
+use crate::http_client::describe_reqwest_error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -1048,21 +1049,23 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
+                            // reqwest 把 body 阶段所有失败压成同一句 Display，归因靠 source 链
+                            let detail = describe_reqwest_error(&e);
+                            tracing::error!("读取响应流失败: {}", detail);
                             // 按值消费 guard：本分支已显式处理结局，Drop 不得再判客户端断开。
                             if let Some(g) = guard.take() {
-                                g.into_upstream_error(sent_bytes, &e);
+                                g.into_upstream_error(sent_bytes, &detail);
                             }
                             // 发送最终事件并结束（记为 error）
                             let final_events = ctx.generate_final_events();
                             record_stream_usage(&hook, &ctx, credential_id, "error");
                             // 连接已建立后断流 = 传输链路失败，计入所用代理
-                            report_stream_outcome(&ops_feedback, true, &e.to_string());
+                            report_stream_outcome(&ops_feedback, true, &detail);
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
                             tracer.finalize(
                                 "interrupted",
                                 Some(outcome::STREAM_INTERRUPTED),
-                                Some(&e.to_string()),
+                                Some(&detail),
                                 Some(sent_bytes),
                                 stream_trace_usage(&ctx),
                             );
@@ -1210,14 +1213,15 @@ async fn handle_non_stream_request(
     let body_bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
-            tracing::error!("读取响应体失败: {}", e);
+            let detail = describe_reqwest_error(&e);
+            tracing::error!("读取响应体失败: {}", detail);
             hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
             // 连接已建立后 body 读取失败 = 传输链路失败，计入所用代理
-            report_stream_outcome(&ops_feedback, true, &e.to_string());
+            report_stream_outcome(&ops_feedback, true, &detail);
             tracer.finalize(
                 "interrupted",
                 Some(outcome::STREAM_INTERRUPTED),
-                Some(&e.to_string()),
+                Some(&detail),
                 None,
                 TraceUsage::zero(),
             );
@@ -1918,21 +1922,22 @@ fn create_buffered_sse_stream(
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
+                                let detail = describe_reqwest_error(&e);
+                                tracing::error!("读取响应流失败: {}", detail);
                                 // 按值消费 guard：本分支已显式处理结局，Drop 不得再判客户端断开。
                                 if let Some(g) = guard.take() {
-                                    g.into_upstream_error(sent_bytes, &e);
+                                    g.into_upstream_error(sent_bytes, &detail);
                                 }
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "error");
-                                report_stream_outcome(&ops_feedback, true, &e.to_string());
+                                report_stream_outcome(&ops_feedback, true, &detail);
                                 // 缓冲模式 chunk 读取失败：上游中途断流
                                 tracer.finalize(
                                     "interrupted",
                                     Some(outcome::STREAM_INTERRUPTED),
-                                    Some(&e.to_string()),
+                                    Some(&detail),
                                     Some(sent_bytes),
                                     TraceUsage {
                                         input_tokens: i.max(0) as u64,

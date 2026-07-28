@@ -50,9 +50,13 @@ struct ClientCache {
 }
 
 impl ClientCache {
-    fn new(protected: Option<ProxyConfig>, initial: Client, cap: usize) -> Self {
+    /// `initial` 为 None 表示无法预热（开了 requireProxy 但全局代理为空，
+    /// 各凭据自带代理——此时直连 client 既建不出来也不该建）。
+    fn new(protected: Option<ProxyConfig>, initial: Option<Client>, cap: usize) -> Self {
         let mut map = HashMap::new();
-        map.insert(protected.clone(), initial);
+        if let Some(initial) = initial {
+            map.insert(protected.clone(), initial);
+        }
         Self {
             map,
             order: std::collections::VecDeque::new(),
@@ -140,9 +144,18 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
-        // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）。
+        // 开了 requireProxy 且全局代理为空时预热必然失败——这是合法配置
+        // （代理配在各凭据上），跳过预热即可，不能让启动 panic。
+        let initial_client = match build_client(proxy.as_ref(), 720, tls_backend) {
+            Ok(client) => Some(client),
+            Err(e) if proxy.is_none() && crate::http_client::require_proxy() => {
+                tracing::info!("requireProxy 已开启且未配全局代理，跳过直连 client 预热");
+                let _ = e;
+                None
+            }
+            Err(e) => panic!("创建 HTTP 客户端失败: {}", e),
+        };
         let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
 
         Self {

@@ -362,6 +362,7 @@ Admin API 鉴权同样支持：
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
+| `requireProxy` | `false` | 强制走代理：无可用代理时拒绝出网而非降级直连（见「代理优先级」） |
 | `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
 | `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
@@ -827,6 +828,18 @@ credential.proxyUrl -> config.proxyUrl -> direct
 ```
 
 凭据级 `proxyUrl` 填 `direct` 表示即使配置了全局代理也直连。
+
+#### 强制走代理（`requireProxy`）
+
+默认情况下，链路末端是直连：凭据未配代理则回退全局代理，全局也没有就直连出网。代理池
+自动禁用后若找不到可换绑的代理，受影响凭据同样会落到这条回退路径。这在需要隐藏真实
+出口 IP 的部署里是个隐患——代理挂掉不会中断服务，而是**静默换成裸连**。
+
+`requireProxy: true` 关掉这条回退：`effective_proxy` 为 `None` 的出网一律被拒绝并
+记录原因，包括显式配置的 `"proxyUrl": "direct"`。覆盖所有出网路径（API 调用、token
+刷新、余额与模型查询、登录、版本探测），检查点在 `build_client` 这一唯一出口。
+
+默认关闭，开启前请确认每个凭据都有可用代理，否则服务会拒绝全部请求。
 
 支持：
 
