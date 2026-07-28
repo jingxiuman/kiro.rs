@@ -592,6 +592,15 @@ impl AdminService {
         };
         let now_ts = Utc::now().timestamp() as f64;
 
+        // balanced 模式下 `current_id` 只是内部调度指针（每次请求重新选号），
+        // 不存在「当前活跃账号」这个概念；对外暴露它等于显示假信息。
+        // 固定为 0，与「无当前凭据」的既有取值（凭据全空时的初值）一致。
+        let exposed_current_id = if self.token_manager.get_load_balancing_mode() == "balanced" {
+            0
+        } else {
+            snapshot.current_id
+        };
+
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
@@ -608,7 +617,7 @@ impl AdminService {
                     disabled: entry.disabled,
                     failure_count: entry.failure_count,
                     total_failure_count: entry.total_failure_count,
-                    is_current: entry.id == snapshot.current_id,
+                    is_current: exposed_current_id != 0 && entry.id == exposed_current_id,
                     expires_at: entry.expires_at,
                     auth_method: entry.auth_method,
                     provider: entry.provider,
@@ -638,7 +647,7 @@ impl AdminService {
         CredentialsStatusResponse {
             total: snapshot.total,
             available: snapshot.available,
-            current_id: snapshot.current_id,
+            current_id: exposed_current_id,
             credentials,
         }
     }
@@ -4711,5 +4720,74 @@ mod tests {
         assert_eq!(subscription_type_from_title(Some("KIRO PRO")), "Pro");
         assert_eq!(subscription_type_from_title(Some("KIRO POWER")), "Enterprise");
         assert_eq!(subscription_type_from_title(None), "Free");
+    }
+
+    // ============ 凭据状态：current_id / is_current 的模式相关语义 ============
+
+    fn cred_with_priority(priority: u32) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.access_token = Some("tok".to_string());
+        // 未过期 → 不会触发刷新（测试环境没有上游）
+        c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        c.priority = priority;
+        c
+    }
+
+    /// 两条凭据（priority 0 / 1），负载均衡模式由参数决定。
+    fn service_with_balancing_mode(mode: &str) -> AdminService {
+        let mut config = Config::default();
+        config.load_balancing_mode = mode.to_string();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                vec![cred_with_priority(0), cred_with_priority(1)],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        AdminService::new(
+            manager,
+            Vec::<String>::new(),
+            Arc::new(ProxyPoolManager::new(
+                None,
+                crate::model::config::TlsBackend::Rustls,
+            )),
+        )
+    }
+
+    /// balanced 模式下 `current_id` 只是内部调度指针（每次请求都重新选号），
+    /// 把它渲染成「当前活跃账号」是假信息。对外必须固定为 0 / 全 false。
+    #[tokio::test]
+    async fn balanced_mode_exposes_no_current_credential() {
+        let service = service_with_balancing_mode("balanced");
+
+        let response = service.get_all_credentials();
+
+        assert_eq!(response.current_id, 0, "均衡模式不得对外暴露调度指针");
+        assert!(
+            response.credentials.iter().all(|item| !item.is_current),
+            "均衡模式下没有「当前活跃账号」这个概念，全部必须为 false"
+        );
+    }
+
+    /// priority 模式下该语义是真实的：最高优先级（priority 最小）的那条为当前凭据。
+    #[tokio::test]
+    async fn priority_mode_keeps_single_current_credential() {
+        let service = service_with_balancing_mode("priority");
+
+        let response = service.get_all_credentials();
+
+        // 列表已按 priority 升序排序，首条即最高优先级
+        assert_eq!(response.current_id, response.credentials[0].id);
+        assert!(
+            response.credentials[0].is_current,
+            "最高优先级的那条应为当前凭据"
+        );
+        assert!(
+            response.credentials[1..].iter().all(|item| !item.is_current),
+            "当前凭据必须唯一"
+        );
     }
 }

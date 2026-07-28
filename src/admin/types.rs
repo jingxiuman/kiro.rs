@@ -13,7 +13,8 @@ pub struct CredentialsStatusResponse {
     pub total: usize,
     /// 可用凭据数量（未禁用）
     pub available: usize,
-    /// 当前活跃凭据 ID
+    /// 优先级模式下的当前优先凭据 ID；均衡模式固定为 0
+    /// （均衡模式每次请求重新选号，内部调度指针不是「当前活跃账号」）
     pub current_id: u64,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
@@ -33,7 +34,7 @@ pub struct CredentialStatusItem {
     pub failure_count: u32,
     /// 累计失败次数（所有失败类型，只增不减，仅手动重置归零）
     pub total_failure_count: u64,
-    /// 是否为当前活跃凭据
+    /// 是否为优先级模式下的当前优先凭据；均衡模式固定为 false
     pub is_current: bool,
     /// Token 过期时间（RFC3339 格式）
     pub expires_at: Option<String>,
