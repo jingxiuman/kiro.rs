@@ -3,9 +3,26 @@
 //! 提供统一的 HTTP Client 构建功能，支持代理配置
 
 use reqwest::{Client, Proxy};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::model::config::TlsBackend;
+
+/// 进程级出网策略：开启后，任何「无代理」的出网请求都会被拒绝。
+///
+/// 用全局状态而非函数参数，是为了让**新增的出网点默认受保护**——本模块是所有
+/// reqwest::Client 的唯一出口，漏传一个参数就会静默裸连，而全局开关漏不掉。
+static REQUIRE_PROXY: AtomicBool = AtomicBool::new(false);
+
+/// 由 main 在读完配置后设置一次（config.requireProxy）
+pub fn set_require_proxy(enabled: bool) {
+    REQUIRE_PROXY.store(enabled, Ordering::Relaxed);
+}
+
+/// 当前是否强制走代理
+pub fn require_proxy() -> bool {
+    REQUIRE_PROXY.load(Ordering::Relaxed)
+}
 
 /// 代理配置
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -49,6 +66,24 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
+    build_client_with_policy(proxy, timeout_secs, tls_backend, require_proxy())
+}
+
+/// [`build_client`] 的策略显式版本。仅用于测试：全局开关会让并发跑的其它用例互相干扰。
+fn build_client_with_policy(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+    require_proxy: bool,
+) -> anyhow::Result<Client> {
+    // 失败即拒绝，不降级直连：代理不可用时裸连会把真实 IP 暴露给上游
+    if require_proxy && proxy.is_none() {
+        anyhow::bail!(
+            "requireProxy 已开启，但本次出网没有可用代理（凭据与全局均未配置代理，\
+             或绑定的代理已被禁用），已拒绝请求以避免真实 IP 泄露"
+        );
+    }
+
     let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
 
     match tls_backend {
@@ -179,6 +214,33 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    /// 直接测策略版本：全局开关会被并发跑的其它用例观察到，造成假失败
+    #[test]
+    fn require_proxy_rejects_direct_egress() {
+        let err = build_client_with_policy(None, 30, TlsBackend::Rustls, true)
+            .expect_err("无代理时应拒绝");
+        let msg = err.to_string();
+        assert!(msg.contains("requireProxy"), "{msg}");
+        assert!(msg.contains("IP"), "错误应说明拒绝理由: {msg}");
+    }
+
+    #[test]
+    fn require_proxy_allows_egress_through_a_proxy() {
+        let proxy = ProxyConfig::new("socks5://127.0.0.1:1080");
+        assert!(build_client_with_policy(Some(&proxy), 30, TlsBackend::Rustls, true).is_ok());
+    }
+
+    #[test]
+    fn direct_egress_still_allowed_when_policy_is_off() {
+        // 默认关闭时行为必须与加固前完全一致
+        assert!(build_client_with_policy(None, 30, TlsBackend::Rustls, false).is_ok());
+    }
+
+    #[test]
+    fn require_proxy_defaults_to_off() {
+        assert!(!require_proxy(), "默认必须关闭，否则升级即断网");
     }
 
     /// 无标签渲染。链的展开逻辑与 [`describe_reqwest_error`] 共用 [`render_error_chain`]，

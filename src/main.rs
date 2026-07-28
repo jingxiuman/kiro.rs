@@ -105,6 +105,12 @@ async fn main() {
         tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
     }
 
+    // 出网策略：必须在任何 build_client 之前装配，否则预热的 client 会绕过检查
+    http_client::set_require_proxy(config.require_proxy);
+    if config.require_proxy {
+        tracing::info!("已开启 requireProxy：无可用代理时拒绝出网，不降级直连");
+    }
+
     // 启动 Kiro IDE 版本自动获取：从官方元数据端点拉取 currentRelease，
     // 用于流式端点 User-Agent（替代写死的版本号）；失败时回退 config.kiroVersion。
     kiro::kiro_version::spawn_refresher(

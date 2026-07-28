@@ -133,6 +133,14 @@ pub struct Config {
     #[serde(default)]
     pub proxy_password: Option<String>,
 
+    /// 强制走代理：开启后，凭据与全局均无可用代理时**拒绝出网**，而不是降级直连。
+    ///
+    /// 关闭（默认）时行为完全不变，保持向后兼容。开启后受保护的是所有出网路径
+    /// （API 调用 / token 刷新 / 余额与模型查询 / 登录），包括显式配置的
+    /// `"proxyUrl": "direct"`——本开关的语义是「这个部署绝不裸连」。
+    #[serde(default)]
+    pub require_proxy: bool,
+
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
@@ -344,6 +352,7 @@ impl Default for Config {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            require_proxy: false,
             admin_api_key: None,
             update_previous_version: None,
             github_token: None,
