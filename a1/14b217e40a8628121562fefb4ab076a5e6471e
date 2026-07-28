@@ -1,0 +1,28 @@
+docs/superpowers/specs/2026-07-28-proxy-auto-recovery-design.md
+  s_de555678f0c332::t_2495a820a9db53 34,56,139
+  s_3abfacbc70cc70::t_7a6fb7110d6f51 1-33,35-55,57-138,140-145
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "a114b217e40a8628121562fefb4ab076a5e6471e",
+  "prompts": {},
+  "sessions": {
+    "s_3abfacbc70cc70": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "734fde98-8bbd-4110-85b1-91cfb2a253fc",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    },
+    "s_de555678f0c332": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa768-08be-74f2-8682-1a57fe550528",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
