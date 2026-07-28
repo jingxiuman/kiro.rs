@@ -2753,6 +2753,23 @@ impl MultiTokenManager {
         Ok((token, credentials))
     }
 
+    /// 构造**钉死在指定凭据**上的调用上下文（Admin 模型测试用）
+    ///
+    /// 与 [`Self::acquire_context`] 的区别：完全不参与调度选择——不看优先级、
+    /// 不看 balanced/priority 模式、不改 `current_id`、不做跨凭据故障转移。
+    /// 调用方明确指定了要测哪张凭据，替它换一张就答非所问了。
+    ///
+    /// 复用 [`Self::prepare_request_token`]（已处理 API Key 凭据与按需刷新）。
+    /// 凭据被禁用时**不**拒绝：管理端「就是要测这张有问题的凭据」是合法诉求。
+    pub async fn acquire_context_pinned(&self, id: u64) -> anyhow::Result<CallContext> {
+        let (token, credentials) = self.prepare_request_token(id).await?;
+        Ok(CallContext {
+            id,
+            credentials,
+            token,
+        })
+    }
+
     /// 获取指定凭据当前可用的模型列表（Admin API）
     ///
     /// 按需实时查询上游 `ListAvailableModels`，不做缓存。
@@ -4949,5 +4966,41 @@ mod tests {
                 id
             );
         }
+    }
+
+    /// `acquire_context_pinned` 必须完全绕开调度：给哪张就用哪张，
+    /// 且不改动 `current_id`（否则一次管理端测试会把生产流量的调度指针带偏）。
+    #[tokio::test]
+    async fn pinned_context_ignores_scheduling_and_does_not_move_current_id() {
+        let live = |priority: u32| {
+            let mut c = KiroCredentials::default();
+            c.access_token = Some("tok".to_string());
+            c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+            c.priority = priority;
+            c
+        };
+        // id=1 优先级最高（调度会选它）；id=2 优先级更低；id=3 已禁用。
+        let mut disabled = live(2);
+        disabled.disabled = true;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![live(0), live(1), disabled], None, None, false)
+                .unwrap();
+
+        let before = *manager.current_id.lock();
+        assert_eq!(before, 1, "前置条件：调度指针指向优先级最高的 1 号");
+
+        let ctx = manager.acquire_context_pinned(2).await.expect("应能钉住 2 号");
+        assert_eq!(ctx.id, 2, "指定了 2 号就必须用 2 号，不得回落到调度选择");
+        assert_eq!(ctx.token, "tok");
+        assert_eq!(*manager.current_id.lock(), before, "不得改动调度指针");
+
+        // 已禁用的凭据也允许钉住：「就是要测这张有问题的凭据」是合法诉求
+        assert_eq!(
+            manager.acquire_context_pinned(3).await.expect("禁用凭据也应可钉住").id,
+            3
+        );
+
+        // 不存在的 id 必须是明确错误，而不是悄悄换一张
+        assert!(manager.acquire_context_pinned(999).await.is_err());
     }
 }
