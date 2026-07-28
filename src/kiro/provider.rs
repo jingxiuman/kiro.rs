@@ -274,7 +274,7 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group).await
+        self.call_api_with_retry(request_body, false, sink, group, None).await
     }
 
     /// 发送流式 API 请求
@@ -284,7 +284,21 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group).await
+        self.call_api_with_retry(request_body, true, sink, group, None).await
+    }
+
+    /// 发送非流式 API 请求，**钉死在指定凭据**上（Admin 模型测试用）
+    ///
+    /// 与 [`Self::call_api`] 的唯一区别：不做跨凭据故障转移，重试预算降为
+    /// 单凭据额度。调用方明确指定了要测哪张凭据，替它换一张就答非所问了。
+    /// 失败/成功仍照常记账（这是一次真实请求，不做只读豁免）。
+    pub async fn call_api_pinned(
+        &self,
+        credential_id: u64,
+        request_body: &str,
+    ) -> anyhow::Result<KiroCallResult> {
+        self.call_api_with_retry(request_body, false, None, None, Some(credential_id))
+            .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -468,22 +482,39 @@ impl KiroProvider {
         }))
     }
 
+    /// 本次调用的重试预算。
+    ///
+    /// - 非 pinned：按当前请求所属分组的账号数计算（避免小分组按全局账号数获得
+    ///   过多无效重试），再压到全局硬上限。
+    /// - pinned：只有一张凭据可用，跨凭据故障转移不存在，预算降为单凭据额度；
+    ///   否则会对同一张凭据白打 MAX_TOTAL_RETRIES 次。
+    fn retry_budget(total_credentials: usize, pinned: Option<u64>) -> usize {
+        if pinned.is_some() {
+            MAX_RETRIES_PER_CREDENTIAL
+        } else {
+            (total_credentials.max(1) * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES)
+        }
+    }
+
     /// 内部方法：带重试逻辑的 API 调用
     ///
     /// 重试策略：
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
     /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
     /// - 硬上限 9 次，避免无限重试
+    ///
+    /// `pinned = Some(id)` 时钉死该凭据：每轮都用同一张凭据的上下文，
+    /// 不跨凭据故障转移（见 [`Self::retry_budget`]）。生产主链路一律传 `None`。
     async fn call_api_with_retry(
         &self,
         request_body: &str,
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        pinned: Option<u64>,
     ) -> anyhow::Result<KiroCallResult> {
-        // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
-        let total_credentials = self.token_manager.total_count_in_group(group).max(1);
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let total_credentials = self.token_manager.total_count_in_group(group);
+        let max_retries = Self::retry_budget(total_credentials, pinned);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -494,7 +525,11 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
+            let acquired = match pinned {
+                Some(id) => self.token_manager.acquire_context_pinned(id).await,
+                None => self.token_manager.acquire_context(model.as_deref(), group).await,
+            };
+            let mut ctx = match acquired {
                 Ok(c) => c,
                 Err(e) => {
                     Self::emit_attempt(
@@ -1063,6 +1098,30 @@ mod rate_limit_tests {
         )))
         .unwrap();
         assert!(!outcome);
+    }
+
+    /// 加 `pinned` 参数不得改变既有调用点（call_api / call_api_stream，均传 None）
+    /// 的重试预算——这是全项目最热的路径，参数穿透只允许多一条分支。
+    #[test]
+    fn retry_budget_unchanged_for_existing_callers() {
+        assert_eq!(KiroProvider::retry_budget(1, None), MAX_RETRIES_PER_CREDENTIAL);
+        // 2 张及以上凭据时被全局硬上限压住，与改造前 min(n*3, 4) 完全一致
+        assert_eq!(KiroProvider::retry_budget(2, None), MAX_TOTAL_RETRIES);
+        assert_eq!(KiroProvider::retry_budget(9, None), MAX_TOTAL_RETRIES);
+        // 分组内 0 张凭据仍按 max(1) 兜底，保持既有语义
+        assert_eq!(KiroProvider::retry_budget(0, None), MAX_RETRIES_PER_CREDENTIAL);
+    }
+
+    /// pinned 只有一张凭据可用，跨凭据故障转移不存在：预算必须降为单凭据额度，
+    /// 否则会对同一张（可能已经坏了的）凭据白打 MAX_TOTAL_RETRIES 次。
+    #[test]
+    fn pinned_retry_budget_does_not_fail_over_across_credentials() {
+        assert_eq!(KiroProvider::retry_budget(9, Some(3)), MAX_RETRIES_PER_CREDENTIAL);
+        assert_eq!(
+            KiroProvider::retry_budget(1, Some(3)),
+            KiroProvider::retry_budget(9, Some(3)),
+            "pinned 预算与账号池规模无关"
+        );
     }
 
     #[test]

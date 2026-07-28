@@ -27,7 +27,8 @@ use super::types::{
     CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
     GitHubRateLimitInfo, ImageUpdateResponse, ExportedAccount, ExportedCredentials,
     CredentialsExportResponse,
-    LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
+    LoadBalancingModeResponse, LogGovernanceConfigResponse, ModelTestRequest, ModelTestResponse,
+    PollIdcLoginResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
     QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
     SetLogGovernanceConfigRequest, SetModelSyncSettingsRequest, SetUpdateConfigRequest,
@@ -206,6 +207,10 @@ pub struct AdminService {
     model_registry_store: Option<Arc<crate::anthropic::model_registry_store::ModelRegistryStore>>,
     /// 手动同步用的同步服务。同上，由启动流程注入。
     model_sync_service: Option<Arc<crate::anthropic::model_sync::ModelSyncService>>,
+    /// Kiro Provider。`POST /models/test` 要发真实上游请求，必须与生产流量
+    /// 走同一个 provider（同一份账号池 / 代理 / 端点解析），否则测出来的
+    /// 不是「本代理实际会发生什么」。未注入时该端点返回明确的未配置错误。
+    kiro_provider: Option<Arc<crate::kiro::provider::KiroProvider>>,
 }
 
 /// Social 登录会话状态
@@ -533,6 +538,7 @@ impl AdminService {
             config_write_lock: tokio::sync::Mutex::new(()),
             model_registry_store: None,
             model_sync_service: None,
+            kiro_provider: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -1349,6 +1355,171 @@ impl AdminService {
     ) -> Self {
         self.model_sync = settings;
         self
+    }
+
+    /// 注入 Kiro Provider（`POST /models/test` 发真实请求用）。
+    ///
+    /// 必须与 `/v1/messages` 用同一个实例：模型测试要回答的问题是「客户端发这个
+    /// 模型名时**本代理**实际会发生什么」，另起一个 provider 就换了账号池与
+    /// client 缓存，测的不再是生产链路。
+    pub fn with_kiro_provider(
+        mut self,
+        provider: Arc<crate::kiro::provider::KiroProvider>,
+    ) -> Self {
+        self.kiro_provider = Some(provider);
+        self
+    }
+
+    /// `POST /models/test`：对指定模型发送一次真实、最小化的 Kiro 请求。
+    ///
+    /// 先过本地注册表再决定发不发：这样测出来的是「客户端发这个模型名时本代理
+    /// 实际会发生什么」——含别名映射、禁用判定、thinking 变体与透传开关，而不是
+    /// 「把这串字符原样丢给上游会怎样」。被注册表拒绝的请求一次都不发出去。
+    ///
+    /// 这是一次真实请求，成功/失败照常计入凭据统计（`report_success` /
+    /// `report_failure` 由 provider 内部完成），不做只读豁免。
+    pub async fn test_model(
+        &self,
+        request: ModelTestRequest,
+    ) -> Result<ModelTestResponse, AdminServiceError> {
+        use crate::anthropic::model_registry::{
+            RejectReason, Resolution, allow_passthrough, current_registry,
+        };
+        use crate::kiro::model::events::{Event, strip_tool_use_xml_leaks};
+        use crate::kiro::model::requests::conversation::{
+            ConversationState, CurrentMessage, UserInputMessage,
+        };
+        use crate::kiro::model::requests::kiro::KiroRequest;
+        use crate::kiro::parser::decoder::EventStreamDecoder;
+
+        let model_id = request.model_id.trim().to_string();
+        if model_id.is_empty() {
+            return Err(AdminServiceError::InvalidModelField(
+                "modelId 不能为空".to_string(),
+            ));
+        }
+
+        // 第 1 步：注册表解析。Rejected 直接返回，不发任何请求。
+        let resolved_model_id = match current_registry().resolve(&model_id, allow_passthrough()) {
+            Resolution::Mapped { upstream_id, .. } | Resolution::Passthrough { upstream_id, .. } => {
+                upstream_id
+            }
+            // 「没配」→ 404 语义
+            Resolution::Rejected(RejectReason::Unknown) => {
+                return Err(AdminServiceError::ModelNotFound(model_id));
+            }
+            // 「配了但被人工禁用」→ 400 语义：这是本地配置问题，不是模型不存在
+            Resolution::Rejected(RejectReason::Disabled) => {
+                return Err(AdminServiceError::InvalidModelField(format!(
+                    "模型 {} 已在本地模型表中被禁用，不会下发到上游",
+                    model_id
+                )));
+            }
+        };
+        // 请求名带 -thinking 后缀且解析通过 → 本次走的是 thinking 变体
+        let thinking = model_id.to_ascii_lowercase().ends_with("-thinking");
+
+        let provider = self
+            .kiro_provider
+            .as_ref()
+            .ok_or_else(|| AdminServiceError::InternalError("Kiro Provider 未配置".to_string()))?;
+
+        // 第 2 步：构造最小请求体
+        let conversation_state = ConversationState::new(Uuid::new_v4().to_string())
+            .with_agent_continuation_id(Uuid::new_v4().to_string())
+            .with_agent_task_type("vibe")
+            .with_chat_trigger_type("MANUAL")
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new("Reply with exactly: OK", resolved_model_id.as_str())
+                    .with_origin("AI_EDITOR"),
+            ));
+        let body = serde_json::to_string(&KiroRequest {
+            conversation_state,
+            profile_arn: None,
+            additional_model_request_fields: None,
+        })
+        .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+
+        // 第 3 步：发送。指定了凭据就钉死它（不跨凭据故障转移），否则走正常账号池。
+        let pinned = request.credential_id;
+        let started = std::time::Instant::now();
+        let (credential_id, bytes) = tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            async {
+                let call = match pinned {
+                    Some(id) => provider.call_api_pinned(id, &body).await?,
+                    None => provider.call_api(&body, None, None).await?,
+                };
+                let credential_id = call.credential_id;
+                let bytes = call.response.bytes().await?;
+                Ok::<_, anyhow::Error>((credential_id, bytes))
+            },
+        )
+        .await
+        .map_err(|_| AdminServiceError::UpstreamError("模型测试请求超时".to_string()))?
+        .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?;
+
+        // 第 4 步：解帧
+        let mut decoder = EventStreamDecoder::new();
+        decoder
+            .feed(&bytes)
+            .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?;
+        let mut response_text = String::new();
+        let mut credit_usage = 0.0_f64;
+        let mut credit_unit = None;
+
+        for frame in decoder.decode_iter() {
+            let frame = frame.map_err(|error| {
+                AdminServiceError::UpstreamError(format!("模型响应解析失败: {error}"))
+            })?;
+            let event = Event::from_frame(frame).map_err(|error| {
+                AdminServiceError::UpstreamError(format!("模型事件解析失败: {error}"))
+            })?;
+            match event {
+                Event::AssistantResponse(response) => response_text.push_str(&response.content),
+                Event::Metering(metering) => {
+                    credit_usage += metering.usage;
+                    if !metering.unit.is_empty() {
+                        credit_unit = Some(metering.unit);
+                    }
+                }
+                Event::Error {
+                    error_code,
+                    error_message,
+                } => {
+                    return Err(AdminServiceError::UpstreamError(format!(
+                        "{error_code}: {error_message}"
+                    )));
+                }
+                Event::Exception {
+                    exception_type,
+                    message,
+                } => {
+                    return Err(AdminServiceError::UpstreamError(format!(
+                        "{exception_type}: {message}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        let response_text = strip_tool_use_xml_leaks(&response_text);
+        if response_text.trim().is_empty() {
+            return Err(AdminServiceError::UpstreamError(
+                "模型返回了空响应".to_string(),
+            ));
+        }
+
+        Ok(ModelTestResponse {
+            model_id,
+            resolved_model_id,
+            thinking,
+            credential_id,
+            latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            response_text,
+            credit_usage: (credit_usage > 0.0).then_some(credit_usage),
+            credit_unit,
+        })
     }
 
     fn registry_store(
@@ -4615,6 +4786,85 @@ mod model_registry_tests {
             }
             other => panic!("期望 InvalidModelField，实际 {:?}", other),
         }
+    }
+
+    // ============ POST /models/test：注册表拒绝时一次请求都不发 ============
+    //
+    // 下面两条测试用的 service **没有注入 kiro_provider**：一旦解析放行，
+    // 代码会在发请求前先撞上 `InternalError("Kiro Provider 未配置")`。
+    // 断言拿到的是 ModelNotFound / InvalidModelField，就证明拒绝发生在发请求之前。
+
+    /// 未收录且未开透传 → ModelNotFound（404 语义），不发请求
+    #[tokio::test]
+    async fn test_model_rejects_unknown_model_before_sending_request() {
+        let service = model_sync_test_service();
+        let err = service
+            .test_model(ModelTestRequest {
+                model_id: "  no-such-model-xyz  ".to_string(),
+                credential_id: None,
+            })
+            .await
+            .unwrap_err();
+        match err {
+            AdminServiceError::ModelNotFound(m) => {
+                assert_eq!(m, "no-such-model-xyz", "回显的模型名应已 trim")
+            }
+            other => panic!("期望 ModelNotFound（且未发出请求），实际 {:?}", other),
+        }
+    }
+
+    /// 配了但被人工禁用 → InvalidModelField（400 语义），不发请求。
+    /// 与「没配」区分开：两者的排查方向完全不同。
+    #[tokio::test]
+    async fn test_model_rejects_disabled_model_before_sending_request() {
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut row = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        row.enabled = false;
+        let exposed = row.exposed_id.clone();
+        let file = ModelRegistryFile {
+            models: vec![row],
+            ..ModelRegistryFile::default()
+        };
+        crate::anthropic::model_registry::install_registry(
+            ModelRegistry::from_file(file).unwrap(),
+        );
+
+        let service = model_sync_test_service();
+        let err = service
+            .test_model(ModelTestRequest {
+                model_id: exposed.clone(),
+                credential_id: None,
+            })
+            .await
+            .unwrap_err();
+        match err {
+            AdminServiceError::InvalidModelField(msg) => {
+                assert!(msg.contains(&exposed), "错误信息应点名被禁用的模型: {}", msg)
+            }
+            other => panic!("期望 InvalidModelField（且未发出请求），实际 {:?}", other),
+        }
+
+        crate::anthropic::model_registry::install_registry(ModelRegistry::builtin());
+    }
+
+    /// 空 modelId 属于请求本身有问题，不是「模型不存在」
+    #[tokio::test]
+    async fn test_model_rejects_blank_model_id() {
+        let service = model_sync_test_service();
+        let err = service
+            .test_model(ModelTestRequest {
+                model_id: "   ".to_string(),
+                credential_id: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AdminServiceError::InvalidModelField(_)), "实际 {:?}", err);
     }
 
     /// M2：模型同步时间校验失败必须走 `InvalidModelField`，文案不得是「凭据无效」

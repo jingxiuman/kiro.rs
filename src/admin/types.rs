@@ -372,6 +372,43 @@ pub struct AvailableModelItem {
     pub max_input_tokens: Option<i64>,
 }
 
+// ============ 模型真实请求测试 ============
+
+/// `POST /models/test` 请求参数。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTestRequest {
+    /// 客户端会发的模型名（走本地注册表解析：别名 / 禁用 / thinking 变体 / 透传）
+    pub model_id: String,
+    /// 指定凭据；缺省时走正常账号池调度
+    #[serde(default)]
+    pub credential_id: Option<u64>,
+}
+
+/// `POST /models/test` 结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTestResponse {
+    /// 请求里给的模型名（原样回显）
+    pub model_id: String,
+    /// 注册表解析后真正下发给上游的 ID
+    pub resolved_model_id: String,
+    /// 请求名是否被识别为 thinking 变体
+    pub thinking: bool,
+    /// 本次实际使用的凭据 ID
+    pub credential_id: u64,
+    /// 端到端耗时（毫秒）
+    pub latency_ms: u64,
+    /// 上游返回的文本
+    pub response_text: String,
+    /// 本次消耗的计费额度（上游未下发计费事件时缺省）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_usage: Option<f64>,
+    /// 计费单位
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_unit: Option<String>,
+}
+
 // ============ 一键超额 ============
 
 /// 一键超额禁用结果
