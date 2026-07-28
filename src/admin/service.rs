@@ -313,7 +313,7 @@ fn compare_semver(current: &str, latest: &str) -> std::cmp::Ordering {
 fn parse_semver_core(value: &str) -> [u32; 3] {
     let core = value
         .trim_start_matches('v')
-        .split(|c: char| c == '-' || c == '+')
+        .split(['-', '+'])
         .next()
         .unwrap_or("");
     let mut out = [0u32; 3];
@@ -1081,8 +1081,8 @@ impl AdminService {
         fetch_balance: bool,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         // 校验端点名：未指定则默认合法，指定则必须已注册
-        if let Some(ref name) = req.endpoint {
-            if !self.known_endpoints.contains(name) {
+        if let Some(ref name) = req.endpoint
+            && !self.known_endpoints.contains(name) {
                 let mut known: Vec<&str> =
                     self.known_endpoints.iter().map(|s| s.as_str()).collect();
                 known.sort();
@@ -1091,7 +1091,6 @@ impl AdminService {
                     name, known
                 )));
             }
-        }
 
         // 规范化 auth_method：识别企业 SSO 别名；带 tokenEndpoint 但未声明时推断为 external_idp。
         let auth_method =
@@ -1179,11 +1178,10 @@ impl AdminService {
         // 主动获取余额（含订阅等级 / 邮箱）并写入缓存，添加后立即可见，
         // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤。
         // 仅验活路径需要；"直接导入"路径跳过以省掉这次上游往返。
-        if fetch_balance {
-            if let Err(e) = self.get_balance(credential_id).await {
+        if fetch_balance
+            && let Err(e) = self.get_balance(credential_id).await {
                 tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
             }
-        }
 
         Ok(AddCredentialResponse {
             success: true,
@@ -2044,8 +2042,8 @@ impl AdminService {
     /// `force=false` 时优先返回 30 分钟内的缓存结果；`force=true` 时强制查询
     /// 远端。查询失败但有旧缓存时，返回旧缓存并附带 warning。
     pub async fn check_update(&self, force: bool) -> UpdateCheckInfo {
-        if !force {
-            if let Some(cached) = self.update_check_cache.lock().clone() {
+        if !force
+            && let Some(cached) = self.update_check_cache.lock().clone() {
                 let age = Utc::now()
                     .signed_duration_since(cached.cached_at)
                     .num_seconds();
@@ -2055,7 +2053,6 @@ impl AdminService {
                     return info;
                 }
             }
-        }
 
         match self.fetch_latest_release().await {
             Ok(info) => {
@@ -2416,32 +2413,28 @@ impl AdminService {
             ("traceRetentionDays", req.trace_retention_days),
             ("usageLogRetentionDays", req.usage_log_retention_days),
         ] {
-            if let Some(d) = v {
-                if !(1..=365).contains(&d) {
+            if let Some(d) = v
+                && !(1..=365).contains(&d) {
                     return Err(AdminServiceError::InvalidCredential(format!(
                         "{} 必须在 1..=365 内: {}",
                         name, d
                     )));
                 }
-            }
         }
 
         // 先改运行时原子值
-        if let Some(enabled) = req.trace_enabled {
-            if let Some(s) = &self.trace_store {
+        if let Some(enabled) = req.trace_enabled
+            && let Some(s) = &self.trace_store {
                 s.set_enabled(enabled);
             }
-        }
-        if let Some(days) = req.trace_retention_days {
-            if let Some(s) = &self.trace_store {
+        if let Some(days) = req.trace_retention_days
+            && let Some(s) = &self.trace_store {
                 s.set_retention_days(days);
             }
-        }
-        if let Some(days) = req.usage_log_retention_days {
-            if let Some(r) = &self.usage_recorder {
+        if let Some(days) = req.usage_log_retention_days
+            && let Some(r) = &self.usage_recorder {
                 r.set_retention_days(days as i64);
             }
-        }
 
         // 持久化到 config.json
         if let Err(e) = self.persist_log_governance_config(&req) {
@@ -3115,16 +3108,16 @@ impl AdminService {
         };
 
         match outcome {
-            PollOutcome::Pending => return Ok(PollIdcLoginResponse::Pending),
+            PollOutcome::Pending => Ok(PollIdcLoginResponse::Pending),
             PollOutcome::Expired => {
                 self.social_sessions.lock().remove(session_id);
-                return Ok(PollIdcLoginResponse::Expired);
+                Ok(PollIdcLoginResponse::Expired)
             }
             PollOutcome::Closed => {
                 self.social_sessions.lock().remove(session_id);
-                return Err(AdminServiceError::InternalError(
+                Err(AdminServiceError::InternalError(
                     "Social 登录回调服务器已关闭，请重新发起登录".to_string(),
-                ));
+                ))
             }
             PollOutcome::Received(callback) => {
                 self.do_complete_social_login(session_id, callback).await
@@ -3377,7 +3370,7 @@ impl AdminService {
             let sessions = self.idc_sessions.lock();
             let s = sessions
                 .get(session_id)
-                .ok_or_else(|| AdminServiceError::NotFound { id: 0 })?;
+                .ok_or(AdminServiceError::NotFound { id: 0 })?;
 
             if Utc::now() >= s.expires_at {
                 return Ok(PollIdcLoginResponse::Expired);
@@ -3678,34 +3671,30 @@ pub fn apply_model_patch(
     }
 
     // 先全部校验再落值：中途失败不能留下改了一半的行。
-    if let Some(v) = req.exposed_id.as_deref() {
-        if v.trim().is_empty() {
+    if let Some(v) = req.exposed_id.as_deref()
+        && v.trim().is_empty() {
             return Err(AdminServiceError::InvalidModelField(
                 "exposedId 不能为空".to_string(),
             ));
         }
-    }
-    if let Some(v) = req.display_name.as_deref() {
-        if v.trim().is_empty() {
+    if let Some(v) = req.display_name.as_deref()
+        && v.trim().is_empty() {
             return Err(AdminServiceError::InvalidModelField(
                 "displayName 不能为空".to_string(),
             ));
         }
-    }
-    if let Some(v) = req.context_window {
-        if v <= 0 {
+    if let Some(v) = req.context_window
+        && v <= 0 {
             return Err(AdminServiceError::InvalidModelField(
                 "contextWindow 必须为正数".to_string(),
             ));
         }
-    }
-    if let Some(v) = req.max_output_tokens {
-        if v <= 0 {
+    if let Some(v) = req.max_output_tokens
+        && v <= 0 {
             return Err(AdminServiceError::InvalidModelField(
                 "maxOutputTokens 必须为正数".to_string(),
             ));
         }
-    }
 
     let pin = |row: &mut crate::anthropic::model_registry::ModelRow, field: &str| {
         if PATCHABLE_PINNED_FIELDS.contains(&field) && !row.pinned.iter().any(|p| p == field) {

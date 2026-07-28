@@ -124,8 +124,8 @@ pub async fn auth_middleware(
         }
     };
 
-    if let Some(mgr) = &state.client_keys {
-        if let Some(id) = mgr.verify_and_touch(&presented) {
+    if let Some(mgr) = &state.client_keys
+        && let Some(id) = mgr.verify_and_touch(&presented) {
             let group = mgr.group_of(id);
             request.extensions_mut().insert(KeyContext {
                 key_id: id,
@@ -134,7 +134,6 @@ pub async fn auth_middleware(
             });
             return next.run(request).await;
         }
-    }
 
     let error = ErrorResponse::authentication_error();
     (StatusCode::UNAUTHORIZED, Json(error)).into_response()

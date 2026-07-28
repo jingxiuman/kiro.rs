@@ -24,6 +24,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::metadata::extract_session_id;
+
 /// 默认条目上限（防止内存无限增长）
 const DEFAULT_CAPACITY: usize = 4096;
 /// 最长 TTL（1h，与 Anthropic ttl="1h" 对齐）
@@ -122,9 +124,9 @@ impl CacheMeter {
     /// 创建一个空 cache。`persist_path` 为 `Some` 时会自动从该文件加载历史。
     pub fn new(persist_path: Option<PathBuf>) -> Self {
         let mut inner = Inner::default();
-        if let Some(path) = persist_path.as_ref() {
-            if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(entries) = serde_json::from_slice::<HashMap<u64, CacheEntry>>(&bytes) {
+        if let Some(path) = persist_path.as_ref()
+            && let Ok(bytes) = std::fs::read(path)
+                && let Ok(entries) = serde_json::from_slice::<HashMap<u64, CacheEntry>>(&bytes) {
                     let now = now_secs();
                     for (k, v) in entries {
                         if v.expires_at > now {
@@ -137,8 +139,6 @@ impl CacheMeter {
                         inner.entries.len()
                     );
                 }
-            }
-        }
         Self {
             inner: Mutex::new(inner),
             persist_path,
@@ -531,7 +531,7 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
 /// 生成会话隔离种子，作为前缀哈希链的最前置输入。
 ///
 /// 优先级：
-///   1. metadata.user_id 里的 session 段（Claude Code 格式含 `_session_<uuid>`）
+///   1. metadata.user_id 里的 session（Claude Code JSON 或 legacy 格式）
 ///      —— 最精确的会话维度，同一会话多轮共享、跨会话隔离。
 ///   2. 主 apiKey（系统 Key，`key_id==0`）且无 session → `None`：该 Key 被多个
 ///      用户共享，若按 key 模拟缓存会产生跨用户虚假命中，故不模拟缓存。
@@ -552,17 +552,6 @@ fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
         return None;
     }
     Some(format!("key:{key_id}"))
-}
-
-/// 从 Claude Code 的 user_id 中提取 session 标识。
-///
-/// 格式形如 `user_<hash>_account__session_<uuid>`，取 `_session_` 之后的部分。
-/// 不含该标记时返回 None（交由调用方退回 key_id）。
-pub(crate) fn extract_session_id(user_id: &str) -> Option<String> {
-    user_id
-        .split_once("_session_")
-        .map(|(_, sid)| sid.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 /// 探测请求里出现过的最大 cache_control.ttl（"1h" 优先于 "5m"）；
@@ -1195,11 +1184,13 @@ mod tests {
         };
         let cache = CacheMeter::new(None);
         // 同 key_id（都为 0），仅 session 不同——靠 metadata session 隔离。
-        let s1a = compute_cache_usage(&cache, &make("aaa"), 0);
+        let session_a = "8bb5523b-ec7c-4540-a9ca-beb6d79f1552";
+        let session_b = "a0662283-7fd3-4399-a7eb-52b9a717ae88";
+        let s1a = compute_cache_usage(&cache, &make(session_a), 0);
         assert_eq!(s1a.cache_read, 0);
-        let s2 = compute_cache_usage(&cache, &make("bbb"), 0);
+        let s2 = compute_cache_usage(&cache, &make(session_b), 0);
         assert_eq!(s2.cache_read, 0, "不同 session 不应命中");
-        let s1b = compute_cache_usage(&cache, &make("aaa"), 0);
+        let s1b = compute_cache_usage(&cache, &make(session_a), 0);
         assert!(s1b.cache_read > 0, "相同 session 应命中");
     }
 
@@ -1278,9 +1269,16 @@ mod tests {
 
     #[test]
     fn extract_session_id_parses_claude_code_format() {
+        let session_id = "8bb5523b-ec7c-4540-a9ca-beb6d79f1552";
         assert_eq!(
-            extract_session_id("user_xxx_account__session_0b4445e1-uuid"),
-            Some("0b4445e1-uuid".to_string())
+            extract_session_id(&format!("user_xxx_account__session_{session_id}")),
+            Some(session_id.to_string())
+        );
+        assert_eq!(
+            extract_session_id(&format!(
+                r#"{{"device_id":"device","account_uuid":"","session_id":"{session_id}"}}"#
+            )),
+            Some(session_id.to_string())
         );
         assert_eq!(extract_session_id("no-session-here"), None);
         assert_eq!(extract_session_id("trailing_session_"), None);

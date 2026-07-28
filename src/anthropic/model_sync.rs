@@ -355,16 +355,14 @@ impl ModelSyncService {
                 // 是人可编辑的配置文件，手写 `...+08:00` 这类偏移就会踩中。
                 // 修法：解析成 DateTime 后比较真实时刻；解析失败按“无记录”放行——
                 // 一条手写坏格式的时间戳不该永久卡死同步。
-                if let Some(last) = file.sync_state.last_sync_at.as_deref() {
-                    if let Ok(last_dt) = DateTime::parse_from_rfc3339(last) {
-                        if last_dt > now {
+                if let Some(last) = file.sync_state.last_sync_at.as_deref()
+                    && let Ok(last_dt) = DateTime::parse_from_rfc3339(last)
+                        && last_dt > now {
                             return Err(format!(
                                 "已有更新的同步结果（{}）晚于本轮起始时间（{}），丢弃本轮",
                                 last, fetch_started_at
                             ));
                         }
-                    }
-                }
 
                 // I1+M1 修复：有效行表 = 内置默认 ∪ 覆盖层（ModelRegistry::from_file 的叠加
                 // 逻辑），而非仅 file.models（覆盖层）。此前只拿 file.models 当基线，会导致：

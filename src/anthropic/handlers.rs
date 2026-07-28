@@ -101,8 +101,8 @@ impl UsageRecordHook {
         if let Some(a) = &self.aggregator {
             a.ingest(&rec);
         }
-        if status == "success" && self.key_id != 0 {
-            if let Some(m) = &self.client_keys {
+        if status == "success" && self.key_id != 0
+            && let Some(m) = &self.client_keys {
                 m.record_usage(
                     self.key_id,
                     rec.input_tokens,
@@ -112,7 +112,6 @@ impl UsageRecordHook {
                     rec.credits,
                 );
             }
-        }
     }
 }
 
@@ -131,7 +130,7 @@ pub(crate) struct RequestTracer {
     key_source: TraceKeySource,
     model: String,
     is_stream: bool,
-    /// Claude Code 会话 id（metadata.user_id 的 `_session_<uuid>`），可为 None
+    /// Claude Code 会话 id（metadata.user_id 的 JSON 或 legacy 格式），可为 None
     session_id: Option<String>,
     started_at: Instant,
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
@@ -167,14 +166,14 @@ struct RequestTraceOptions {
     session_id: Option<String>,
 }
 
-/// 从请求 metadata.user_id 提取 Claude Code 会话 id（`_session_<uuid>`）。
-/// 无 metadata / 非该格式时返回 None。
+/// 从请求 metadata.user_id 提取 Claude Code 会话 id。
+/// 支持当前 JSON 格式与旧版 `_session_<uuid>` 格式。
 fn session_id_of(payload: &super::types::MessagesRequest) -> Option<String> {
     payload
         .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_deref())
-        .and_then(super::cache_metering::extract_session_id)
+        .and_then(super::metadata::extract_session_id)
 }
 
 impl RequestTracer {
@@ -1348,11 +1347,10 @@ async fn handle_non_stream_request(
                             );
                             metering = Some(event_metering);
                         }
-                        Event::Exception { exception_type, .. } => {
-                            if exception_type == "ContentLengthExceededException" {
+                        Event::Exception { exception_type, .. }
+                            if exception_type == "ContentLengthExceededException" => {
                                 stop_reason = "max_tokens".to_string();
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -1598,7 +1596,7 @@ pub async fn count_tokens(
     ) as i32;
 
     Json(CountTokensResponse {
-        input_tokens: total_tokens.max(1) as i32,
+        input_tokens: total_tokens.max(1),
     })
 }
 
@@ -2197,6 +2195,23 @@ mod tests {
         assert_eq!(stats.count, 0);
         assert_eq!(stats.total_b64_bytes, 0);
         assert_eq!(stats.largest_b64_bytes, 0);
+    }
+
+    #[test]
+    fn trace_session_id_supports_current_json_metadata() {
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+            "model": "claude-opus-5",
+            "max_tokens": 100,
+            "messages": [],
+            "metadata": {
+                "user_id": "{\"device_id\":\"device\",\"account_uuid\":\"\",\"session_id\":\"8bb5523b-ec7c-4540-a9ca-beb6d79f1552\"}"
+            }
+        }"#).unwrap();
+
+        assert_eq!(
+            session_id_of(&req).as_deref(),
+            Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552")
+        );
     }
 
     #[test]

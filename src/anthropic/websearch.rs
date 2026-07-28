@@ -154,8 +154,8 @@ pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
 
     // 去除前缀 "Perform a web search for the query: "
     const PREFIX: &str = "Perform a web search for the query: ";
-    let query = if text.starts_with(PREFIX) {
-        text[PREFIX.len()..].to_string()
+    let query = if let Some(stripped) = text.strip_prefix(PREFIX) {
+        stripped.to_string()
     } else {
         text
     };
@@ -201,7 +201,7 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
     // tool_use_id 使用相同格式
     let tool_use_id = format!(
         "srvtoolu_{}",
-        Uuid::new_v4().to_string().replace('-', "")[..32].to_string()
+        &Uuid::new_v4().to_string().replace('-', "")[..32]
     );
 
     let request = McpRequest {
@@ -260,7 +260,7 @@ fn generate_websearch_events(
     let mut events = Vec::new();
     let message_id = format!(
         "msg_{}",
-        Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
+        &Uuid::new_v4().to_string().replace('-', "")[..24]
     );
 
     // 1. message_start
@@ -516,12 +516,12 @@ fn build_websearch_content(
 
 fn finish_mcp_call(
     result: anyhow::Result<McpResponse>,
-) -> Result<Option<WebSearchResults>, Response> {
+) -> Result<Option<WebSearchResults>, Box<Response>> {
     match result {
         Ok(response) => Ok(parse_search_results(&response)),
         Err(error) => {
             tracing::warn!("MCP API 调用失败: {}", error);
-            Err(super::handlers::map_provider_error(error))
+            Err(Box::new(super::handlers::map_provider_error(error)))
         }
     }
 }
@@ -583,7 +583,7 @@ pub async fn handle_websearch_request(
     // 3. 调用 Kiro MCP API
     let search_results = match finish_mcp_call(call_mcp_api(&provider, &mcp_request, group).await) {
         Ok(results) => results,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     // 4. 按请求模式生成响应

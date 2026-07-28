@@ -219,11 +219,10 @@ async fn decode_round(
                     credits += m.usage;
                     last_metering = Some(m.clone());
                 }
-                Event::Exception { exception_type, .. } => {
-                    if exception_type == "ContentLengthExceededException" {
+                Event::Exception { exception_type, .. }
+                    if exception_type == "ContentLengthExceededException" => {
                         stop_reason_override = Some("max_tokens".to_string());
                     }
-                }
                 _ => {}
             }
         }

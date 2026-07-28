@@ -306,7 +306,7 @@ pub fn validate_external_idp_endpoint(raw_url: &str) -> Result<(), String> {
 #[serde(untagged)]
 pub enum CredentialsConfig {
     /// 单个凭据（旧格式）
-    Single(KiroCredentials),
+    Single(Box<KiroCredentials>),
     /// 多凭据数组（新格式）
     Multiple(Vec<KiroCredentials>),
 }
@@ -341,7 +341,7 @@ impl CredentialsConfig {
         match self {
             CredentialsConfig::Single(mut cred) => {
                 cred.canonicalize_auth_method();
-                vec![cred]
+                vec![*cred]
             }
             CredentialsConfig::Multiple(mut creds) => {
                 // 按优先级排序（数字越小优先级越高）

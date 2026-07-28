@@ -582,13 +582,11 @@ fn spawn_model_sync_scheduler(
 fn ensure_config_files(config_path: &str, credentials_path: &str) {
     let config_p = std::path::Path::new(config_path);
     if !config_p.exists() {
-        if let Some(parent) = config_p.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = config_p.parent()
+            && !parent.as_os_str().is_empty()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     tracing::warn!("创建配置目录失败 {}: {}", parent.display(), e);
                 }
-            }
-        }
         let api_key = format!("sk-kiro-rs-{}", random_token(24));
         let admin_api_key = format!("sk-admin-{}", random_token(24));
         let default = serde_json::json!({
@@ -616,13 +614,11 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
 
     let cred_p = std::path::Path::new(credentials_path);
     if !cred_p.exists() {
-        if let Some(parent) = cred_p.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = cred_p.parent()
+            && !parent.as_os_str().is_empty()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     tracing::warn!("创建凭证目录失败 {}: {}", parent.display(), e);
                 }
-            }
-        }
         if let Err(e) = std::fs::write(cred_p, "[]\n") {
             tracing::warn!("写入空凭证文件失败 {}: {}", cred_p.display(), e);
         } else {

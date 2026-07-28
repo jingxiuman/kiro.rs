@@ -201,14 +201,13 @@ async fn download_to_file(
             resp.status()
         )));
     }
-    if let Some(len) = resp.content_length() {
-        if len > MAX_DOWNLOAD_BYTES {
+    if let Some(len) = resp.content_length()
+        && len > MAX_DOWNLOAD_BYTES {
             return Err(AdminServiceError::InternalError(format!(
                 "下载体积 {} 字节超过上限 {} 字节",
                 len, MAX_DOWNLOAD_BYTES
             )));
         }
-    }
 
     let bytes = resp.bytes().await.map_err(|e| {
         AdminServiceError::InternalError(format!("读取下载内容失败: {}", e))

@@ -1105,11 +1105,10 @@ fn credential_matches_request(
     }
 
     // 按上游宣告的 credential_support 过滤（无记录则放行，见 credential_supports_model 注释）
-    if let Some(m) = model {
-        if !credential_supports_model(credential_id, m, credential_support) {
+    if let Some(m) = model
+        && !credential_supports_model(credential_id, m, credential_support) {
             return false;
         }
-    }
 
     group_matches(&credentials.groups, group)
 }
@@ -1522,8 +1521,7 @@ impl MultiTokenManager {
             .iter()
             .filter(|e| !e.disabled)
             .min_by_key(|e| e.credentials.priority)
-        {
-            if best.id != *current_id {
+            && best.id != *current_id {
                 tracing::info!(
                     "优先级变更后切换凭据: #{} -> #{}（优先级 {}）",
                     *current_id,
@@ -1532,7 +1530,6 @@ impl MultiTokenManager {
                 );
                 *current_id = best.id;
             }
-        }
     }
 
     /// 尝试使用指定凭据获取有效 Token
@@ -2502,11 +2499,10 @@ impl MultiTokenManager {
         }
 
         // 已有真实 ARN（含 Social 共享 ARN）→ 直接用，无需查询
-        if let Some(arn) = credentials.profile_arn.as_deref() {
-            if !is_placeholder_profile_arn(arn) {
+        if let Some(arn) = credentials.profile_arn.as_deref()
+            && !is_placeholder_profile_arn(arn) {
                 return Ok(Some(arn.to_string()));
             }
-        }
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -2635,11 +2631,10 @@ impl MultiTokenManager {
                 }
             };
 
-            if changed {
-                if let Err(e) = self.persist_credentials() {
+            if changed
+                && let Err(e) = self.persist_credentials() {
                     tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
                 }
-            }
         }
 
         // 回填邮箱：仅在凭据尚无邮箱、且上游返回了邮箱时写入
@@ -2665,11 +2660,10 @@ impl MultiTokenManager {
                 }
             };
 
-            if changed {
-                if let Err(e) = self.persist_credentials() {
+            if changed
+                && let Err(e) = self.persist_credentials() {
                     tracing::warn!("邮箱回填后持久化失败（不影响本次请求）: {}", e);
                 }
-            }
         }
 
         Ok(usage_limits)

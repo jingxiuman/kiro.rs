@@ -17,6 +17,7 @@ use crate::kiro::model::requests::tool::{
 };
 use crate::model::config::ToolCompatibilityMode;
 
+use super::metadata::extract_session_id;
 use super::types::{ContentBlock, ImageSource, MessagesRequest};
 
 use crate::image_resize::{ResizeConfig, maybe_shrink_image};
@@ -153,11 +154,10 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
 
     // maximum/minimum 超过 i64::MAX 或为 JavaScript MAX_SAFE_INTEGER (9007199254740991) 时移除
     for key in &["maximum", "minimum"] {
-        if let Some(v) = obj.get(*key).and_then(|v| v.as_f64()) {
-            if v > 2_147_483_647.0 || v < -2_147_483_648.0 {
+        if let Some(v) = obj.get(*key).and_then(|v| v.as_f64())
+            && (!(-2_147_483_648.0..=2_147_483_647.0).contains(&v)) {
                 obj.remove(*key);
             }
-        }
     }
 
     // 递归处理嵌套 properties
@@ -507,55 +507,19 @@ impl std::fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
-/// 从 metadata.user_id 中提取 session UUID
-///
-/// 支持两种格式:
-/// 1. 字符串格式: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
-/// 2. JSON 格式: {"device_id":"...","account_uuid":"...","session_id":"UUID"}
-///
-/// 提取 session UUID 作为 conversationId
-fn extract_session_id(user_id: &str) -> Option<String> {
-    // 先尝试 JSON 解析
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
-        if let Some(session_id) = json.get("session_id").and_then(|v| v.as_str()) {
-            if is_valid_uuid(session_id) {
-                return Some(session_id.to_string());
-            }
-        }
-    }
-
-    // 回退到字符串格式: 查找 "session_" 后面的内容
-    if let Some(pos) = user_id.find("session_") {
-        let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
-        if session_part.len() >= 36 {
-            let uuid_str = &session_part[..36];
-            if is_valid_uuid(uuid_str) {
-                return Some(uuid_str.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// 简单验证 UUID 格式（36 字符，包含 4 个连字符）
-fn is_valid_uuid(s: &str) -> bool {
-    s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
-}
-
 /// 收集历史消息中使用的所有工具名称
 fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     let mut tool_names = Vec::new();
 
     for msg in history {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
+        if let Message::Assistant(assistant_msg) = msg
+            && let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
                 for tool_use in tool_uses {
                     if !tool_names.contains(&tool_use.name) {
                         tool_names.push(tool_use.name.clone());
                     }
                 }
             }
-        }
     }
 
     tool_names
@@ -1007,8 +971,8 @@ fn remove_orphaned_tool_uses(
     }
 
     for msg in history.iter_mut() {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
+        if let Message::Assistant(assistant_msg) = msg
+            && let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
                 let original_len = tool_uses.len();
                 tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
 
@@ -1022,7 +986,6 @@ fn remove_orphaned_tool_uses(
                     );
                 }
             }
-        }
     }
 }
 
@@ -1596,8 +1559,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     // SHA256 dedup set for images spanning the whole history; a repeated image is kept only on first sight
     let mut image_dedup: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for i in 0..history_end_index {
-        let msg = &messages[i];
+    for msg in messages.iter().take(history_end_index) {
 
         if msg.role == "user" {
             // 先处理累积的 assistant 消息

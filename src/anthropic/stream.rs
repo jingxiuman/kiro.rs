@@ -162,10 +162,7 @@ fn find_char_boundary(s: &str, target: usize) -> usize {
 /// - 反引号 (`)：行内代码
 /// - 双引号 (")：字符串
 /// - 单引号 (')：字符串
-const QUOTE_CHARS: &[u8] = &[
-    b'`', b'"', b'\'', b'\\', b'#', b'!', b'@', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'-',
-    b'_', b'=', b'+', b'[', b']', b'{', b'}', b';', b':', b'<', b'>', b',', b'.', b'?', b'/',
-];
+const QUOTE_CHARS: &[u8] = b"`\"'\\#!@$%^&*()-_=+[]{};:<>,.?/";
 
 /// 检查指定位置的字符是否是引用字符
 fn is_quote_char(buffer: &str, pos: usize) -> bool {
@@ -341,7 +338,7 @@ fn find_invoke_start(buffer: &str) -> Option<usize> {
         if let Some(lt) = open_tag_lt_pos(buffer, name_pos) {
             // 标签名后必须是边界字符（空白或 '>'），避免误匹配 invoked 之类
             let after = name_pos + "invoke".len();
-            let next_ok = buffer.as_bytes().get(after).map_or(true, |c| {
+            let next_ok = buffer.as_bytes().get(after).is_none_or(|c| {
                 c.is_ascii_whitespace() || *c == b'>' || *c == b'/'
             });
             let has_quote_before = lt > 0 && is_quote_char(buffer, lt - 1);
@@ -387,7 +384,7 @@ fn find_next_invoke_open(buffer: &str, start: usize) -> Option<usize> {
         let name_pos = search + rel;
         if let Some(lt) = open_tag_lt_pos(region, name_pos) {
             let after = name_pos + "invoke".len();
-            let next_ok = region.as_bytes().get(after).map_or(true, |c| {
+            let next_ok = region.as_bytes().get(after).is_none_or(|c| {
                 c.is_ascii_whitespace() || *c == b'>' || *c == b'/'
             });
             if next_ok {
@@ -702,11 +699,10 @@ fn fence_open_after(open: bool, partial: &str, text: &str) -> bool {
 /// 保留这段尾巴等下一个 chunk 拼齐，避免把半个标签当文本吐出去。
 fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
     // 任何形如 `<...`（最后一个 '<' 之后没有 '>'）的尾巴都可能是部分开标签
-    if let Some(lt) = buf.rfind('<') {
-        if !buf[lt..].contains('>') {
+    if let Some(lt) = buf.rfind('<')
+        && !buf[lt..].contains('>') {
             return buf.len() - lt;
         }
-    }
     0
 }
 
@@ -773,6 +769,7 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
 /// 返回的 content block 形态与调用方现有约定一致：
 ///   - 文本：`{"type":"text","text": "..."}`
 ///   - 工具：`{"type":"tool_use","id":"toolu_...","name":"...","input": {...}}`
+///
 /// 文本块按需合并相邻片段；空文本片段不产出。`input` 解析失败时 fall back 成 `{}`。
 ///
 /// `tool_name_map`（短名 → 原始名）用于把捞回的工具名还原成客户端可识别的原始名，
@@ -1287,10 +1284,7 @@ impl SseStateManager {
     /// 生成最终事件序列
     pub fn generate_final_events(
         &mut self,
-        input_tokens: i32,
         output_tokens: i32,
-        cache_creation_input_tokens: i32,
-        cache_read_input_tokens: i32,
         metering: Option<&MeteringEvent>,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
@@ -1312,12 +1306,10 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
-            let mut usage_json = json!({
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cache_creation_input_tokens": cache_creation_input_tokens,
-                "cache_read_input_tokens": cache_read_input_tokens
-            });
+            // Anthropic streaming declares all input-side usage in message_start.
+            // Re-sending corrected input/cache fields here makes clients merge the
+            // two snapshots and double-count the context.
+            let mut usage_json = json!({ "output_tokens": output_tokens });
             // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
             // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
             if let Some(m) = metering {
@@ -1435,6 +1427,11 @@ pub struct StreamContext {
 }
 
 impl StreamContext {
+    /// Input/cache split available before the upstream stream starts.
+    fn estimated_usage(&self) -> (i32, i32, i32) {
+        self.cache_usage.split_against_total(self.input_tokens)
+    }
+
     /// 解析最终上报口径的 `(input_tokens, cache_creation, cache_read)`。
     ///
     /// total 真值优先取 contextUsage（上游真实百分比×窗口），否则用客户端估算的
@@ -1512,6 +1509,7 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let (input_tokens, cache_creation, cache_read) = self.estimated_usage();
         json!({
             "type": "message_start",
             "message": {
@@ -1523,10 +1521,10 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": input_tokens,
                     "output_tokens": 1,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_creation,
+                    "cache_read_input_tokens": cache_read
                 }
             }
         })
@@ -1743,13 +1741,12 @@ impl StreamContext {
                 if let Some(end_pos) = find_real_thinking_end_tag(&self.thinking_buffer) {
                     // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
-                        if let Some(thinking_index) = self.thinking_block_index {
+                    if !thinking_content.is_empty()
+                        && let Some(thinking_index) = self.thinking_block_index {
                             events.push(
                                 self.create_thinking_delta_event(thinking_index, &thinking_content),
                             );
                         }
-                    }
 
                     // 结束 thinking 块
                     self.in_thinking_block = false;
@@ -1786,13 +1783,12 @@ impl StreamContext {
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
-                        if !safe_content.is_empty() {
-                            if let Some(thinking_index) = self.thinking_block_index {
+                        if !safe_content.is_empty()
+                            && let Some(thinking_index) = self.thinking_block_index {
                                 events.push(
                                     self.create_thinking_delta_event(thinking_index, &safe_content),
                                 );
                             }
-                        }
                         self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                     }
                     break;
@@ -2035,11 +2031,10 @@ impl StreamContext {
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
         // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
-        if let Some(idx) = self.text_block_index {
-            if !self.state_manager.is_block_open_of_type(idx, "text") {
+        if let Some(idx) = self.text_block_index
+            && !self.state_manager.is_block_open_of_type(idx, "text") {
                 self.text_block_index = None;
             }
-        }
 
         // 获取或创建文本块索引
         let text_index = if let Some(idx) = self.text_block_index {
@@ -2335,16 +2330,15 @@ impl StreamContext {
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
         // thinking 结束标签会滞留在 thinking_buffer，导致后续 flush 时把 `</thinking>` 当作内容输出。
         // 这里在开始 tool_use block 前做一次“边界场景”的结束标签识别与过滤。
-        if self.thinking_enabled && self.in_thinking_block {
-            if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
+        if self.thinking_enabled && self.in_thinking_block
+            && let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                if !thinking_content.is_empty() {
-                    if let Some(thinking_index) = self.thinking_block_index {
+                if !thinking_content.is_empty()
+                    && let Some(thinking_index) = self.thinking_block_index {
                         events.push(
                             self.create_thinking_delta_event(thinking_index, &thinking_content),
                         );
                     }
-                }
 
                 // 结束 thinking 块
                 self.in_thinking_block = false;
@@ -2371,7 +2365,6 @@ impl StreamContext {
                     events.extend(self.create_text_delta_events(&remaining));
                 }
             }
-        }
 
         // thinking 模式下，process_content_with_thinking 可能会为了探测 `<thinking>` 而暂存一小段尾部文本。
         // 如果此时直接开始 tool_use，状态机会自动关闭 text block，导致这段"待输出文本"看起来被 tool_use 吞掉。
@@ -2431,13 +2424,12 @@ impl StreamContext {
                     find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer)
                 {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
-                        if let Some(thinking_index) = self.thinking_block_index {
+                    if !thinking_content.is_empty()
+                        && let Some(thinking_index) = self.thinking_block_index {
                             events.push(
                                 self.create_thinking_delta_event(thinking_index, &thinking_content),
                             );
                         }
-                    }
 
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
@@ -2516,15 +2508,10 @@ impl StreamContext {
             self.state_manager.set_stop_reason("error");
         }
 
-        // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
-        let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
-
-        // 生成最终事件（message_delta + message_stop）
+        // 输入侧 usage 已在 message_start 声明；收尾只发送 output_tokens，避免
+        // Claude Code 把 start 的估算 input 与这里的最终 cache usage 合并重复计数。
         events.extend(self.state_manager.generate_final_events(
-            final_input_tokens,
             self.output_tokens,
-            cache_creation,
-            cache_read,
             self.metering.as_ref(),
         ));
 
@@ -2636,15 +2623,13 @@ impl BufferedStreamContext {
 
         // 更正 message_start 事件中的 input_tokens 与 cache_* 字段
         for event in &mut self.event_buffer {
-            if event.event == "message_start" {
-                if let Some(message) = event.data.get_mut("message") {
-                    if let Some(usage) = message.get_mut("usage") {
+            if event.event == "message_start"
+                && let Some(message) = event.data.get_mut("message")
+                    && let Some(usage) = message.get_mut("usage") {
                         usage["input_tokens"] = serde_json::json!(final_input_tokens);
                         usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
                         usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
                     }
-                }
-            }
         }
 
         std::mem::take(&mut self.event_buffer)
@@ -4782,7 +4767,7 @@ mod tests {
     fn test_generate_final_events_omits_credit_fields_without_metering() {
         // 没有 meteringEvent 时不应在 usage 里写 credit_* 字段。
         let mut manager = SseStateManager::new();
-        let events = manager.generate_final_events(10, 5, 0, 0, None);
+        let events = manager.generate_final_events(5, None);
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")
@@ -4799,7 +4784,7 @@ mod tests {
         let metering = parse_metering(
             r#"{"unit":"credit","unitPlural":"credits","usage":0.75}"#,
         );
-        let events = manager.generate_final_events(10, 5, 0, 0, Some(&metering));
+        let events = manager.generate_final_events(5, Some(&metering));
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")
@@ -4808,9 +4793,103 @@ mod tests {
         assert_eq!(usage["credit_usage"], json!(0.75));
         assert_eq!(usage["credit_unit"], json!("credit"));
         assert_eq!(usage["credit_unit_plural"], json!("credits"));
-        // 既有字段保持原样
-        assert_eq!(usage["input_tokens"], json!(10));
+        assert!(usage.get("input_tokens").is_none());
+        assert!(usage.get("cache_creation_input_tokens").is_none());
+        assert!(usage.get("cache_read_input_tokens").is_none());
         assert_eq!(usage["output_tokens"], json!(5));
+    }
+
+    #[test]
+    fn realtime_usage_is_declared_once_and_cannot_be_double_counted() {
+        use crate::anthropic::cache_metering::CacheUsage;
+        use crate::kiro::model::events::ContextUsageEvent;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            63_052,
+            1_000_000,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.cache_usage = CacheUsage {
+            cache_read: 70_000,
+            cache_covered_est: 80_000,
+            prompt_total_est: 100_000,
+        };
+
+        let mut events = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+            context_usage_percentage: 10.0,
+        }));
+        ctx.output_tokens = 5;
+        events.extend(ctx.generate_final_events());
+
+        let start_usage = &events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .expect("message_start must exist")
+            .data["message"]["usage"];
+        let start_total = start_usage["input_tokens"].as_i64().unwrap()
+            + start_usage["cache_creation_input_tokens"].as_i64().unwrap()
+            + start_usage["cache_read_input_tokens"].as_i64().unwrap();
+        assert_eq!(start_total, 63_052, "start usage must be mutually exclusive");
+
+        let delta_usage = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta must exist")
+            .data["usage"];
+        assert_eq!(delta_usage["output_tokens"], json!(5));
+        assert!(delta_usage.get("input_tokens").is_none());
+        assert!(delta_usage.get("cache_creation_input_tokens").is_none());
+        assert!(delta_usage.get("cache_read_input_tokens").is_none());
+
+        let (input, creation, read) = ctx.resolved_usage();
+        assert_eq!(input + creation + read, 100_000);
+    }
+
+    #[test]
+    fn buffered_stream_rewrites_message_start_with_final_usage_only() {
+        use crate::anthropic::cache_metering::CacheUsage;
+        use crate::kiro::model::events::ContextUsageEvent;
+
+        let mut ctx = BufferedStreamContext::new(
+            "claude-opus-5",
+            63_052,
+            1_000_000,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.set_cache_usage(CacheUsage {
+            cache_read: 70_000,
+            cache_covered_est: 80_000,
+            prompt_total_est: 100_000,
+        });
+        ctx.process_and_buffer(&Event::ContextUsage(ContextUsageEvent {
+            context_usage_percentage: 10.0,
+        }));
+
+        let events = ctx.finish_and_get_all_events();
+        let start_usage = &events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .expect("message_start must exist")
+            .data["message"]["usage"];
+        let start_total = start_usage["input_tokens"].as_i64().unwrap()
+            + start_usage["cache_creation_input_tokens"].as_i64().unwrap()
+            + start_usage["cache_read_input_tokens"].as_i64().unwrap();
+        assert_eq!(start_total, 100_000);
+
+        let delta_usage = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta must exist")
+            .data["usage"];
+        assert!(delta_usage.get("input_tokens").is_none());
+        assert!(delta_usage.get("cache_creation_input_tokens").is_none());
+        assert!(delta_usage.get("cache_read_input_tokens").is_none());
     }
 
     #[test]

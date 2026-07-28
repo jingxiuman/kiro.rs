@@ -322,11 +322,10 @@ impl ProxyPoolManager {
         }
         drop(entries);
 
-        if !added.is_empty() {
-            if let Err(e) = self.persist() {
+        if !added.is_empty()
+            && let Err(e) = self.persist() {
                 tracing::warn!("批量添加代理后持久化失败: {}", e);
             }
-        }
 
         (added, errors)
     }
@@ -640,19 +639,17 @@ impl ProxyPoolManager {
         let mut changed = false;
         {
             let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|e| e.url == url) {
-                if entry.request_failures != 0 || entry.last_request_error.is_some() {
+            if let Some(entry) = entries.iter_mut().find(|e| e.url == url)
+                && (entry.request_failures != 0 || entry.last_request_error.is_some()) {
                     entry.request_failures = 0;
                     entry.last_request_error = None;
                     changed = true;
                 }
-            }
         }
-        if changed {
-            if let Err(e) = self.persist() {
+        if changed
+            && let Err(e) = self.persist() {
                 tracing::warn!("请求级反馈持久化失败: {}", e);
             }
-        }
     }
 
     /// 请求级失败反馈：真实上游请求经该代理失败（网络错误 / 流中断）。

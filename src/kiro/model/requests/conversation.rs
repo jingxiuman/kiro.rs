@@ -163,6 +163,7 @@ impl Default for EnvState {
 /// 包含工具定义和工具执行结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct UserInputMessageContext {
     /// 环境状态（kiro-cli 始终携带）
     pub env_state: EnvState,
@@ -174,15 +175,6 @@ pub struct UserInputMessageContext {
     pub tools: Vec<Tool>,
 }
 
-impl Default for UserInputMessageContext {
-    fn default() -> Self {
-        Self {
-            env_state: EnvState::default(),
-            tool_results: Vec::new(),
-            tools: Vec::new(),
-        }
-    }
-}
 
 fn is_empty_context(ctx: &UserInputMessageContext) -> bool {
     ctx.tools.is_empty() && ctx.tool_results.is_empty()

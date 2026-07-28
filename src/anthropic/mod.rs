@@ -24,6 +24,7 @@
 
 mod converter;
 mod handlers;
+mod metadata;
 mod middleware;
 pub mod model_registry;
 pub mod model_registry_store;

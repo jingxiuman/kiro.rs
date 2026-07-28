@@ -251,12 +251,11 @@ pub(super) fn push_merged(merged: &mut Vec<(String, Vec<Value>)>, role: &str, bl
     if blocks.is_empty() {
         return;
     }
-    if let Some(last) = merged.last_mut() {
-        if last.0 == role {
+    if let Some(last) = merged.last_mut()
+        && last.0 == role {
             last.1.extend(blocks);
             return;
         }
-    }
     merged.push((role.to_string(), blocks));
 }
 
@@ -303,11 +302,10 @@ pub(super) fn collect_text_strings(content: Option<&Value>) -> Vec<String> {
         }
         Some(Value::Array(parts)) => {
             for part in parts {
-                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                    if !t.is_empty() {
+                if let Some(t) = part.get("text").and_then(|v| v.as_str())
+                    && !t.is_empty() {
                         out.push(t.to_string());
                     }
-                }
             }
         }
         _ => {}
@@ -474,14 +472,13 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
     }
 
     // web_search loop 的带外思考文本（不进 content，避免 Anthropic 客户端回放）
-    if let Some(t) = anthropic.get("kiro_thinking").and_then(|v| v.as_str()) {
-        if !t.is_empty() {
+    if let Some(t) = anthropic.get("kiro_thinking").and_then(|v| v.as_str())
+        && !t.is_empty() {
             if !thinking.is_empty() {
                 thinking.push_str("\n\n");
             }
             thinking.push_str(t);
         }
-    }
 
     let stop_reason = anthropic
         .get("stop_reason")

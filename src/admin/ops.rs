@@ -409,7 +409,7 @@ impl OpsStore {
         }
 
         let mut out: Vec<OpsCredentialRow> = map.into_values().collect();
-        out.sort_by(|a, b| b.total.cmp(&a.total));
+        out.sort_by_key(|row| std::cmp::Reverse(row.total));
         out
     }
 
@@ -479,7 +479,7 @@ impl OpsStore {
         }
 
         let mut out: Vec<OpsProxyRow> = map.into_values().collect();
-        out.sort_by(|a, b| b.attempts.cmp(&a.attempts));
+        out.sort_by_key(|row| std::cmp::Reverse(row.attempts));
         out
     }
 

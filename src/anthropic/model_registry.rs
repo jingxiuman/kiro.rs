@@ -12,33 +12,27 @@ use std::collections::{HashMap, HashSet};
 /// 匹配方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum MatchKind {
     /// 精确匹配（默认）。
+    #[default]
     Exact,
     /// 前缀匹配。用于复现 `gpt-5*` 通配透传，命中后上游 id 为「小写后的请求名原样」。
     Prefix,
 }
 
-impl Default for MatchKind {
-    fn default() -> Self {
-        Self::Exact
-    }
-}
 
 /// 模型状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ModelStatus {
+    #[default]
     Active,
     /// 上游已不再返回，但保留且仍可用（不打断在用客户端）。
     Deprecated,
 }
 
-impl Default for ModelStatus {
-    fn default() -> Self {
-        Self::Active
-    }
-}
 
 /// 行来源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -600,11 +594,13 @@ impl ModelRegistry {
         &self.aliases
     }
 
-    /// 测试与同步服务用于就地修改行。
+    /// 测试用于就地修改行。
+    #[cfg(test)]
     pub fn rows_mut(&mut self) -> &mut Vec<ModelRow> {
         &mut self.rows
     }
 
+    #[cfg(test)]
     pub fn set_aliases(&mut self, aliases: Vec<ModelAlias>) {
         self.aliases = aliases;
     }
@@ -662,8 +658,8 @@ impl ModelRegistry {
         }
 
         // 3. {exposed_id}-thinking 命中，且该行开启 thinking 变体
-        if let Some(base) = lower.strip_suffix("-thinking") {
-            if let Some(row) = self
+        if let Some(base) = lower.strip_suffix("-thinking")
+            && let Some(row) = self
                 .rows
                 .iter()
                 .find(|r| r.match_kind == MatchKind::Exact && r.exposed_id == base)
@@ -679,7 +675,6 @@ impl ModelRegistry {
                     return Self::hit(row, row.upstream_id.clone());
                 }
             }
-        }
 
         // 4. prefix 行，最长前缀优先；上游 id = 小写请求名原样。
         //    必须在规范化匹配之前：规范化会剥掉日期后缀，而 gpt-5* 这类
@@ -2315,4 +2310,3 @@ mod tests {
         assert_eq!(mapped(&r, "claude-opus-4-5-20251101").0, "claude-opus-4.5");
     }
 }
-

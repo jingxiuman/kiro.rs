@@ -74,11 +74,10 @@ impl UsageRecorder {
         } else {
             dir
         };
-        if !dir.exists() {
-            if let Err(e) = std::fs::create_dir_all(&dir) {
+        if !dir.exists()
+            && let Err(e) = std::fs::create_dir_all(&dir) {
                 tracing::warn!("创建 usage_log 目录失败 {}: {}", dir.display(), e);
             }
-        }
         Self {
             inner: Mutex::new(RecorderState {
                 current_date: None,
@@ -153,12 +152,11 @@ impl UsageRecorder {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if let Some(date) = parse_usage_log_filename(&name) {
-                if date < cutoff {
+            if let Some(date) = parse_usage_log_filename(&name)
+                && date < cutoff {
                     let _ = std::fs::remove_file(entry.path());
                     tracing::info!("已清理过期 usage_log: {}", name);
                 }
-            }
         }
     }
 }
@@ -505,7 +503,7 @@ impl UsageAggregator {
                 output_tokens: stats.output_tokens,
             })
             .collect();
-        out.sort_by(|a, b| b.calls.cmp(&a.calls));
+        out.sort_by_key(|row| std::cmp::Reverse(row.calls));
         out
     }
 
@@ -524,11 +522,10 @@ impl UsageAggregator {
                 continue;
             };
             for (id, stats) in group {
-                if let Some(allow) = cred_filter {
-                    if !allow.contains(id) {
+                if let Some(allow) = cred_filter
+                    && !allow.contains(id) {
                         continue;
                     }
-                }
                 let entry = acc.entry(*id).or_default();
                 entry.input_tokens += stats.input_tokens;
                 entry.output_tokens += stats.output_tokens;
@@ -546,7 +543,7 @@ impl UsageAggregator {
                 errors: stats.errors,
             })
             .collect();
-        out.sort_by(|a, b| b.calls.cmp(&a.calls));
+        out.sort_by_key(|row| std::cmp::Reverse(row.calls));
         out
     }
 
