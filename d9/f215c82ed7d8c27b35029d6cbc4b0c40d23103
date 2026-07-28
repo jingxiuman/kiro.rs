@@ -1,0 +1,34 @@
+src/admin/service.rs
+  s_3abfacbc70cc70::t_2750b71830f323 4724-4791
+  s_3abfacbc70cc70::t_5f7b313bed4ae7 595-602
+  s_3abfacbc70cc70::t_55613151456a72 603
+  s_3abfacbc70cc70::t_733f1546d988ca 4792
+  s_64f1bc5fe50310::t_3ba3afee1e4544 620,650
+src/admin/types.rs
+  s_3abfacbc70cc70::t_69c3440c40c952 16-17
+  s_3abfacbc70cc70::t_61147935bdc770 37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "d9f215c82ed7d8c27b35029d6cbc4b0c40d23103",
+  "prompts": {},
+  "sessions": {
+    "s_3abfacbc70cc70": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "734fde98-8bbd-4110-85b1-91cfb2a253fc",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    },
+    "s_64f1bc5fe50310": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af0da6eab4732c5e1",
+        "model": "unknown"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
