@@ -49,13 +49,12 @@ use super::middleware::{AppState, KeyContext};
 use super::openai::{
     ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message, push_merged,
 };
-use super::types::{Message, MessagesRequest, OutputConfig, SystemMessage, Tool};
+use super::types::{
+    DEFAULT_MAX_TOKENS, Message, MessagesRequest, OutputConfig, SystemMessage, Tool,
+};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
-
-/// 未显式给出 max_output_tokens 时的默认输出上限
-const DEFAULT_MAX_TOKENS: i32 = 32000;
 
 /// 无 codex 工具时的严格提示（保持既有已验证的纯聊天/搜索行为）
 const NUDGE_STRICT: &str = "You have a web_search tool that returns live results. For anything \
