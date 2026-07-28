@@ -30,6 +30,16 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
+#[derive(Default)]
+pub(crate) struct CredentialUpdate {
+    pub email: Option<Option<String>>,
+    pub proxy_url: Option<Option<String>>,
+    pub proxy_username: Option<Option<String>>,
+    pub proxy_password: Option<Option<String>>,
+    pub groups: Option<Vec<String>>,
+    pub source_channel: Option<Option<String>>,
+}
+
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
     credentials: &KiroCredentials,
@@ -3053,12 +3063,7 @@ impl MultiTokenManager {
     pub fn update_credential(
         &self,
         id: u64,
-        email: Option<Option<String>>,
-        proxy_url: Option<Option<String>>,
-        proxy_username: Option<Option<String>>,
-        proxy_password: Option<Option<String>>,
-        groups: Option<Vec<String>>,
-        source_channel: Option<Option<String>>,
+        update: CredentialUpdate,
     ) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
@@ -3067,23 +3072,23 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
 
-            if let Some(v) = email {
+            if let Some(v) = update.email {
                 entry.credentials.email = v.filter(|s| !s.is_empty());
             }
-            if let Some(v) = proxy_url {
+            if let Some(v) = update.proxy_url {
                 entry.credentials.proxy_url = v.filter(|s| !s.is_empty());
             }
-            if let Some(v) = proxy_username {
+            if let Some(v) = update.proxy_username {
                 entry.credentials.proxy_username = v.filter(|s| !s.is_empty());
             }
-            if let Some(v) = proxy_password {
+            if let Some(v) = update.proxy_password {
                 entry.credentials.proxy_password = v.filter(|s| !s.is_empty());
             }
-            if let Some(g) = groups {
+            if let Some(g) = update.groups {
                 entry.credentials.groups =
                     g.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             }
-            if let Some(v) = source_channel {
+            if let Some(v) = update.source_channel {
                 entry.credentials.source_channel =
                     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             }

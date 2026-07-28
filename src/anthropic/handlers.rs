@@ -73,11 +73,11 @@ impl UsageRecordHook {
         credential_id: u64,
         input_tokens: i32,
         output_tokens: i32,
-        cache_creation_tokens: i32,
-        cache_read_tokens: i32,
+        cache_tokens: (i32, i32),
         credits: f64,
         status: &str,
     ) {
+        let (cache_creation_tokens, cache_read_tokens) = cache_tokens;
         let rec = UsageRecord {
             ts: Utc::now().to_rfc3339(),
             key_id: self.key_id,
@@ -164,6 +164,15 @@ struct RequestTraceOptions {
     model: String,
     is_stream: bool,
     session_id: Option<String>,
+}
+
+struct ResponseProcessingConfig {
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
+    cache_usage: super::cache_metering::CacheUsage,
+    group: Option<String>,
+    context_window: i32,
 }
 
 /// 从请求 metadata.user_id 提取 Claude Code 会话 id。
@@ -703,7 +712,7 @@ pub async fn post_messages(
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, (0, 0), 0.0, "error");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -739,7 +748,7 @@ pub async fn post_messages(
         .await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
         let status = if resp.status().is_success() { "success" } else { "error" };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        hook.record(0, input_tokens, 0, (0, 0), 0.0, status);
         return resp;
     }
 
@@ -757,7 +766,7 @@ pub async fn post_messages(
         Ok(result) => result,
         Err(e) => {
             tracing::warn!("请求转换失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, (0, 0), 0.0, "error");
             // 文案与状态码见 conversion_error_response（抽出来是为了可测）
             return conversion_error_response(&e).into_response();
         }
@@ -775,7 +784,7 @@ pub async fn post_messages(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, (0, 0), 0.0, "error");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -832,14 +841,16 @@ pub async fn post_messages(
             &request_body,
             &payload.model,
             total_input_tokens,
-            thinking_enabled,
-            tool_name_map,
-            known_tool_names,
             hook,
-            cache_usage,
             tracer,
-            key_ctx.group.clone(),
-            context_window,
+            ResponseProcessingConfig {
+                thinking_enabled,
+                tool_name_map,
+                known_tool_names,
+                cache_usage,
+                group: key_ctx.group.clone(),
+                context_window,
+            },
         )
         .await
     } else {
@@ -859,14 +870,16 @@ pub async fn post_messages(
             &request_body,
             &payload.model,
             total_input_tokens,
-            extract_thinking,
-            tool_name_map,
-            known_tool_names,
             hook,
-            cache_usage,
             tracer,
-            key_ctx.group.clone(),
-            context_window,
+            ResponseProcessingConfig {
+                thinking_enabled: extract_thinking,
+                tool_name_map,
+                known_tool_names,
+                cache_usage,
+                group: key_ctx.group.clone(),
+                context_window,
+            },
         )
         .await
     }
@@ -878,21 +891,23 @@ async fn handle_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
-    thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
-    known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
-    cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
-    // 请求入口随 ConversionResult 传入的输入上下文窗口，见 handle_non_stream_request 同名参数注释。
-    context_window: i32,
+    config: ResponseProcessingConfig,
 ) -> Response {
+    let ResponseProcessingConfig {
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+        cache_usage,
+        group,
+        context_window,
+    } = config;
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(0, input_tokens, 0, (0, 0), 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
             tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
@@ -1173,8 +1188,7 @@ fn record_stream_usage(
         credential_id,
         input,
         ctx.output_tokens,
-        cache_creation,
-        cache_read,
+        (cache_creation, cache_read),
         ctx.credits,
         status,
     );
@@ -1198,24 +1212,25 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
-    thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
-    // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探，
-    // 因此这里不需要工具表校验；保留参数以对齐调用方签名。
-    _known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
-    cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
-    // 请求入口随 ConversionResult 传入的输入上下文窗口，单请求内只取一次快照，
-    // 避免响应处理阶段回头查全局注册表（热重载可能导致「用旧表映射、用新表计量」）。
-    context_window: i32,
+    config: ResponseProcessingConfig,
 ) -> Response {
+    let ResponseProcessingConfig {
+        thinking_enabled,
+        tool_name_map,
+        // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探。
+        known_tool_names: _,
+        cache_usage,
+        group,
+        // 请求入口只取一次窗口快照，避免响应阶段读取热重载后的新注册表。
+        context_window,
+    } = config;
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(0, input_tokens, 0, (0, 0), 0.0, "error");
             tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
@@ -1231,7 +1246,7 @@ async fn handle_non_stream_request(
         Err(e) => {
             let detail = describe_reqwest_error(&e);
             tracing::error!("读取响应体失败: {}", detail);
-            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(credential_id, input_tokens, 0, (0, 0), 0.0, "error");
             // 连接已建立后 body 读取失败 = 传输链路失败，计入所用代理
             report_stream_outcome(&ops_feedback, true, &detail);
             tracer.finalize(
@@ -1376,7 +1391,7 @@ async fn handle_non_stream_request(
     if let Some(err) = tool_json_error {
         let incomplete = err.is_incomplete();
         let message = err.message();
-        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        hook.record(credential_id, input_tokens, 0, (0, 0), 0.0, "error");
         report_stream_outcome(&ops_feedback, incomplete, &message);
         tracer.finalize(
             "error",
@@ -1452,8 +1467,7 @@ async fn handle_non_stream_request(
         credential_id,
         final_input_tokens,
         output_tokens,
-        cache_creation_tokens,
-        cache_read_tokens,
+        (cache_creation_tokens, cache_read_tokens),
         credits,
         "success",
     );
@@ -1627,7 +1641,7 @@ pub async fn post_messages_cc(
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, (0, 0), 0.0, "error");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -1662,7 +1676,7 @@ pub async fn post_messages_cc(
         )
         .await;
         let status = if resp.status().is_success() { "success" } else { "error" };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        hook.record(0, input_tokens, 0, (0, 0), 0.0, status);
         return resp;
     }
 
@@ -1680,7 +1694,7 @@ pub async fn post_messages_cc(
         Ok(result) => result,
         Err(e) => {
             tracing::warn!("请求转换失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, (0, 0), 0.0, "error");
             // 文案与状态码见 conversion_error_response（抽出来是为了可测）
             return conversion_error_response(&e).into_response();
         }
@@ -1698,7 +1712,7 @@ pub async fn post_messages_cc(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, (0, 0), 0.0, "error");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -1753,15 +1767,17 @@ pub async fn post_messages_cc(
             provider,
             &request_body,
             &payload.model,
-            thinking_enabled,
-            tool_name_map,
-            known_tool_names,
-            hook,
             total_input_tokens,
-            cache_usage,
+            hook,
             tracer,
-            key_ctx.group.clone(),
-            context_window,
+            ResponseProcessingConfig {
+                thinking_enabled,
+                tool_name_map,
+                known_tool_names,
+                cache_usage,
+                group: key_ctx.group.clone(),
+                context_window,
+            },
         )
         .await
     } else {
@@ -1781,14 +1797,16 @@ pub async fn post_messages_cc(
             &request_body,
             &payload.model,
             total_input_tokens,
-            extract_thinking,
-            tool_name_map,
-            known_tool_names,
             hook,
-            cache_usage,
             tracer,
-            key_ctx.group.clone(),
-            context_window,
+            ResponseProcessingConfig {
+                thinking_enabled: extract_thinking,
+                tool_name_map,
+                known_tool_names,
+                cache_usage,
+                group: key_ctx.group.clone(),
+                context_window,
+            },
         )
         .await
     }
@@ -1802,22 +1820,24 @@ async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
-    thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
-    known_tool_names: std::collections::HashSet<String>,
-    hook: UsageRecordHook,
     fallback_input_tokens: i32,
-    cache_usage: super::cache_metering::CacheUsage,
+    hook: UsageRecordHook,
     tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
-    // 请求入口随 ConversionResult 传入的输入上下文窗口，见 handle_non_stream_request 同名参数注释。
-    context_window: i32,
+    config: ResponseProcessingConfig,
 ) -> Response {
+    let ResponseProcessingConfig {
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+        cache_usage,
+        group,
+        context_window,
+    } = config;
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
-            hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(0, fallback_input_tokens, 0, (0, 0), 0.0, "error");
             tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
@@ -1949,7 +1969,7 @@ fn create_buffered_sse_stream(
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
-                                hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                hook.record(credential_id, i, o, (cc, cr), credits, "error");
                                 report_stream_outcome(&ops_feedback, true, &detail);
                                 // 缓冲模式 chunk 读取失败：上游中途断流
                                 tracer.finalize(
@@ -2000,7 +2020,7 @@ fn create_buffered_sse_stream(
                                     // 见实时流路径同名分支
                                     let incomplete =
                                         ctx.tool_json_error_incomplete().unwrap_or(true);
-                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                    hook.record(credential_id, i, o, (cc, cr), credits, "error");
                                     report_stream_outcome(&ops_feedback, incomplete, &message);
                                     tracer.finalize(
                                         "error",
@@ -2014,7 +2034,7 @@ fn create_buffered_sse_stream(
                                         trace_usage,
                                     );
                                 } else {
-                                    hook.record(credential_id, i, o, cc, cr, credits, "success");
+                                    hook.record(credential_id, i, o, (cc, cr), credits, "success");
                                     report_stream_outcome(&ops_feedback, false, "");
                                     tracer.finalize("success", None, None, None, trace_usage);
                                 }

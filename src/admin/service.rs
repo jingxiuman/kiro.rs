@@ -15,7 +15,7 @@ use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::credentials::{normalize_import_auth_method, validate_external_idp_endpoint};
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CredentialUpdate, MultiTokenManager};
 use crate::model::config::Config;
 
 use super::error::AdminServiceError;
@@ -1280,16 +1280,20 @@ impl AdminService {
         self.token_manager
             .update_credential(
                 id,
-                req.email.map(|v| if v.is_empty() { None } else { Some(v) }),
-                req.proxy_url
-                    .map(|v| if v.is_empty() { None } else { Some(v) }),
-                req.proxy_username
-                    .map(|v| if v.is_empty() { None } else { Some(v) }),
-                req.proxy_password
-                    .map(|v| if v.is_empty() { None } else { Some(v) }),
-                req.groups,
-                req.source_channel
-                    .map(|v| if v.is_empty() { None } else { Some(v) }),
+                CredentialUpdate {
+                    email: req.email.map(|v| if v.is_empty() { None } else { Some(v) }),
+                    proxy_url: req.proxy_url.map(|v| if v.is_empty() { None } else { Some(v) }),
+                    proxy_username: req
+                        .proxy_username
+                        .map(|v| if v.is_empty() { None } else { Some(v) }),
+                    proxy_password: req
+                        .proxy_password
+                        .map(|v| if v.is_empty() { None } else { Some(v) }),
+                    groups: req.groups,
+                    source_channel: req
+                        .source_channel
+                        .map(|v| if v.is_empty() { None } else { Some(v) }),
+                },
             )
             .map_err(|e| self.classify_error(e, id))
     }
@@ -2802,12 +2806,11 @@ impl AdminService {
         self.token_manager
             .update_credential(
                 credential_id,
-                None,            // email 不修改
-                Some(proxy_url), // 设置或清除 proxy_url（Some(None) = 清除，Some(Some(url)) = 设置）
-                None,            // proxy_username 不修改
-                None,            // proxy_password 不修改
-                None,            // groups 不修改
-                None,            // source_channel 不修改
+                CredentialUpdate {
+                    // Some(None) = 清除，Some(Some(url)) = 设置。
+                    proxy_url: Some(proxy_url),
+                    ..CredentialUpdate::default()
+                },
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -2887,7 +2890,13 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None)
+                .update_credential(
+                    *cred_id,
+                    CredentialUpdate {
+                        proxy_url: Some(Some(url)),
+                        ..CredentialUpdate::default()
+                    },
+                )
                 .is_ok()
             {
                 assigned += 1;
