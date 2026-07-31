@@ -1,0 +1,29 @@
+src/admin/router.rs
+  s_9a6f841432c23b::t_8b0dc39bd2eeff 23-24
+  s_9a6f841432c23b::t_c5828f2cd8a7c4 185
+src/admin/handlers.rs
+  s_9a6f841432c23b::t_2344fe552a8b73 1900-1930
+src/admin/ops.rs
+  s_9a6f841432c23b::t_2344fe552a8b73 32-42,138-185,195-218,220,224-368,453-485,861-942,1959-2036,2040-2041,2052-2053,2062,2064-2136,2141-2147,2149-2150,2162-2196
+  s_9a6f841432c23b::t_6e348fb3aa145c 2137-2140,2148,2151-2161
+  s_9a6f841432c23b::t_21ba6a1d373732 223
+  s_9a6f841432c23b::t_5e0fd732820f09 2037-2039,2042-2051,2054-2061,2063
+  s_9a6f841432c23b::t_9579acb908cd80 219,221-222
+  s_9a6f841432c23b::t_d636fa28471e19 186-194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "202d115e1577fb5b1d2fe44f9dc288193d785286",
+  "prompts": {},
+  "sessions": {
+    "s_9a6f841432c23b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3288a3ad-dcfe-4a5a-9ece-c573fec8d0ee",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
