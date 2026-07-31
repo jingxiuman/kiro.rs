@@ -1,0 +1,21 @@
+Cargo.lock
+  s_ef0bb9ae6ef7d6::t_da23e21ec68be0 1050
+Cargo.toml
+  s_ef0bb9ae6ef7d6::t_39c51ad918cec3 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "75216fcf16c8ef32ddcb37d4abf95508cc2f34f0",
+  "prompts": {},
+  "sessions": {
+    "s_ef0bb9ae6ef7d6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a07a60d2-98eb-43ff-aaf2-a572fbea1917",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
