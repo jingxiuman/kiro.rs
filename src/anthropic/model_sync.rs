@@ -270,6 +270,11 @@ impl ModelSyncService {
 
         // ---- 拉取 + 并集（按凭据 id 升序，保证冲突解决确定性）----
         let mut outcome = self.fetch_from(&credential_ids).await;
+        // 本轮已尝试过（无论成功失败）的凭据全集，供下方补充轮排除——
+        // 探针失败回退后 credential_ids 会被替换成采样集，失败的探针本身就不再
+        // 在 credential_ids 里了，若补充轮只排除 credential_ids 会重新拉一次刚
+        // 失败的探针（复现 N4 要修的问题）。
+        let mut attempted_ids: Vec<u64> = credential_ids.clone();
 
         // I3 修复：探针（权威轮次唯一凭据）拉取失败时，此前整轮直接返回 Err —— 探针的
         // refresh token 一旦失效，每轮都会静默地进权威分支再失败，新模型永远进不来，
@@ -299,9 +304,26 @@ impl ModelSyncService {
                 return Err("探针不可用，且回退采样后仍没有可用于同步的凭据".to_string());
             }
             outcome = self.fetch_from(&credential_ids).await;
+            attempted_ids.extend_from_slice(&credential_ids);
         }
 
         let FetchOutcome { union, mut per_credential, any_nonempty, .. } = outcome;
+
+        // ---- credentialSupport 补充轮：覆盖主轮次之外的全部可用凭据 ----
+        // 只补 per_credential（凭据可用模型集），不参与 union/权威消失判定——
+        // 注册表轮次语义不变（spec §设计-4）。失败凭据不写入，落盘时旧记录自然保留
+        // （下方 insert 按键覆盖）。每日一轮、串行拉取，凭据上百也可接受。
+        {
+            let mut extra_ids = self.fetcher.candidate_credential_ids();
+            extra_ids.retain(|id| !attempted_ids.contains(id));
+            extra_ids.sort_unstable();
+            if !extra_ids.is_empty() {
+                let extra = self.fetch_from(&extra_ids).await;
+                for (cred, models) in extra.per_credential {
+                    per_credential.insert(cred, models);
+                }
+            }
+        }
 
         // ---- 可信度判定 ----
         if !any_nonempty {
@@ -1717,5 +1739,59 @@ mod tests {
             calls
         );
         assert_eq!(calls, vec![1, 2, 4, 6], "降级应采样探针以外的 SAMPLE_SIZE 个凭据");
+    }
+
+    /// credentialSupport 补充轮：探针为 1、candidate 为 1..=5 时，权威轮只拉 1，
+    /// 补充轮应把 2..=5 也各拉一次，per_credential 覆盖全部 5 张凭据。
+    /// 凭据 3 拉取失败：其余 4 张照常写入，3 的旧记录保留不清空。
+    #[tokio::test]
+    async fn credential_support_covers_all_usable_credentials() {
+        let _registry_guard =
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("credsupport-all");
+
+        // 阶段 0：先用凭据 3 跑一轮，给 credential_support["3"] 种下旧记录。
+        let seed_fetcher =
+            Arc::new(FakeFetcher::new(vec![(3, Ok(vec![upstream("claude-p3-old", Some(200_000))]))]));
+        ModelSyncService::new(store.clone(), seed_fetcher).sync_once(Some(3), now()).await.unwrap();
+        let out0 = store.load();
+        assert_eq!(
+            out0.file.credential_support.get("3").unwrap(),
+            &vec!["claude-p3-old".to_string()]
+        );
+
+        // 阶段 1：探针为 1，candidate 为 1..=5；凭据 3 本轮拉取失败。
+        let fetcher = Arc::new(FakeFetcher::new(vec![
+            (1, Ok(vec![upstream("claude-p1", Some(200_000))])),
+            (2, Ok(vec![upstream("claude-p2", Some(200_000))])),
+            (3, Err("token 刷新失败".to_string())),
+            (4, Ok(vec![upstream("claude-p4", Some(200_000))])),
+            (5, Ok(vec![upstream("claude-p5", Some(200_000))])),
+        ]));
+        ModelSyncService::new(store.clone(), fetcher.clone()).sync_once(Some(1), now()).await.unwrap();
+
+        // 断言 1：fetch 调用序列包含 1,2,3,4,5 各一次，1 不重复拉。
+        let calls = fetcher.calls();
+        assert_eq!(calls, vec![1, 2, 3, 4, 5], "权威轮拉 1，补充轮应把 2..=5 各拉一次，1 不重复拉");
+
+        // 断言 2：落盘后的 credential_support 有 5 个键。
+        let out = store.load();
+        assert_eq!(
+            out.file.credential_support.len(),
+            5,
+            "credential_support 应覆盖全部 5 张可用凭据: {:?}",
+            out.file.credential_support
+        );
+
+        // 断言 3：凭据 3 拉取失败时，其余 4 张照常写入，3 的旧记录保留不清空。
+        assert_eq!(out.file.credential_support.get("1").unwrap(), &vec!["claude-p1".to_string()]);
+        assert_eq!(out.file.credential_support.get("2").unwrap(), &vec!["claude-p2".to_string()]);
+        assert_eq!(out.file.credential_support.get("4").unwrap(), &vec!["claude-p4".to_string()]);
+        assert_eq!(out.file.credential_support.get("5").unwrap(), &vec!["claude-p5".to_string()]);
+        assert_eq!(
+            out.file.credential_support.get("3").unwrap(),
+            &vec!["claude-p3-old".to_string()],
+            "凭据 3 本轮失败，旧记录应保留不清空"
+        );
     }
 }
