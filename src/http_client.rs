@@ -22,6 +22,24 @@ const HTTP2_KEEP_ALIVE_TIMEOUT_SECS: u64 = 15;
 /// 只覆盖到代理这一跳，两层各防一段链路。
 const TCP_KEEPALIVE_SECS: u64 = 30;
 
+/// 流式上游连接的**空闲**超时：两个数据帧之间允许的最长间隔，每收到一帧即重置。
+///
+/// 不能用总超时（`Client::timeout`）约束流式响应：它覆盖整个 body 读取过程，会在
+/// 「生成正常但耗时长」时把成功的请求斩断。实测 Opus 长思考单条请求可跑到 712s，
+/// 而旧的 720s 总超时距此仅 8s——撞上去的后果是烧掉十分钟和全部输入 token 后
+/// 才拿到 timeout，是最贵的失败形态。
+///
+/// 取值须高于**合法**静默间隔的上限。历史中断簇集中在 240~265s（中间代理的 idle
+/// timeout 判死 RST_STREAM），说明合法静默确实能接近甚至超过 240s；300s 留出余量。
+/// 传输层真死不靠这个兜底——h2 PING（25s 间隔 + 15s ACK 超时）约 40s 就能识别，
+/// 本超时只管「连接活着、PING 有回应，但上游这条流再也不吐数据」的卡死。
+const STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// 编译期钉住上述取值下界：调低到合法静默上限（观测 240~265s）以下，就会把正常的
+/// Opus 长思考误判为卡死，正是本次改动要消除的失败形态。放编译期而非测试里，
+/// 是因为这是常量间的不变式，改错时应当直接编不过。
+const _: () = assert!(STREAM_IDLE_TIMEOUT_SECS > 265);
+
 /// 进程级出网策略：开启后，任何「无代理」的出网请求都会被拒绝。
 ///
 /// 用全局状态而非函数参数，是为了让**新增的出网点默认受保护**——本模块是 Kiro 上游
@@ -82,13 +100,33 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    build_client_with_policy(proxy, timeout_secs, tls_backend, require_proxy())
+    build_client_with_policy(proxy, Timeout::Total(timeout_secs), tls_backend, require_proxy())
+}
+
+/// 构建**流式**上游 Client：用空闲超时（[`STREAM_IDLE_TIMEOUT_SECS`]）而非总超时。
+///
+/// 仅供聊天/流式路径使用。认证、token 刷新、版本探测、代理探活等一问一答的调用
+/// 应继续用 [`build_client`]——对它们总超时才是正确语义。
+pub fn build_streaming_client(
+    proxy: Option<&ProxyConfig>,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    build_client_with_policy(proxy, Timeout::Idle, tls_backend, require_proxy())
+}
+
+/// Client 的超时语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Timeout {
+    /// 总请求超时（秒），覆盖建连到 body 读完的全过程。适用于一问一答。
+    Total(u64),
+    /// 空闲超时：每次成功读取后重置，不限制总时长。适用于流式。
+    Idle,
 }
 
 /// [`build_client`] 的策略显式版本。仅用于测试：全局开关会让并发跑的其它用例互相干扰。
 fn build_client_with_policy(
     proxy: Option<&ProxyConfig>,
-    timeout_secs: u64,
+    timeout: Timeout,
     tls_backend: TlsBackend,
     require_proxy: bool,
 ) -> anyhow::Result<Client> {
@@ -101,12 +139,18 @@ fn build_client_with_policy(
     }
 
     let mut builder = Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
         .http2_keep_alive_interval(Duration::from_secs(HTTP2_KEEP_ALIVE_INTERVAL_SECS))
         .http2_keep_alive_timeout(Duration::from_secs(HTTP2_KEEP_ALIVE_TIMEOUT_SECS))
         // 不开 http2_keep_alive_while_idle：有活跃流时 PING 本来就发（覆盖流式长静默这个
         // 目标场景）；池中全空闲连接 90s 就被驱逐，活不到需要保活的时刻，开了只多流量
         .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_SECS));
+
+    builder = match timeout {
+        Timeout::Total(secs) => builder.timeout(Duration::from_secs(secs)),
+        // 不设总超时：长流的活性由 read_timeout + h2 PING 两层保证，见
+        // STREAM_IDLE_TIMEOUT_SECS 的说明
+        Timeout::Idle => builder.read_timeout(Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS)),
+    };
 
     match tls_backend {
         TlsBackend::Rustls => {
@@ -238,10 +282,28 @@ mod tests {
         assert!(client.is_ok());
     }
 
+    #[test]
+    fn build_streaming_client_succeeds_with_and_without_proxy() {
+        assert!(build_client_with_policy(None, Timeout::Idle, TlsBackend::Rustls, false).is_ok());
+        let proxy = ProxyConfig::new("socks5://127.0.0.1:1080");
+        assert!(
+            build_client_with_policy(Some(&proxy), Timeout::Idle, TlsBackend::Rustls, false).is_ok()
+        );
+    }
+
+    /// 流式 client 同样受 requireProxy 约束：漏掉它就等于给流式路径开了裸连后门，
+    /// 而流式恰好是全部聊天流量的走向。
+    #[test]
+    fn require_proxy_also_guards_streaming_client() {
+        let err = build_client_with_policy(None, Timeout::Idle, TlsBackend::Rustls, true)
+            .expect_err("无代理时流式 client 也应拒绝");
+        assert!(err.to_string().contains("requireProxy"), "{err}");
+    }
+
     /// 直接测策略版本：全局开关会被并发跑的其它用例观察到，造成假失败
     #[test]
     fn require_proxy_rejects_direct_egress() {
-        let err = build_client_with_policy(None, 30, TlsBackend::Rustls, true)
+        let err = build_client_with_policy(None, Timeout::Total(30), TlsBackend::Rustls, true)
             .expect_err("无代理时应拒绝");
         let msg = err.to_string();
         assert!(msg.contains("requireProxy"), "{msg}");
@@ -251,13 +313,18 @@ mod tests {
     #[test]
     fn require_proxy_allows_egress_through_a_proxy() {
         let proxy = ProxyConfig::new("socks5://127.0.0.1:1080");
-        assert!(build_client_with_policy(Some(&proxy), 30, TlsBackend::Rustls, true).is_ok());
+        assert!(
+            build_client_with_policy(Some(&proxy), Timeout::Total(30), TlsBackend::Rustls, true)
+                .is_ok()
+        );
     }
 
     #[test]
     fn direct_egress_still_allowed_when_policy_is_off() {
         // 默认关闭时行为必须与加固前完全一致
-        assert!(build_client_with_policy(None, 30, TlsBackend::Rustls, false).is_ok());
+        assert!(
+            build_client_with_policy(None, Timeout::Total(30), TlsBackend::Rustls, false).is_ok()
+        );
     }
 
     #[test]

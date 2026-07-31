@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_streaming_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::machine_id;
@@ -147,7 +147,7 @@ impl KiroProvider {
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）。
         // 开了 requireProxy 且全局代理为空时预热必然失败——这是合法配置
         // （代理配在各凭据上），跳过预热即可，不能让启动 panic。
-        let initial_client = match build_client(proxy.as_ref(), 720, tls_backend) {
+        let initial_client = match build_streaming_client(proxy.as_ref(), tls_backend) {
             Ok(client) => Some(client),
             Err(e) if proxy.is_none() && crate::http_client::require_proxy() => {
                 tracing::info!("requireProxy 已开启且未配全局代理，跳过直连 client 预热");
@@ -193,7 +193,7 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client);
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        let client = build_streaming_client(effective.as_ref(), self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
     }
