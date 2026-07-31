@@ -1,0 +1,51 @@
+docs/streaming-timeouts.md
+  s_ef0bb9ae6ef7d6::t_dc74eab23e6b6d 39-40
+  s_ef0bb9ae6ef7d6::t_006af0b44903dc 1-30,38,41-121
+  s_ef0bb9ae6ef7d6::t_4b632086e9415f 31-37
+README.md
+  s_ef0bb9ae6ef7d6::t_62ccd59922de52 294
+  s_ef0bb9ae6ef7d6::t_a1c4897e8fe6ea 300-305
+src/model/config.rs
+  s_ef0bb9ae6ef7d6::t_aecc2be6deb8a7 489-494,498-505
+src/anthropic/handlers.rs
+  s_ea57621c035404::t_978d2a31a74c8e 1579-1585,1593-1600
+  s_ea57621c035404::t_eda2b9f6a1bf89 3022-3060
+  s_ea57621c035404::t_ba102bc83941c7 1344-1347
+  s_ea57621c035404::t_d58e258862c8d2 1459-1462,1464-1465
+  s_ea57621c035404::t_9738aec3d98375 3063-3068,3070-3071,3077,3080-3087,3089-3096,3098-3099
+docs/local-deploy.md
+  s_ef0bb9ae6ef7d6::t_540eccf6051717 50-54
+  s_ef0bb9ae6ef7d6::t_a1836eb707fc53 16-27
+  s_ef0bb9ae6ef7d6::t_8d06aa860ef675 7,33,41
+admin-ui/src/components/trace-timing-bar.tsx
+  s_ea57621c035404::t_8c94f3823b3286 138-142,144
+  s_ea57621c035404::t_7a642bd8f1c7bb 178,180-190,193-198
+  s_ea57621c035404::t_d45d5838444654 146-149
+  s_ea57621c035404::t_b7b41b20649c8d 225-234
+src/http_client.rs
+  s_ef0bb9ae6ef7d6::t_22517ae8729a61 37-45,49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "5f87c9eaf3a56499e250259f6a5516b2b862db03",
+  "prompts": {},
+  "sessions": {
+    "s_ea57621c035404": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "13ca0f38-2e72-44b2-85e7-155affc22975",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    },
+    "s_ef0bb9ae6ef7d6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a07a60d2-98eb-43ff-aaf2-a572fbea1917",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
