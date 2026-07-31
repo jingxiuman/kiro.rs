@@ -1,0 +1,28 @@
+src/http_client.rs
+  s_ef0bb9ae6ef7d6::t_3c46395d5bf61a 25-37
+  s_ef0bb9ae6ef7d6::t_6a727e533dfe9f 316-319,325-327
+  s_ef0bb9ae6ef7d6::t_fc9743e5219e01 38-42
+  s_ef0bb9ae6ef7d6::t_b17a5b4cd948d6 148-154
+  s_ef0bb9ae6ef7d6::t_f9c7afeab76ad0 285-302,306
+  s_ef0bb9ae6ef7d6::t_444c110dc3bec4 103-123,129
+src/kiro/provider.rs
+  s_ef0bb9ae6ef7d6::t_65fc8e837daa78 15
+  s_ef0bb9ae6ef7d6::t_46e6b6eb9db360 150
+  s_ef0bb9ae6ef7d6::t_211d28265ce7fe 196
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "ea3869c47c361ba21ce1cf6ab81ca28a53420c1f",
+  "prompts": {},
+  "sessions": {
+    "s_ef0bb9ae6ef7d6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a07a60d2-98eb-43ff-aaf2-a572fbea1917",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
