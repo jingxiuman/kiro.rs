@@ -340,6 +340,8 @@ pub(crate) struct StreamPhaseGuard {
     tracer: std::sync::Arc<RequestTracer>,
     sent_bytes: u64,
     last_chunk_at: Instant,
+    /// 见 [`StreamPhaseGuard::max_idle_ms`]
+    max_idle_ms: u64,
     armed: bool,
     /// guard 构造时打开的是 FIRST_TOKEN 段；[`Self::mark_first_chunk`] 把它切到
     /// STREAMING。终态方法/Drop 必须按这个字段收尾，不能硬编码 STREAMING——
@@ -355,6 +357,7 @@ impl StreamPhaseGuard {
             tracer,
             sent_bytes,
             last_chunk_at: Instant::now(),
+            max_idle_ms: 0,
             armed: true,
             current_phase: phase::FIRST_TOKEN,
         }
@@ -372,6 +375,8 @@ impl StreamPhaseGuard {
     /// 更新已发送字节数与最后一个 chunk 的时刻（每个 chunk 后调用）
     pub fn set_bytes(&mut self, sent_bytes: u64) {
         self.sent_bytes = sent_bytes;
+        let gap = self.last_chunk_at.elapsed().as_millis() as u64;
+        self.max_idle_ms = self.max_idle_ms.max(gap);
         self.last_chunk_at = Instant::now();
     }
 
@@ -380,15 +385,28 @@ impl StreamPhaseGuard {
         self.last_chunk_at.elapsed().as_millis() as u64
     }
 
+    /// 整条流中最长的 chunk 间隔（含末尾未闭合的那段）。
+    ///
+    /// 存在的理由：`idle_ms` 只在失败时被记录，于是「合法静默能有多长」这个分布
+    /// 完全不可见——只能看到被杀掉的那些，是删失数据。而 `STREAM_IDLE_TIMEOUT_SECS`
+    /// 的取值恰恰依赖这个上限（定得比它低就会亲手掐死正常请求）。成功流也记下来，
+    /// 才能用证据校准该常量，而不是猜。
+    pub fn max_idle_ms(&self) -> u64 {
+        self.max_idle_ms.max(self.idle_ms())
+    }
+
     /// 流正常结束：按值消费 guard，记当前实际打开的段（FIRST_TOKEN 或
     /// STREAMING，取决于是否已收到过 chunk）成功。
     pub fn into_completed(mut self, sent_bytes: u64) {
         self.armed = false; // 先解除，随后的 Drop 成为 no-op
+        let max_idle_ms = self.max_idle_ms();
         self.tracer.close_phase(
             self.current_phase,
             crate::admin::trace_db::outcome::SUCCESS,
             Some(sent_bytes),
-            None,
+            // 成功流也写 max_idle_ms：这是校准 STREAM_IDLE_TIMEOUT_SECS 的唯一
+            // 非删失样本，见 max_idle_ms() 的说明
+            Some(format!("max_idle_ms={}", max_idle_ms)),
         );
     }
 
@@ -401,8 +419,11 @@ impl StreamPhaseGuard {
             crate::admin::trace_db::outcome::STREAM_INTERRUPTED,
             Some(sent_bytes),
             Some(format!(
-                "client_gone=false bytes={} idle_ms={} err={}",
-                sent_bytes, idle_ms, err
+                "client_gone=false bytes={} idle_ms={} max_idle_ms={} err={}",
+                sent_bytes,
+                idle_ms,
+                self.max_idle_ms.max(idle_ms),
+                err
             )),
         );
     }
@@ -2847,6 +2868,49 @@ mod tracer_tests {
         );
         assert_eq!(got[2].outcome, outcome::UPSTREAM_TRUNCATED);
         assert_eq!(got[2].bytes, Some(20211));
+    }
+
+    /// max_idle_ms 必须是整条流的**最大** chunk 间隔，不是最后一段。
+    ///
+    /// 这个区别就是它存在的意义：卡死通常发生在流中段（长思考），末尾往往是连续
+    /// 输出，只记末值会把最长静默完全漏掉——而校准 STREAM_IDLE_TIMEOUT_SECS 要的
+    /// 恰是那个最长值。
+    #[test]
+    fn max_idle_ms_tracks_the_largest_gap_not_the_last() {
+        let t = std::sync::Arc::new(detached_tracer());
+        t.open_phase(phase::FIRST_TOKEN);
+        let mut guard = StreamPhaseGuard::new(t.clone(), 0);
+        guard.mark_first_chunk();
+
+        // 中段一个较长静默，随后是密集输出：末值远小于峰值
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        guard.set_bytes(100); // 记下 ~40ms 的峰值
+        guard.set_bytes(200); // ~0ms，不得覆盖峰值
+        guard.set_bytes(300);
+
+        assert!(
+            guard.max_idle_ms() >= 40,
+            "应保留中段峰值，实际 {}",
+            guard.max_idle_ms()
+        );
+
+        guard.into_completed(300);
+        let got = t.phases.lock();
+        let streaming = got
+            .iter()
+            .find(|p| p.phase == phase::STREAMING)
+            .expect("streaming 段应已关闭");
+        assert_eq!(streaming.outcome, outcome::SUCCESS);
+        let detail = streaming.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.starts_with("max_idle_ms="),
+            "成功流也必须写 max_idle_ms（否则合法静默分布仍不可见）: {detail}"
+        );
+        let recorded: u64 = detail
+            .trim_start_matches("max_idle_ms=")
+            .parse()
+            .expect("max_idle_ms 应为整数");
+        assert!(recorded >= 40, "落盘值应是峰值而非末值: {recorded}");
     }
 
     #[test]
