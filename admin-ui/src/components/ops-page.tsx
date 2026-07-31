@@ -29,6 +29,7 @@ import {
 } from '@/hooks/use-ops'
 import { useTraces } from '@/hooks/use-traces'
 import type {
+  DurationPercentiles,
   OpsCredentialRow,
   OpsEvent,
   OpsProxyRow,
@@ -66,6 +67,18 @@ function formatDuration(ms?: number | null): string {
   if (ms == null) return '—'
   if (ms < 1000) return `${ms}ms`
   return `${(ms / 1000).toFixed(1)}s`
+}
+
+/**
+ * 中断耗时卡的副标题。
+ *
+ * 头条取 p95 而非 p99：实测中断样本 7 天仅约 20 条，n 这么小时 p99 就等于最大值
+ * 本身，拿它当头条会让人以为有分位精度。同时把 p50 与 n 一起显示 —— p50 与 p95
+ * 拉开（如 240s vs 720s）就是"链路上存在多个不同固定超时"的信号。
+ */
+function interruptedDurationSub(d?: DurationPercentiles | null): string {
+  if (!d) return '窗口内无中断'
+  return `p50 ${formatDuration(d.p50)} · p99 ${formatDuration(d.p99)} · n=${d.n}`
 }
 
 function pct(part: number, total: number): string {
@@ -570,10 +583,10 @@ export function OpsPage() {
         />
         <StatCard
           icon={<Timer className="h-4 w-4" />}
-          label="中断平均时长"
-          value={formatDuration(overview?.interruptedAvgDurationMs)}
-          sub="集中在同一时长 → 链路固定超时"
-          tone={overview?.interruptedAvgDurationMs ? 'bad' : undefined}
+          label="中断耗时 p95"
+          value={formatDuration(overview?.interruptedDuration?.p95)}
+          sub={interruptedDurationSub(overview?.interruptedDuration)}
+          tone={overview?.interruptedDuration ? 'bad' : undefined}
         />
         <StatCard
           icon={<Network className="h-4 w-4" />}

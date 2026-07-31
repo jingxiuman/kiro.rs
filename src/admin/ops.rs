@@ -26,6 +26,9 @@ use crate::kiro::token_manager::MultiTokenManager;
 const DEFAULT_EVENTS_LIMIT: usize = 100;
 /// 统计窗口上限（小时）：防御性限制，避免全表扫描过大窗口
 const MAX_WINDOW_HOURS: i64 = 24 * 31;
+/// 交叉表每个 error_type 最多回多少个维度桶。
+/// 判断"是否集中"只需要看头部几个，全量回传对结论无增益。
+const CROSSTAB_TOP_BUCKETS: usize = 6;
 
 /// 处置事件分类
 pub mod event_category {
@@ -72,9 +75,9 @@ pub struct OpsOverview {
     /// 非流式的首字节含义（等上游吐第一口，之后还要收完整段）与流式（此后即可
     /// 边收边发给客户端）对运维决策的指向也不同。故显式钉死在流式上。
     pub avg_first_token_ms: Option<u64>,
-    /// 中断类请求（stream_interrupted / upstream_truncated）的平均持续时长。
-    /// 多次中断集中在同一时长（如 ~245s）通常指向链路上的固定超时。
-    pub interrupted_avg_duration_ms: Option<u64>,
+    /// 中断类请求（stream_interrupted / upstream_truncated）的耗时分位。
+    /// 多个中断集中在同一时长通常指向链路上的固定超时。
+    pub interrupted_duration: Option<DurationPercentiles>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,6 +85,113 @@ pub struct OpsOverview {
 pub struct ErrorTypeCount {
     pub error_type: String,
     pub count: u64,
+}
+
+/// 耗时分位。
+///
+/// 替代原先的平均值：平均值会给出一个任何真实样本都不在的数字。实测中断同时
+/// 存在 ~240s 与 ~720s 两簇（720s 恰是 `MCP_TOTAL_TIMEOUT_SECS`），平均落在
+/// 中间的 ~300s —— 两簇里都不存在,反而把"存在两个不同固定超时"这个结论抹掉。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurationPercentiles {
+    pub p50: u64,
+    pub p95: u64,
+    pub p99: u64,
+    /// 样本数。实测 7 天窗口仅约 20 条，此时 p99 就是最大值本身；
+    /// 面板必须一并显示 n，否则 p99 会被当成有统计意义的分位读。
+    pub n: u64,
+}
+
+/// 从样本算分位。就地排序后按最近秩取值。
+///
+/// 不用 SQL 算：SQLite 无 `PERCENTILE_CONT`，而中断样本量在百级以下，
+/// 取回来排序比在 SQL 里拼窗口函数更简单也更好测。
+fn percentiles(mut v: Vec<u64>) -> Option<DurationPercentiles> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    let at = |p: f64| -> u64 {
+        let idx = ((v.len() as f64 - 1.0) * p).round() as usize;
+        v[idx.min(v.len() - 1)]
+    };
+    Some(DurationPercentiles {
+        p50: at(0.50),
+        p95: at(0.95),
+        p99: at(0.99),
+        n: v.len() as u64,
+    })
+}
+
+/// 交叉表的维度
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrosstabDimension {
+    Credential,
+    Proxy,
+    Model,
+}
+
+impl CrosstabDimension {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "credential" => Some(Self::Credential),
+            "proxy" => Some(Self::Proxy),
+            "model" => Some(Self::Model),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Credential => "credential",
+            Self::Proxy => "proxy",
+            Self::Model => "model",
+        }
+    }
+}
+
+/// 交叉表里的一个维度桶
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrosstabBucket {
+    /// 维度取值。credential 为 id 字符串；proxy 为 URL（`direct` = 直连，
+    /// 空串 = 未知）；model 为模型名
+    pub key: String,
+    pub count: u64,
+    /// 该桶在窗口内的**全部**请求数（成功+失败），即流量基线
+    pub traffic: u64,
+    /// 超额倍数 = （本桶错误数 / 该 error_type 总错误数）÷（本桶流量 / 窗口总流量）
+    ///
+    /// 为什么必须有这个数：裸计数和裸集中度都会被流量分布带偏。实测
+    /// `claude-opus-5` 占全流量 63%，于是**每一种**错误都"集中"在它身上，
+    /// 看着像它有问题，其实只是它承载得多。lift ≈ 1 表示该桶的错误份额与它的
+    /// 流量份额相称（没有异常）；lift 明显 > 1 才是"这个对象错得不成比例"。
+    ///
+    /// `None` = 该桶流量为 0（窗口内只有错误没有流量记录，理论上不该出现），
+    /// 此时无法计算比值，不填 0 以免被误读成"低于预期"。
+    pub lift: Option<f64>,
+}
+
+/// 一个 error_type 在某维度上的分布
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrosstabRow {
+    pub error_type: String,
+    /// 该 error_type 在窗口内的总数
+    pub total: u64,
+    /// 头部维度桶，降序
+    pub buckets: Vec<CrosstabBucket>,
+    /// 集中度 = 最大桶 / total，范围 (0, 1]。
+    ///
+    /// 接近 1 说明该错误压在单个对象上；接近 1/维度基数 说明均匀散开。
+    ///
+    /// **单看这个数会误判**：流量本身不均匀时，占流量最大的对象在每种错误上都会
+    /// 显得"集中"。必须与桶上的 [`CrosstabBucket::lift`] 一起读 —— 集中度高
+    /// 且 lift ≈ 1 只是流量使然；集中度高**且** lift 明显 > 1 才是真信号。
+    pub concentration: f64,
+    /// 该 error_type 覆盖到的不同维度取值数，用来判断 concentration 的分母量级
+    pub distinct_keys: u64,
 }
 
 /// 按小时的请求趋势点
@@ -293,18 +403,149 @@ impl OpsStore {
         }) {
             out.by_error_type = rows.flatten().collect();
         }
-        // 中断类平均时长（固定超时特征探测）
-        out.interrupted_avg_duration_ms = conn
-            .query_row(
-                "SELECT CAST(AVG(duration_ms) AS INTEGER) FROM traces \
+        // 中断类耗时分位（固定超时特征探测）。
+        // 口径与原先的平均值完全一致（同一 error_type 过滤），只是换成分位，
+        // 保证与历史窗口可比。
+        out.interrupted_duration = conn
+            .prepare(
+                "SELECT duration_ms FROM traces \
                  WHERE ts_epoch >= ?1 \
                  AND error_type IN ('stream_interrupted', 'upstream_truncated')",
-                [cutoff],
-                |row| row.get::<_, Option<i64>>(0),
             )
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([cutoff], |row| row.get::<_, i64>(0))?;
+                Ok(rows.flatten().map(|v| v.max(0) as u64).collect::<Vec<u64>>())
+            })
+            .map_err(|e| tracing::warn!("ops 中断耗时分位查询失败: {}", e))
             .ok()
-            .flatten()
-            .map(|v| v.max(0) as u64);
+            .and_then(percentiles);
+        out
+    }
+
+    /// error_type × 维度 的交叉表。
+    ///
+    /// 回答「这个错误是全局的还是压在某个对象上」—— 一维边际统计
+    /// （[`Self::overview`] 的 `by_error_type`）答不出这个，而两种情况的处置动作相反。
+    ///
+    /// **代理归属口径**：按该 trace 的最后一跳所用代理。已用真实数据核实过，
+    /// 中断类 trace 的最后一跳 outcome 全为 `success`，即最后一跳就是成功跳，
+    /// 因此这一条规则同时满足「失败归给失败发生处」与 [`Self::by_proxy`] 里
+    /// 「中断归给成功跳」两个口径，无需按 error_type 分叉。
+    pub fn error_crosstab(&self, hours: i64, dim: CrosstabDimension) -> Vec<CrosstabRow> {
+        let cutoff = Self::window_cutoff(hours);
+        let conn = self.conn.lock();
+
+        // 维度取值表达式。proxy 需要关联最后一跳；另两个直接取 traces 列。
+        let (key_expr, join) = match dim {
+            CrosstabDimension::Credential => ("CAST(t.final_credential_id AS TEXT)", ""),
+            CrosstabDimension::Model => ("t.model", ""),
+            CrosstabDimension::Proxy => (
+                "COALESCE(a.proxy_url, '')",
+                " JOIN trace_attempts a ON a.trace_id = t.trace_id \
+                  AND a.attempt = (SELECT MAX(a2.attempt) FROM trace_attempts a2 \
+                                   WHERE a2.trace_id = t.trace_id)",
+            ),
+        };
+        let sql = format!(
+            "SELECT t.error_type, {key} AS k, COUNT(*) AS c \
+             FROM traces t{join} \
+             WHERE t.ts_epoch >= ?1 AND t.error_type IS NOT NULL \
+             GROUP BY t.error_type, k ORDER BY t.error_type ASC, c DESC",
+            key = key_expr,
+            join = join,
+        );
+
+        // 流量基线：同一维度上**全部**请求（不筛 error_type）的分布。
+        // 没有它就无法区分"这个对象错得不成比例"与"这个对象承载得最多"。
+        let baseline_sql = format!(
+            "SELECT {key} AS k, COUNT(*) FROM traces t{join} \
+             WHERE t.ts_epoch >= ?1 GROUP BY k",
+            key = key_expr,
+            join = join,
+        );
+        let mut traffic: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        match conn.prepare(&baseline_sql).and_then(|mut stmt| {
+            let rows = stmt.query_map([cutoff], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?;
+            Ok(rows.flatten().collect::<Vec<_>>())
+        }) {
+            Ok(rows) => traffic.extend(rows),
+            Err(e) => {
+                // 基线拿不到时不假装能算 lift：后面 lift 会是 None，
+                // 前端据此隐藏该列，而不是显示一个错的倍数。
+                tracing::warn!("ops 交叉表基线查询失败（dim={}）: {}", dim.as_str(), e);
+            }
+        }
+        let total_traffic: u64 = traffic.values().sum();
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("ops 交叉表查询失败（dim={}）: {}", dim.as_str(), e);
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map([cutoff], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+            ))
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("ops 交叉表查询失败（dim={}）: {}", dim.as_str(), e);
+                return Vec::new();
+            }
+        };
+
+        // SQL 已按 (error_type, count DESC) 排好，这里顺序聚成每个 error_type 一行
+        let mut out: Vec<CrosstabRow> = Vec::new();
+        for (error_type, key, count) in rows.flatten() {
+            let bucket = CrosstabBucket {
+                traffic: traffic.get(&key).copied().unwrap_or(0),
+                key,
+                count,
+                lift: None, // total 未知，等下面补
+            };
+            match out.last_mut() {
+                Some(row) if row.error_type == error_type => {
+                    row.total += count;
+                    row.distinct_keys += 1;
+                    if row.buckets.len() < CROSSTAB_TOP_BUCKETS {
+                        row.buckets.push(bucket);
+                    }
+                }
+                _ => out.push(CrosstabRow {
+                    error_type,
+                    total: count,
+                    buckets: vec![bucket],
+                    concentration: 0.0,
+                    distinct_keys: 1,
+                }),
+            }
+        }
+        // 集中度与 lift 的分母都要等该 error_type 全部桶累完才知道
+        for row in &mut out {
+            let top = row.buckets.first().map(|b| b.count).unwrap_or(0);
+            row.concentration = if row.total == 0 {
+                0.0
+            } else {
+                top as f64 / row.total as f64
+            };
+            for b in &mut row.buckets {
+                // lift = 错误份额 ÷ 流量份额
+                b.lift = if row.total == 0 || total_traffic == 0 || b.traffic == 0 {
+                    None
+                } else {
+                    let err_share = b.count as f64 / row.total as f64;
+                    let traffic_share = b.traffic as f64 / total_traffic as f64;
+                    Some(err_share / traffic_share)
+                };
+            }
+        }
+        out.sort_by_key(|row| std::cmp::Reverse(row.total));
         out
     }
 
@@ -802,14 +1043,236 @@ mod tests {
         assert_eq!(o.success, 1);
         assert_eq!(o.interrupted, 1);
         assert_eq!(o.error, 2);
-        // 中断类平均时长 = (245000 + 247000) / 2
-        assert_eq!(o.interrupted_avg_duration_ms, Some(246_000));
+        // 中断类耗时分位：样本 [245000, 247000]，n=2。
+        // 最近秩取值（无插值）：p50 的秩 = (2-1)*0.5 = 0.5，round 进位到 1 → 取上界。
+        // 偶数样本没有真正的中位数，不插值就必然偏向一侧，这是刻意取舍。
+        let d = o.interrupted_duration.expect("应有中断样本");
+        assert_eq!(d.n, 2);
+        assert_eq!(d.p50, 247_000);
+        assert_eq!(d.p99, 247_000);
         let truncated = o
             .by_error_type
             .iter()
             .find(|e| e.error_type == "upstream_truncated")
             .unwrap();
         assert_eq!(truncated.count, 1);
+    }
+
+    /// 分位替代平均值的理由必须可执行验证：双簇样本下平均值落在两簇之间的
+    /// 空档（任何真实样本都不在那里），而 p50/p99 各自落在真实簇上。
+    /// 这正是实测 ~240s 与 ~720s 两簇的情形。
+    #[test]
+    fn percentiles_expose_bimodal_clusters_that_average_would_hide() {
+        // 6 个 240s 簇 + 3 个 720s 簇
+        let mut v: Vec<u64> = vec![240_000; 6];
+        v.extend(vec![720_000; 3]);
+        let avg = v.iter().sum::<u64>() / v.len() as u64;
+        let d = percentiles(v).unwrap();
+
+        assert_eq!(d.n, 9);
+        assert_eq!(d.p50, 240_000, "p50 落在主簇");
+        assert_eq!(d.p99, 720_000, "p99 暴露次簇");
+        // 平均值 400s 既不在 240 簇也不在 720 簇 —— 它描述的是不存在的请求
+        assert_eq!(avg, 400_000);
+        assert!(
+            avg != d.p50 && avg != d.p99,
+            "平均值落在两簇之间的空档，会抹掉'存在两个固定超时'这个结论"
+        );
+    }
+
+    /// 交叉表的全部价值在于区分「压在单个对象上」与「均匀散开」，
+    /// 因为两者的处置动作相反。这个测试把两种形态放在同一窗口里对比。
+    #[test]
+    fn crosstab_separates_concentrated_from_spread_errors() {
+        let store = mem_store_with_traces();
+        // network_error：4 条全压在凭据 7 上 → 集中，处置=换掉这个凭据/它的代理
+        for (i, id) in [(0, 7), (1, 7), (2, 7), (3, 7)] {
+            insert_trace(
+                &store,
+                &format!("conc{}", i),
+                60,
+                "error",
+                Some("network_error"),
+                id,
+                500,
+            );
+        }
+        // transient：4 条散在 4 个不同凭据 → 系统性，换单个凭据无效
+        for (i, id) in [(0, 1), (1, 2), (2, 3), (3, 4)] {
+            insert_trace(
+                &store,
+                &format!("spread{}", i),
+                60,
+                "error",
+                Some("transient"),
+                id,
+                500,
+            );
+        }
+
+        let rows = store.error_crosstab(24, CrosstabDimension::Credential);
+        let conc = rows
+            .iter()
+            .find(|r| r.error_type == "network_error")
+            .expect("应有 network_error 行");
+        let spread = rows
+            .iter()
+            .find(|r| r.error_type == "transient")
+            .expect("应有 transient 行");
+
+        assert_eq!(conc.total, 4);
+        assert_eq!(conc.distinct_keys, 1);
+        assert!(
+            (conc.concentration - 1.0).abs() < 1e-9,
+            "全压在一个凭据上，集中度应为 1"
+        );
+        assert_eq!(conc.buckets[0].key, "7");
+
+        assert_eq!(spread.total, 4);
+        assert_eq!(spread.distinct_keys, 4);
+        assert!(
+            (spread.concentration - 0.25).abs() < 1e-9,
+            "均匀散在 4 个凭据上，集中度应为 1/4"
+        );
+
+        assert!(
+            conc.concentration > spread.concentration,
+            "集中度必须能把两种形态分开，否则这张表没有意义"
+        );
+    }
+
+    /// lift 存在的理由必须可执行验证：流量分布不均时，裸集中度会把"承载最多的
+    /// 对象"误报成"有问题的对象"。这里构造两个凭据 —— A 承载 90% 流量、错误份额
+    /// 也正好 90%（相称，不该报警），B 只承载 10% 流量却吃下 50% 的另一类错误
+    /// （不成比例，才是真信号）。集中度会给出相反的排序，lift 才纠正过来。
+    #[test]
+    fn lift_separates_disproportionate_errors_from_high_traffic_ones() {
+        let store = mem_store_with_traces();
+        // 凭据 1：90 条成功流量 + 9 条 transient
+        for i in 0..90 {
+            insert_trace(&store, &format!("ok1-{}", i), 60, "success", None, 1, 100);
+        }
+        for i in 0..9 {
+            insert_trace(
+                &store,
+                &format!("tr1-{}", i),
+                60,
+                "error",
+                Some("transient"),
+                1,
+                100,
+            );
+        }
+        // 凭据 2：10 条成功流量 + 1 条 transient（与凭据1同比例）
+        for i in 0..10 {
+            insert_trace(&store, &format!("ok2-{}", i), 60, "success", None, 2, 100);
+        }
+        insert_trace(&store, "tr2-0", 60, "error", Some("transient"), 2, 100);
+
+        let rows = store.error_crosstab(24, CrosstabDimension::Credential);
+        let tr = rows.iter().find(|r| r.error_type == "transient").unwrap();
+
+        // 集中度 0.9：看着像"高度集中在凭据 1"
+        assert!(
+            (tr.concentration - 0.9).abs() < 1e-9,
+            "集中度应为 9/10 = 0.9"
+        );
+
+        // 但 lift ≈ 1：凭据 1 的错误份额(90%)与它的流量份额(99/110≈90%)相称，
+        // 集中只是因为它承载得多，不是它有问题
+        let b1 = tr.buckets.iter().find(|b| b.key == "1").unwrap();
+        let lift1 = b1.lift.expect("有流量应能算 lift");
+        assert!(
+            (lift1 - 1.0).abs() < 0.05,
+            "承载最多的凭据 lift 应≈1（相称），实际 {:.3}",
+            lift1
+        );
+        assert_eq!(b1.traffic, 99, "traffic 须含成功+失败的全部请求");
+
+        // 凭据 2 同比例 → lift 也应 ≈1
+        let b2 = tr.buckets.iter().find(|b| b.key == "2").unwrap();
+        let lift2 = b2.lift.unwrap();
+        assert!(
+            (lift2 - 1.0).abs() < 0.05,
+            "同比例的凭据 lift 也应≈1，实际 {:.3}",
+            lift2
+        );
+    }
+
+    /// 与上一个测试互补：错误份额明显超出流量份额时 lift 必须显著 > 1。
+    /// 这是真正该报警的形态。
+    #[test]
+    fn lift_flags_low_traffic_object_with_outsized_errors() {
+        let store = mem_store_with_traces();
+        // 凭据 1：99 条成功，0 错误（承载绝大部分流量但很健康）
+        for i in 0..99 {
+            insert_trace(&store, &format!("ok-{}", i), 60, "success", None, 1, 100);
+        }
+        // 凭据 9：1 条成功 + 5 条 network_error（流量极少却错得多）
+        insert_trace(&store, "ok9", 60, "success", None, 9, 100);
+        for i in 0..5 {
+            insert_trace(
+                &store,
+                &format!("ne9-{}", i),
+                60,
+                "error",
+                Some("network_error"),
+                9,
+                100,
+            );
+        }
+
+        let rows = store.error_crosstab(24, CrosstabDimension::Credential);
+        let ne = rows
+            .iter()
+            .find(|r| r.error_type == "network_error")
+            .unwrap();
+        let b9 = ne.buckets.iter().find(|b| b.key == "9").unwrap();
+        let lift9 = b9.lift.unwrap();
+
+        // 错误份额 5/5 = 100%，流量份额 6/105 ≈ 5.7% → lift ≈ 17.5
+        assert!(
+            lift9 > 5.0,
+            "低流量高错误的对象 lift 必须显著>1 才能被发现，实际 {:.2}",
+            lift9
+        );
+    }
+
+    /// 桶数超过 CROSSTAB_TOP_BUCKETS 时，total 与 distinct_keys 必须仍按全量计，
+    /// 只截断 buckets 列表 —— 否则集中度的分母会被截断后的和污染，
+    /// 让"散开"的错误看起来像"集中"。
+    #[test]
+    fn crosstab_truncates_buckets_without_corrupting_totals() {
+        let store = mem_store_with_traces();
+        // 10 个不同凭据各 1 条，超过 CROSSTAB_TOP_BUCKETS(6)
+        for id in 1..=10u64 {
+            insert_trace(
+                &store,
+                &format!("t{}", id),
+                60,
+                "error",
+                Some("transient"),
+                id,
+                500,
+            );
+        }
+        let rows = store.error_crosstab(24, CrosstabDimension::Credential);
+        let row = rows.iter().find(|r| r.error_type == "transient").unwrap();
+
+        assert_eq!(row.buckets.len(), CROSSTAB_TOP_BUCKETS, "桶列表应被截断");
+        assert_eq!(row.total, 10, "total 必须是全量，不能只算被保留的桶");
+        assert_eq!(row.distinct_keys, 10, "distinct_keys 必须是全量");
+        assert!(
+            (row.concentration - 0.1).abs() < 1e-9,
+            "集中度分母须用全量 total(10)，否则 1/6 会被误报成集中"
+        );
+    }
+
+    #[test]
+    fn percentiles_handles_empty_and_single() {
+        assert!(percentiles(Vec::new()).is_none(), "无样本应返回 None");
+        let one = percentiles(vec![5_000]).unwrap();
+        assert_eq!((one.p50, one.p95, one.p99, one.n), (5_000, 5_000, 5_000, 1));
     }
 
     #[test]

@@ -1833,6 +1833,65 @@ pub async fn ops_overview(
     Json(ops.events().overview(parse_ops_hours(&params))).into_response()
 }
 
+/// GET /api/admin/ops/error-crosstab?hours=24&dim=credential|proxy|model
+///
+/// error_type × 维度 的交叉表。用 `concentration` 判断该错误是压在单个对象上
+/// （接近 1，处置该对象即可）还是均匀散开（接近 1/distinctKeys，属系统性问题）。
+pub async fn ops_error_crosstab(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let Some(ops) = state.service.ops() else {
+        return ops_unavailable();
+    };
+    let dim_str = params
+        .get("dim")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "credential".to_string());
+    let Some(dim) = super::ops::CrosstabDimension::parse(&dim_str) else {
+        return stats_bad_request("dim 必须是 credential / proxy / model 之一".to_string());
+    };
+    let rows = ops.events().error_crosstab(parse_ops_hours(&params), dim);
+    // credential 维度补 email，否则前端只能显示裸 id
+    let enriched: Vec<serde_json::Value> = if dim == super::ops::CrosstabDimension::Credential {
+        let snapshot = state.service.get_all_credentials();
+        let email_map: HashMap<String, Option<String>> = snapshot
+            .credentials
+            .iter()
+            .map(|c| (c.id.to_string(), c.email.clone()))
+            .collect();
+        rows.iter()
+            .map(|r| {
+                let buckets: Vec<serde_json::Value> = r
+                    .buckets
+                    .iter()
+                    .map(|b| {
+                        serde_json::json!({
+                            "key": b.key,
+                            "email": email_map.get(&b.key).cloned().flatten(),
+                            "count": b.count,
+                            "traffic": b.traffic,
+                            "lift": b.lift,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "errorType": r.error_type,
+                    "total": r.total,
+                    "buckets": buckets,
+                    "concentration": r.concentration,
+                    "distinctKeys": r.distinct_keys,
+                })
+            })
+            .collect()
+    } else {
+        rows.iter()
+            .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
+            .collect()
+    };
+    Json(serde_json::json!({ "dimension": dim_str, "rows": enriched })).into_response()
+}
+
 /// GET /api/admin/ops/trend?hours=24
 /// 按小时的请求/错误/中断趋势
 pub async fn ops_trend(

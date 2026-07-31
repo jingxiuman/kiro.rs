@@ -629,8 +629,17 @@ export interface OpsOverview {
   byErrorType: OpsErrorTypeCount[]
   avgDurationMs: number
   avgFirstTokenMs?: number | null
-  /** 中断类请求的平均时长（集中在同一时长通常指向链路固定超时） */
-  interruptedAvgDurationMs?: number | null
+  /** 中断类耗时分位；null = 窗口内无中断样本 */
+  interruptedDuration?: DurationPercentiles | null
+}
+
+/** 耗时分位。多簇集中（如 ~240s 与 ~720s）指向链路上存在多个固定超时 */
+export interface DurationPercentiles {
+  p50: number
+  p95: number
+  p99: number
+  /** 样本数。n 小时 p99 等于最大值本身，面板须一并显示以免被当成有效分位 */
+  n: number
 }
 
 /** 按小时趋势点 */
