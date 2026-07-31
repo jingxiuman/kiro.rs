@@ -327,6 +327,36 @@ impl ModelSyncService {
 
         // ---- 可信度判定 ----
         if !any_nonempty {
+            // I5 修复：不可信轮不该连累补充轮已经成功拉到的 credentialSupport。
+            // `any_nonempty` 只反映主轮（权威探针或采样）的可信度，回答的是「这份
+            // 快照能不能用来判定 models/aliases/消失」；而 credentialSupport 是
+            // **逐凭据独立的事实**——某张凭据本轮到底支持哪些模型，跟同一轮里
+            // 别的凭据是否可信毫无关系。主轮采样是 candidate ids 排序后取前
+            // SAMPLE_SIZE 张（确定性），如果 id 最小的几张凭据持续坏死，主轮会
+            // 永远不可信、永远整轮 Err，若不在这里补写，补充轮已经成功拿到的
+            // per_credential 就永远没有机会落盘，credentialSupport 特性对这些
+            // 凭据永久失效（退化为「不设限」）。
+            // 因此这里只写 `file.credential_support`（逐键覆盖，不影响未拉取到的
+            // 旧记录），不碰 models/aliases/sync_state —— “不可信轮不改注册表”的
+            // 护栏语义保持不变；随后仍照旧返回 Err。
+            if !per_credential.is_empty() {
+                let extra_writes = per_credential.clone();
+                if let Err(e) = self
+                    .store
+                    .mutate(move |file| {
+                        for (cred, models) in &extra_writes {
+                            file.credential_support.insert(cred.clone(), models.clone());
+                        }
+                        Ok(())
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        "不可信轮补写 credentialSupport 失败: {}，本轮成功拉到的凭据支持集丢失",
+                        e
+                    );
+                }
+            }
             return Err(format!(
                 "本轮同步不可信（{} 个凭据均失败或返回空列表），不改动 models.json",
                 credential_ids.len()
@@ -1792,6 +1822,51 @@ mod tests {
             out.file.credential_support.get("3").unwrap(),
             &vec!["claude-p3-old".to_string()],
             "凭据 3 本轮失败，旧记录应保留不清空"
+        );
+    }
+
+    /// I5：主轮（采样，candidate ids 排序取前 SAMPLE_SIZE）全部失败 → 整轮不可信、
+    /// 返回 Err；但补充轮拉到的凭据已经成功返回数据。修复前这些数据会被主轮的
+    /// 不可信判定连累丢弃，credentialSupport 对这些凭据永久不更新。
+    /// 断言：sync 返回 Err，且成功凭据的 credential_support 已落盘，
+    /// models/sync_state 未被本轮改动（不可信轮不改注册表的护栏语义保持）。
+    #[tokio::test]
+    async fn untrusted_round_still_persists_supplement_round_credential_support() {
+        let _registry_guard =
+            crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tmp_store("i5-untrusted-persists-supplement");
+
+        // 无探针（走采样分支），candidate 为 1..=4，SAMPLE_SIZE=3 → 主轮采样
+        // id 最小的 3 张（1,2,3），全部失败；补充轮拉剩下的 4，成功。
+        let fetcher = Arc::new(FakeFetcher::new(vec![
+            (1, Err("token 刷新失败".to_string())),
+            (2, Err("token 刷新失败".to_string())),
+            (3, Err("token 刷新失败".to_string())),
+            (4, Ok(vec![upstream("claude-p4", Some(200_000))])),
+        ]));
+
+        let before = store.load();
+        assert!(before.file.sync_state.last_sync_at.is_none(), "同步前不应有 last_sync_at");
+
+        let err = ModelSyncService::new(store.clone(), fetcher.clone())
+            .sync_once(None, now())
+            .await
+            .unwrap_err();
+        assert!(err.contains("不可信"), "主轮 3/3 失败应判定为不可信轮: {}", err);
+
+        let calls = fetcher.calls();
+        assert_eq!(calls, vec![1, 2, 3, 4], "主轮采样 1,2,3，补充轮应拉剩下的 4");
+
+        let out = store.load();
+        assert_eq!(
+            out.file.credential_support.get("4").unwrap(),
+            &vec!["claude-p4".to_string()],
+            "补充轮成功拉到的凭据支持集应落盘，不因主轮不可信而丢弃"
+        );
+        assert!(out.file.models.is_empty(), "不可信轮不应写入 models");
+        assert!(
+            out.file.sync_state.last_sync_at.is_none(),
+            "不可信轮不应更新 sync_state（护栏语义不变）"
         );
     }
 }
