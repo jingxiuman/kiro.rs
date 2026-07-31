@@ -711,7 +711,7 @@ function CredentialPanel({ data }: { data: CredentialDistribution[] }) {
             <Server className="h-3 w-3" />Top {Math.min(data.length, 12)}
           </span>
         </div>
-        {totalTokens > 0 && (
+        {data.length > 0 && (
           <p className="mb-3 text-[11px] text-muted-foreground">
             图中合计 <span className="tabular-nums font-medium text-foreground">{formatNumber(totalTokens)}</span> token
           </p>
