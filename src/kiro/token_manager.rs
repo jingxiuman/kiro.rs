@@ -1106,21 +1106,33 @@ pub fn credential_supports_model(
 ///   与 `credential_supports_model` 的保守语义一致);
 /// - 组内没有任何未禁用凭据(交由既有"无可用凭据"错误路径,不在本层报错)。
 ///
-/// `creds` 元组:(凭据 id, groups, disabled)。禁用凭据不计入。
+/// `creds` 元组:(凭据 id, groups, disabled, supports_opus)。禁用凭据不计入。
+///
+/// `supports_opus` 必须与 `credential_matches_request` 的订阅门同源
+/// （`KiroCredentials::supports_opus()`）：选凭据时 opus 是"订阅门 AND support 门"
+/// （见 `credential_matches_request_opus_gate_and_support_gate_are_and`），若组视图
+/// 只看 support 门而不看订阅门，FREE 凭据的 support 记录一旦含 opus，组视图会放行
+/// 但选凭据必然拒绝——客户端吃到 502（选不到凭据）而不是设计要求的 404（组不支持）。
 pub fn group_supported_models_from(
-    creds: &[(u64, Vec<String>, bool)],
+    creds: &[(u64, Vec<String>, bool, bool)],
     group: Option<&str>,
     support: &std::collections::HashMap<String, Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
     let mut union = std::collections::HashSet::new();
     let mut any = false;
-    for (id, groups, disabled) in creds {
+    for (id, groups, disabled, supports_opus) in creds {
         if *disabled || !group_matches(groups, group) {
             continue;
         }
         any = true;
         match support.get(&id.to_string()) {
-            Some(models) => union.extend(models.iter().cloned()),
+            Some(models) => {
+                // 判据与 credential_matches_request 的 is_opus 完全一致，不另造。
+                let filtered = models.iter().filter(|m| {
+                    *supports_opus || !m.to_ascii_lowercase().contains("opus")
+                });
+                union.extend(filtered.cloned());
+            }
             None => return None,
         }
     }
@@ -1350,11 +1362,11 @@ impl MultiTokenManager {
         &self,
         group: Option<&str>,
     ) -> Option<std::collections::HashSet<String>> {
-        let creds: Vec<(u64, Vec<String>, bool)> = self
+        let creds: Vec<(u64, Vec<String>, bool, bool)> = self
             .entries
             .lock()
             .iter()
-            .map(|e| (e.id, e.credentials.groups.clone(), e.disabled))
+            .map(|e| (e.id, e.credentials.groups.clone(), e.disabled, e.credentials.supports_opus()))
             .collect();
         let support = self.credential_support.read();
         group_supported_models_from(&creds, group, &support)
@@ -5054,9 +5066,9 @@ mod tests {
             ("2".into(), vec!["auto".into(), "claude-opus-5".into()]),
         ]);
         let creds = vec![
-            (1u64, vec!["own".to_string()], false),
-            (2u64, vec!["own".to_string()], false),
-            (3u64, vec!["other".to_string()], false),
+            (1u64, vec!["own".to_string()], false, true),
+            (2u64, vec!["own".to_string()], false, true),
+            (3u64, vec!["other".to_string()], false, true),
         ];
         // 组内并集:1 号有 opus-4.8,2 号没有 → 并集含 opus-4.8
         let set = group_supported_models_from(&creds, Some("own"), &support)
@@ -5072,8 +5084,8 @@ mod tests {
         let support: HashMap<String, Vec<String>> =
             HashMap::from([("1".into(), vec!["claude-opus-5".into()])]);
         let creds = vec![
-            (1u64, vec!["own".to_string()], false),
-            (2u64, vec!["own".to_string()], false),
+            (1u64, vec!["own".to_string()], false, true),
+            (2u64, vec!["own".to_string()], false, true),
         ];
         assert!(group_supported_models_from(&creds, Some("own"), &support).is_none());
     }
@@ -5087,8 +5099,8 @@ mod tests {
         ]);
         // 2 号禁用:不计入并集,也不因它触发"无记录放行"以外的语义
         let creds = vec![
-            (1u64, vec!["own".to_string()], false),
-            (2u64, vec!["own".to_string()], true),
+            (1u64, vec!["own".to_string()], false, true),
+            (2u64, vec!["own".to_string()], true, true),
         ];
         let set = group_supported_models_from(&creds, Some("own"), &support).unwrap();
         assert!(set.contains("claude-opus-5"));
@@ -5098,5 +5110,37 @@ mod tests {
         // group=None → 按全部未禁用凭据计算
         let all = group_supported_models_from(&creds, None, &support).unwrap();
         assert!(all.contains("claude-opus-5"));
+    }
+
+    /// I6：组视图必须叠加 opus 订阅门，与 credential_matches_request 的选凭据门
+    /// 保持一致（AND 关系）。FREE 凭据（supports_opus=false）的 support 记录里
+    /// 即便含 opus 模型，组视图也不该放行——否则组层放行、选凭据层必拒，
+    /// 客户端会吃到 502 而不是设计承诺的 404。
+    #[test]
+    fn group_supported_models_excludes_opus_when_credential_lacks_opus_subscription() {
+        use std::collections::HashMap;
+        let support: HashMap<String, Vec<String>> = HashMap::from([(
+            "1".into(),
+            vec!["claude-opus-5".into(), "claude-sonnet-5".into()],
+        )]);
+        // 组内唯一凭据是 FREE（不支持 opus）
+        let creds = vec![(1u64, vec!["own".to_string()], false, false)];
+
+        let set = group_supported_models_from(&creds, Some("own"), &support)
+            .expect("有记录应返回 Some");
+        assert!(!set.contains("claude-opus-5"), "FREE 凭据不该在组视图里放行 opus 模型");
+        assert!(set.contains("claude-sonnet-5"), "非 opus 模型不受订阅门影响");
+    }
+
+    /// supports_opus=true 时不过滤，行为与修复前一致。
+    #[test]
+    fn group_supported_models_keeps_opus_when_credential_supports_opus() {
+        use std::collections::HashMap;
+        let support: HashMap<String, Vec<String>> =
+            HashMap::from([("1".into(), vec!["claude-opus-5".into()])]);
+        let creds = vec![(1u64, vec!["own".to_string()], false, true)];
+
+        let set = group_supported_models_from(&creds, Some("own"), &support).unwrap();
+        assert!(set.contains("claude-opus-5"));
     }
 }
