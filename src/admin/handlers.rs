@@ -1636,6 +1636,21 @@ pub async fn sync_models(
     }
 }
 
+/// POST /api/admin/models/test
+/// 用所选模型发送一次真实、最小化的 Kiro 请求。
+///
+/// modelId 走本地注册表解析（别名 / 禁用 / thinking 变体 / 透传），被拒时不发请求；
+/// 可选的 credentialId 把请求钉死在指定凭据上，缺省走正常账号池。
+pub async fn test_model(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::ModelTestRequest>,
+) -> impl IntoResponse {
+    match state.service.test_model(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_http_response(),
+    }
+}
+
 /// POST /api/admin/models
 /// 手动新增一行（origin = manual）
 pub async fn create_model(

@@ -219,11 +219,10 @@ async fn decode_round(
                     credits += m.usage;
                     last_metering = Some(m.clone());
                 }
-                Event::Exception { exception_type, .. } => {
-                    if exception_type == "ContentLengthExceededException" {
+                Event::Exception { exception_type, .. }
+                    if exception_type == "ContentLengthExceededException" => {
                         stop_reason_override = Some("max_tokens".to_string());
                     }
-                }
                 _ => {}
             }
         }
@@ -305,7 +304,7 @@ async fn run_round(
     let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
         Ok(c) => c,
         Err(e) => {
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, (0, 0), 0.0, "error");
             // Wording and status code live in conversion_error_response (extracted to be testable)
             return Err(conversion_error_response(&e).into_response());
         }
@@ -319,7 +318,7 @@ async fn run_round(
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(b) => b,
         Err(e) => {
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, (0, 0), 0.0, "error");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new("internal_error", format!("failed to serialize request: {}", e))),
@@ -331,7 +330,7 @@ async fn run_round(
     let call_result = match provider.call_api_stream(&request_body, None, group).await {
         Ok(r) => r,
         Err(e) => {
-            hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(0, fallback_input_tokens, 0, (0, 0), 0.0, "error");
             return Err(map_provider_error(e));
         }
     };
@@ -346,7 +345,7 @@ async fn run_round(
     if outcome.stream_error {
         // The upstream stream was cut off mid-round; the decoded content is partial,
         // so fail the round instead of feeding truncated text/tool_use back into the loop.
-        hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+        hook.record(0, fallback_input_tokens, 0, (0, 0), 0.0, "error");
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
@@ -668,8 +667,7 @@ pub(super) async fn run_web_search_loop(
                         last_credential_id,
                         final_input,
                         0,
-                        0,
-                        0,
+                        (0, 0),
                         total_credits,
                         "error",
                     );
@@ -715,8 +713,7 @@ pub(super) async fn run_web_search_loop(
                             last_credential_id,
                             fallback_input_tokens,
                             0,
-                            0,
-                            0,
+                            (0, 0),
                             total_credits,
                             "error",
                         );
@@ -756,8 +753,7 @@ pub(super) async fn run_web_search_loop(
                             last_credential_id,
                             fallback_input_tokens,
                             0,
-                            0,
-                            0,
+                            (0, 0),
                             total_credits,
                             "error",
                         );
@@ -791,8 +787,7 @@ pub(super) async fn run_web_search_loop(
             last_credential_id,
             final_input,
             output_tokens,
-            0,
-            0,
+            (0, 0),
             total_credits,
             "success",
         );
@@ -820,7 +815,7 @@ pub(super) async fn run_web_search_loop(
     }
 
     // Theoretically unreachable (the loop always returns)
-    hook.record(last_credential_id, fallback_input_tokens, 0, 0, 0, total_credits, "error");
+    hook.record(last_credential_id, fallback_input_tokens, 0, (0, 0), total_credits, "error");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse::new("internal_error", "web_search loop exited unexpectedly")),

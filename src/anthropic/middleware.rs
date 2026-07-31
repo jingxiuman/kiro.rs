@@ -72,8 +72,12 @@ impl AppState {
     }
 
     /// 设置 KiroProvider
-    pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
-        self.kiro_provider = Some(Arc::new(provider));
+    ///
+    /// 收 `Arc` 而不是按值 move：Admin 的 `POST /models/test` 要与 `/v1/messages`
+    /// 共用同一个 provider 实例（同一份账号池 / 代理 / client 缓存），否则测出来的
+    /// 不是生产链路实际会发生的事。
+    pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
+        self.kiro_provider = Some(provider);
         self
     }
 
@@ -120,8 +124,8 @@ pub async fn auth_middleware(
         }
     };
 
-    if let Some(mgr) = &state.client_keys {
-        if let Some(id) = mgr.verify_and_touch(&presented) {
+    if let Some(mgr) = &state.client_keys
+        && let Some(id) = mgr.verify_and_touch(&presented) {
             let group = mgr.group_of(id);
             request.extensions_mut().insert(KeyContext {
                 key_id: id,
@@ -130,7 +134,6 @@ pub async fn auth_middleware(
             });
             return next.run(request).await;
         }
-    }
 
     let error = ErrorResponse::authentication_error();
     (StatusCode::UNAUTHORIZED, Json(error)).into_response()

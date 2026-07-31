@@ -30,6 +30,16 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
+#[derive(Default)]
+pub(crate) struct CredentialUpdate {
+    pub email: Option<Option<String>>,
+    pub proxy_url: Option<Option<String>>,
+    pub proxy_username: Option<Option<String>>,
+    pub proxy_password: Option<Option<String>>,
+    pub groups: Option<Vec<String>>,
+    pub source_channel: Option<Option<String>>,
+}
+
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
     credentials: &KiroCredentials,
@@ -1089,6 +1099,46 @@ pub fn credential_supports_model(
     }
 }
 
+/// 组内凭据可用上游模型 id 的并集。
+///
+/// 返回 `None` 表示"不设限",两种情形:
+/// - 组内存在无 `credential_support` 记录的未禁用凭据(未知=放行,
+///   与 `credential_supports_model` 的保守语义一致);
+/// - 组内没有任何未禁用凭据(交由既有"无可用凭据"错误路径,不在本层报错)。
+///
+/// `creds` 元组:(凭据 id, groups, disabled, supports_opus)。禁用凭据不计入。
+///
+/// `supports_opus` 必须与 `credential_matches_request` 的订阅门同源
+/// （`KiroCredentials::supports_opus()`）：选凭据时 opus 是"订阅门 AND support 门"
+/// （见 `credential_matches_request_opus_gate_and_support_gate_are_and`），若组视图
+/// 只看 support 门而不看订阅门，FREE 凭据的 support 记录一旦含 opus，组视图会放行
+/// 但选凭据必然拒绝——客户端吃到 502（选不到凭据）而不是设计要求的 404（组不支持）。
+pub fn group_supported_models_from(
+    creds: &[(u64, Vec<String>, bool, bool)],
+    group: Option<&str>,
+    support: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<std::collections::HashSet<String>> {
+    let mut union = std::collections::HashSet::new();
+    let mut any = false;
+    for (id, groups, disabled, supports_opus) in creds {
+        if *disabled || !group_matches(groups, group) {
+            continue;
+        }
+        any = true;
+        match support.get(&id.to_string()) {
+            Some(models) => {
+                // 判据与 credential_matches_request 的 is_opus 完全一致，不另造。
+                let filtered = models.iter().filter(|m| {
+                    *supports_opus || !m.to_ascii_lowercase().contains("opus")
+                });
+                union.extend(filtered.cloned());
+            }
+            None => return None,
+        }
+    }
+    if any { Some(union) } else { None }
+}
+
 fn credential_matches_request(
     credentials: &KiroCredentials,
     credential_id: u64,
@@ -1105,11 +1155,10 @@ fn credential_matches_request(
     }
 
     // 按上游宣告的 credential_support 过滤（无记录则放行，见 credential_supports_model 注释）
-    if let Some(m) = model {
-        if !credential_supports_model(credential_id, m, credential_support) {
+    if let Some(m) = model
+        && !credential_supports_model(credential_id, m, credential_support) {
             return false;
         }
-    }
 
     group_matches(&credentials.groups, group)
 }
@@ -1306,6 +1355,21 @@ impl MultiTokenManager {
     /// 避免只凭"调用过 set_ 了"就宣称接线完成。
     pub fn credential_support(&self) -> std::collections::HashMap<String, Vec<String>> {
         self.credential_support.read().clone()
+    }
+
+    /// 见 [`group_supported_models_from`]。entries 快照 + credential_support 缓存。
+    pub fn group_supported_models(
+        &self,
+        group: Option<&str>,
+    ) -> Option<std::collections::HashSet<String>> {
+        let creds: Vec<(u64, Vec<String>, bool, bool)> = self
+            .entries
+            .lock()
+            .iter()
+            .map(|e| (e.id, e.credentials.groups.clone(), e.disabled, e.credentials.supports_opus()))
+            .collect();
+        let support = self.credential_support.read();
+        group_supported_models_from(&creds, group, &support)
     }
 
     pub fn available_count(&self) -> usize {
@@ -1522,8 +1586,7 @@ impl MultiTokenManager {
             .iter()
             .filter(|e| !e.disabled)
             .min_by_key(|e| e.credentials.priority)
-        {
-            if best.id != *current_id {
+            && best.id != *current_id {
                 tracing::info!(
                     "优先级变更后切换凭据: #{} -> #{}（优先级 {}）",
                     *current_id,
@@ -1532,7 +1595,6 @@ impl MultiTokenManager {
                 );
                 *current_id = best.id;
             }
-        }
     }
 
     /// 尝试使用指定凭据获取有效 Token
@@ -2502,11 +2564,10 @@ impl MultiTokenManager {
         }
 
         // 已有真实 ARN（含 Social 共享 ARN）→ 直接用，无需查询
-        if let Some(arn) = credentials.profile_arn.as_deref() {
-            if !is_placeholder_profile_arn(arn) {
+        if let Some(arn) = credentials.profile_arn.as_deref()
+            && !is_placeholder_profile_arn(arn) {
                 return Ok(Some(arn.to_string()));
             }
-        }
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -2635,11 +2696,10 @@ impl MultiTokenManager {
                 }
             };
 
-            if changed {
-                if let Err(e) = self.persist_credentials() {
+            if changed
+                && let Err(e) = self.persist_credentials() {
                     tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
                 }
-            }
         }
 
         // 回填邮箱：仅在凭据尚无邮箱、且上游返回了邮箱时写入
@@ -2665,11 +2725,10 @@ impl MultiTokenManager {
                 }
             };
 
-            if changed {
-                if let Err(e) = self.persist_credentials() {
+            if changed
+                && let Err(e) = self.persist_credentials() {
                     tracing::warn!("邮箱回填后持久化失败（不影响本次请求）: {}", e);
                 }
-            }
         }
 
         Ok(usage_limits)
@@ -2751,6 +2810,23 @@ impl MultiTokenManager {
         };
 
         Ok((token, credentials))
+    }
+
+    /// 构造**钉死在指定凭据**上的调用上下文（Admin 模型测试用）
+    ///
+    /// 与 [`Self::acquire_context`] 的区别：完全不参与调度选择——不看优先级、
+    /// 不看 balanced/priority 模式、不改 `current_id`、不做跨凭据故障转移。
+    /// 调用方明确指定了要测哪张凭据，替它换一张就答非所问了。
+    ///
+    /// 复用 [`Self::prepare_request_token`]（已处理 API Key 凭据与按需刷新）。
+    /// 凭据被禁用时**不**拒绝：管理端「就是要测这张有问题的凭据」是合法诉求。
+    pub async fn acquire_context_pinned(&self, id: u64) -> anyhow::Result<CallContext> {
+        let (token, credentials) = self.prepare_request_token(id).await?;
+        Ok(CallContext {
+            id,
+            credentials,
+            token,
+        })
     }
 
     /// 获取指定凭据当前可用的模型列表（Admin API）
@@ -3042,12 +3118,7 @@ impl MultiTokenManager {
     pub fn update_credential(
         &self,
         id: u64,
-        email: Option<Option<String>>,
-        proxy_url: Option<Option<String>>,
-        proxy_username: Option<Option<String>>,
-        proxy_password: Option<Option<String>>,
-        groups: Option<Vec<String>>,
-        source_channel: Option<Option<String>>,
+        update: CredentialUpdate,
     ) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
@@ -3056,23 +3127,23 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
 
-            if let Some(v) = email {
+            if let Some(v) = update.email {
                 entry.credentials.email = v.filter(|s| !s.is_empty());
             }
-            if let Some(v) = proxy_url {
+            if let Some(v) = update.proxy_url {
                 entry.credentials.proxy_url = v.filter(|s| !s.is_empty());
             }
-            if let Some(v) = proxy_username {
+            if let Some(v) = update.proxy_username {
                 entry.credentials.proxy_username = v.filter(|s| !s.is_empty());
             }
-            if let Some(v) = proxy_password {
+            if let Some(v) = update.proxy_password {
                 entry.credentials.proxy_password = v.filter(|s| !s.is_empty());
             }
-            if let Some(g) = groups {
+            if let Some(g) = update.groups {
                 entry.credentials.groups =
                     g.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             }
-            if let Some(v) = source_channel {
+            if let Some(v) = update.source_channel {
                 entry.credentials.source_channel =
                     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             }
@@ -4949,5 +5020,127 @@ mod tests {
                 id
             );
         }
+    }
+
+    /// `acquire_context_pinned` 必须完全绕开调度：给哪张就用哪张，
+    /// 且不改动 `current_id`（否则一次管理端测试会把生产流量的调度指针带偏）。
+    #[tokio::test]
+    async fn pinned_context_ignores_scheduling_and_does_not_move_current_id() {
+        let live = |priority: u32| {
+            let mut c = KiroCredentials::default();
+            c.access_token = Some("tok".to_string());
+            c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+            c.priority = priority;
+            c
+        };
+        // id=1 优先级最高（调度会选它）；id=2 优先级更低；id=3 已禁用。
+        let mut disabled = live(2);
+        disabled.disabled = true;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![live(0), live(1), disabled], None, None, false)
+                .unwrap();
+
+        let before = *manager.current_id.lock();
+        assert_eq!(before, 1, "前置条件：调度指针指向优先级最高的 1 号");
+
+        let ctx = manager.acquire_context_pinned(2).await.expect("应能钉住 2 号");
+        assert_eq!(ctx.id, 2, "指定了 2 号就必须用 2 号，不得回落到调度选择");
+        assert_eq!(ctx.token, "tok");
+        assert_eq!(*manager.current_id.lock(), before, "不得改动调度指针");
+
+        // 已禁用的凭据也允许钉住：「就是要测这张有问题的凭据」是合法诉求
+        assert_eq!(
+            manager.acquire_context_pinned(3).await.expect("禁用凭据也应可钉住").id,
+            3
+        );
+
+        // 不存在的 id 必须是明确错误，而不是悄悄换一张
+        assert!(manager.acquire_context_pinned(999).await.is_err());
+    }
+
+    #[test]
+    fn group_supported_models_union_of_group_credentials() {
+        use std::collections::HashMap;
+        let support: HashMap<String, Vec<String>> = HashMap::from([
+            ("1".into(), vec!["auto".into(), "claude-opus-5".into(), "claude-opus-4.8".into()]),
+            ("2".into(), vec!["auto".into(), "claude-opus-5".into()]),
+        ]);
+        let creds = vec![
+            (1u64, vec!["own".to_string()], false, true),
+            (2u64, vec!["own".to_string()], false, true),
+            (3u64, vec!["other".to_string()], false, true),
+        ];
+        // 组内并集:1 号有 opus-4.8,2 号没有 → 并集含 opus-4.8
+        let set = group_supported_models_from(&creds, Some("own"), &support)
+            .expect("全部有记录,应返回 Some");
+        assert!(set.contains("claude-opus-4.8"));
+        assert!(set.contains("claude-opus-5"));
+    }
+
+    #[test]
+    fn group_supported_models_unknown_credential_means_unrestricted() {
+        use std::collections::HashMap;
+        // 凭据 2 无记录 → 整组不设限(None)
+        let support: HashMap<String, Vec<String>> =
+            HashMap::from([("1".into(), vec!["claude-opus-5".into()])]);
+        let creds = vec![
+            (1u64, vec!["own".to_string()], false, true),
+            (2u64, vec!["own".to_string()], false, true),
+        ];
+        assert!(group_supported_models_from(&creds, Some("own"), &support).is_none());
+    }
+
+    #[test]
+    fn group_supported_models_skips_disabled_and_empty_group_is_none() {
+        use std::collections::HashMap;
+        let support: HashMap<String, Vec<String>> = HashMap::from([
+            ("1".into(), vec!["claude-opus-5".into()]),
+            ("2".into(), vec!["glm-5".into()]),
+        ]);
+        // 2 号禁用:不计入并集,也不因它触发"无记录放行"以外的语义
+        let creds = vec![
+            (1u64, vec!["own".to_string()], false, true),
+            (2u64, vec!["own".to_string()], true, true),
+        ];
+        let set = group_supported_models_from(&creds, Some("own"), &support).unwrap();
+        assert!(set.contains("claude-opus-5"));
+        assert!(!set.contains("glm-5"));
+        // 组内无凭据 → None(不设限,由既有"无可用凭据"路径兜底报错)
+        assert!(group_supported_models_from(&creds, Some("ghost"), &support).is_none());
+        // group=None → 按全部未禁用凭据计算
+        let all = group_supported_models_from(&creds, None, &support).unwrap();
+        assert!(all.contains("claude-opus-5"));
+    }
+
+    /// I6：组视图必须叠加 opus 订阅门，与 credential_matches_request 的选凭据门
+    /// 保持一致（AND 关系）。FREE 凭据（supports_opus=false）的 support 记录里
+    /// 即便含 opus 模型，组视图也不该放行——否则组层放行、选凭据层必拒，
+    /// 客户端会吃到 502 而不是设计承诺的 404。
+    #[test]
+    fn group_supported_models_excludes_opus_when_credential_lacks_opus_subscription() {
+        use std::collections::HashMap;
+        let support: HashMap<String, Vec<String>> = HashMap::from([(
+            "1".into(),
+            vec!["claude-opus-5".into(), "claude-sonnet-5".into()],
+        )]);
+        // 组内唯一凭据是 FREE（不支持 opus）
+        let creds = vec![(1u64, vec!["own".to_string()], false, false)];
+
+        let set = group_supported_models_from(&creds, Some("own"), &support)
+            .expect("有记录应返回 Some");
+        assert!(!set.contains("claude-opus-5"), "FREE 凭据不该在组视图里放行 opus 模型");
+        assert!(set.contains("claude-sonnet-5"), "非 opus 模型不受订阅门影响");
+    }
+
+    /// supports_opus=true 时不过滤，行为与修复前一致。
+    #[test]
+    fn group_supported_models_keeps_opus_when_credential_supports_opus() {
+        use std::collections::HashMap;
+        let support: HashMap<String, Vec<String>> =
+            HashMap::from([("1".into(), vec!["claude-opus-5".into()])]);
+        let creds = vec![(1u64, vec!["own".to_string()], false, true)];
+
+        let set = group_supported_models_from(&creds, Some("own"), &support).unwrap();
+        assert!(set.contains("claude-opus-5"));
     }
 }

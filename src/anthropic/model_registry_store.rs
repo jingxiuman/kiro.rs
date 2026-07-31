@@ -29,6 +29,7 @@ impl ModelRegistryStore {
         Self { path, write_lock: Mutex::new(()) }
     }
 
+    #[cfg(test)]
     pub fn path(&self) -> &PathBuf {
         &self.path
     }

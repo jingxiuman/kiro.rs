@@ -15,7 +15,7 @@ use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::credentials::{normalize_import_auth_method, validate_external_idp_endpoint};
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CredentialUpdate, MultiTokenManager};
 use crate::model::config::Config;
 
 use super::error::AdminServiceError;
@@ -27,7 +27,8 @@ use super::types::{
     CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
     GitHubRateLimitInfo, ImageUpdateResponse, ExportedAccount, ExportedCredentials,
     CredentialsExportResponse,
-    LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
+    LoadBalancingModeResponse, LogGovernanceConfigResponse, ModelTestRequest, ModelTestResponse,
+    PollIdcLoginResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
     QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
     SetLogGovernanceConfigRequest, SetModelSyncSettingsRequest, SetUpdateConfigRequest,
@@ -206,6 +207,10 @@ pub struct AdminService {
     model_registry_store: Option<Arc<crate::anthropic::model_registry_store::ModelRegistryStore>>,
     /// 手动同步用的同步服务。同上，由启动流程注入。
     model_sync_service: Option<Arc<crate::anthropic::model_sync::ModelSyncService>>,
+    /// Kiro Provider。`POST /models/test` 要发真实上游请求，必须与生产流量
+    /// 走同一个 provider（同一份账号池 / 代理 / 端点解析），否则测出来的
+    /// 不是「本代理实际会发生什么」。未注入时该端点返回明确的未配置错误。
+    kiro_provider: Option<Arc<crate::kiro::provider::KiroProvider>>,
 }
 
 /// Social 登录会话状态
@@ -308,7 +313,7 @@ fn compare_semver(current: &str, latest: &str) -> std::cmp::Ordering {
 fn parse_semver_core(value: &str) -> [u32; 3] {
     let core = value
         .trim_start_matches('v')
-        .split(|c: char| c == '-' || c == '+')
+        .split(['-', '+'])
         .next()
         .unwrap_or("");
     let mut out = [0u32; 3];
@@ -533,6 +538,7 @@ impl AdminService {
             config_write_lock: tokio::sync::Mutex::new(()),
             model_registry_store: None,
             model_sync_service: None,
+            kiro_provider: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -592,6 +598,15 @@ impl AdminService {
         };
         let now_ts = Utc::now().timestamp() as f64;
 
+        // balanced 模式下 `current_id` 只是内部调度指针（每次请求重新选号），
+        // 不存在「当前活跃账号」这个概念；对外暴露它等于显示假信息。
+        // 固定为 0，与「无当前凭据」的既有取值（凭据全空时的初值）一致。
+        let exposed_current_id = if self.token_manager.get_load_balancing_mode() == "balanced" {
+            0
+        } else {
+            snapshot.current_id
+        };
+
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
@@ -608,7 +623,7 @@ impl AdminService {
                     disabled: entry.disabled,
                     failure_count: entry.failure_count,
                     total_failure_count: entry.total_failure_count,
-                    is_current: entry.id == snapshot.current_id,
+                    is_current: exposed_current_id != 0 && entry.id == exposed_current_id,
                     expires_at: entry.expires_at,
                     auth_method: entry.auth_method,
                     provider: entry.provider,
@@ -638,7 +653,7 @@ impl AdminService {
         CredentialsStatusResponse {
             total: snapshot.total,
             available: snapshot.available,
-            current_id: snapshot.current_id,
+            current_id: exposed_current_id,
             credentials,
         }
     }
@@ -944,16 +959,22 @@ impl AdminService {
                 let started = std::time::Instant::now();
                 let summary = svc.proxy_pool.check_all().await;
                 tracing::info!(
-                    "代理池健康检查完成：健康 {}，异常 {}，本轮自动禁用 {}，耗时 {:.1}s",
+                    "代理池健康检查完成：健康 {}，异常 {}，本轮自动禁用 {}，恢复探测 {}，放回 {}，耗时 {:.1}s",
                     summary.healthy,
                     summary.unhealthy,
                     summary.auto_disabled,
+                    summary.recovery_probed,
+                    summary.newly_recovered.len(),
                     started.elapsed().as_secs_f32()
                 );
                 // 探测触发的自动禁用同样走处置流程：记事件 + 解绑受影响凭据
                 if let Some(ops) = &svc.ops {
                     for (id, url) in &summary.newly_disabled {
                         ops.handle_probe_auto_disable(*id, url);
+                    }
+                    // 放回只记事件，不动凭据绑定（见 handle_probe_auto_recover）
+                    for (id, url) in &summary.newly_recovered {
+                        ops.handle_probe_auto_recover(*id, url);
                     }
                 }
                 tokio::time::sleep(interval).await;
@@ -1060,8 +1081,8 @@ impl AdminService {
         fetch_balance: bool,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         // 校验端点名：未指定则默认合法，指定则必须已注册
-        if let Some(ref name) = req.endpoint {
-            if !self.known_endpoints.contains(name) {
+        if let Some(ref name) = req.endpoint
+            && !self.known_endpoints.contains(name) {
                 let mut known: Vec<&str> =
                     self.known_endpoints.iter().map(|s| s.as_str()).collect();
                 known.sort();
@@ -1070,7 +1091,6 @@ impl AdminService {
                     name, known
                 )));
             }
-        }
 
         // 规范化 auth_method：识别企业 SSO 别名；带 tokenEndpoint 但未声明时推断为 external_idp。
         let auth_method =
@@ -1158,11 +1178,10 @@ impl AdminService {
         // 主动获取余额（含订阅等级 / 邮箱）并写入缓存，添加后立即可见，
         // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤。
         // 仅验活路径需要；"直接导入"路径跳过以省掉这次上游往返。
-        if fetch_balance {
-            if let Err(e) = self.get_balance(credential_id).await {
+        if fetch_balance
+            && let Err(e) = self.get_balance(credential_id).await {
                 tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
             }
-        }
 
         Ok(AddCredentialResponse {
             success: true,
@@ -1261,16 +1280,20 @@ impl AdminService {
         self.token_manager
             .update_credential(
                 id,
-                req.email.map(|v| if v.is_empty() { None } else { Some(v) }),
-                req.proxy_url
-                    .map(|v| if v.is_empty() { None } else { Some(v) }),
-                req.proxy_username
-                    .map(|v| if v.is_empty() { None } else { Some(v) }),
-                req.proxy_password
-                    .map(|v| if v.is_empty() { None } else { Some(v) }),
-                req.groups,
-                req.source_channel
-                    .map(|v| if v.is_empty() { None } else { Some(v) }),
+                CredentialUpdate {
+                    email: req.email.map(|v| if v.is_empty() { None } else { Some(v) }),
+                    proxy_url: req.proxy_url.map(|v| if v.is_empty() { None } else { Some(v) }),
+                    proxy_username: req
+                        .proxy_username
+                        .map(|v| if v.is_empty() { None } else { Some(v) }),
+                    proxy_password: req
+                        .proxy_password
+                        .map(|v| if v.is_empty() { None } else { Some(v) }),
+                    groups: req.groups,
+                    source_channel: req
+                        .source_channel
+                        .map(|v| if v.is_empty() { None } else { Some(v) }),
+                },
             )
             .map_err(|e| self.classify_error(e, id))
     }
@@ -1340,6 +1363,171 @@ impl AdminService {
     ) -> Self {
         self.model_sync = settings;
         self
+    }
+
+    /// 注入 Kiro Provider（`POST /models/test` 发真实请求用）。
+    ///
+    /// 必须与 `/v1/messages` 用同一个实例：模型测试要回答的问题是「客户端发这个
+    /// 模型名时**本代理**实际会发生什么」，另起一个 provider 就换了账号池与
+    /// client 缓存，测的不再是生产链路。
+    pub fn with_kiro_provider(
+        mut self,
+        provider: Arc<crate::kiro::provider::KiroProvider>,
+    ) -> Self {
+        self.kiro_provider = Some(provider);
+        self
+    }
+
+    /// `POST /models/test`：对指定模型发送一次真实、最小化的 Kiro 请求。
+    ///
+    /// 先过本地注册表再决定发不发：这样测出来的是「客户端发这个模型名时本代理
+    /// 实际会发生什么」——含别名映射、禁用判定、thinking 变体与透传开关，而不是
+    /// 「把这串字符原样丢给上游会怎样」。被注册表拒绝的请求一次都不发出去。
+    ///
+    /// 这是一次真实请求，成功/失败照常计入凭据统计（`report_success` /
+    /// `report_failure` 由 provider 内部完成），不做只读豁免。
+    pub async fn test_model(
+        &self,
+        request: ModelTestRequest,
+    ) -> Result<ModelTestResponse, AdminServiceError> {
+        use crate::anthropic::model_registry::{
+            RejectReason, Resolution, allow_passthrough, current_registry,
+        };
+        use crate::kiro::model::events::{Event, strip_tool_use_xml_leaks};
+        use crate::kiro::model::requests::conversation::{
+            ConversationState, CurrentMessage, UserInputMessage,
+        };
+        use crate::kiro::model::requests::kiro::KiroRequest;
+        use crate::kiro::parser::decoder::EventStreamDecoder;
+
+        let model_id = request.model_id.trim().to_string();
+        if model_id.is_empty() {
+            return Err(AdminServiceError::InvalidModelField(
+                "modelId 不能为空".to_string(),
+            ));
+        }
+
+        // 第 1 步：注册表解析。Rejected 直接返回，不发任何请求。
+        let resolved_model_id = match current_registry().resolve(&model_id, allow_passthrough()) {
+            Resolution::Mapped { upstream_id, .. } | Resolution::Passthrough { upstream_id, .. } => {
+                upstream_id
+            }
+            // 「没配」→ 404 语义
+            Resolution::Rejected(RejectReason::Unknown) => {
+                return Err(AdminServiceError::ModelNotFound(model_id));
+            }
+            // 「配了但被人工禁用」→ 400 语义：这是本地配置问题，不是模型不存在
+            Resolution::Rejected(RejectReason::Disabled) => {
+                return Err(AdminServiceError::InvalidModelField(format!(
+                    "模型 {} 已在本地模型表中被禁用，不会下发到上游",
+                    model_id
+                )));
+            }
+        };
+        // 请求名带 -thinking 后缀且解析通过 → 本次走的是 thinking 变体
+        let thinking = model_id.to_ascii_lowercase().ends_with("-thinking");
+
+        let provider = self
+            .kiro_provider
+            .as_ref()
+            .ok_or_else(|| AdminServiceError::InternalError("Kiro Provider 未配置".to_string()))?;
+
+        // 第 2 步：构造最小请求体
+        let conversation_state = ConversationState::new(Uuid::new_v4().to_string())
+            .with_agent_continuation_id(Uuid::new_v4().to_string())
+            .with_agent_task_type("vibe")
+            .with_chat_trigger_type("MANUAL")
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new("Reply with exactly: OK", resolved_model_id.as_str())
+                    .with_origin("AI_EDITOR"),
+            ));
+        let body = serde_json::to_string(&KiroRequest {
+            conversation_state,
+            profile_arn: None,
+            additional_model_request_fields: None,
+        })
+        .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+
+        // 第 3 步：发送。指定了凭据就钉死它（不跨凭据故障转移），否则走正常账号池。
+        let pinned = request.credential_id;
+        let started = std::time::Instant::now();
+        let (credential_id, bytes) = tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            async {
+                let call = match pinned {
+                    Some(id) => provider.call_api_pinned(id, &body).await?,
+                    None => provider.call_api(&body, None, None).await?,
+                };
+                let credential_id = call.credential_id;
+                let bytes = call.response.bytes().await?;
+                Ok::<_, anyhow::Error>((credential_id, bytes))
+            },
+        )
+        .await
+        .map_err(|_| AdminServiceError::UpstreamError("模型测试请求超时".to_string()))?
+        .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?;
+
+        // 第 4 步：解帧
+        let mut decoder = EventStreamDecoder::new();
+        decoder
+            .feed(&bytes)
+            .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?;
+        let mut response_text = String::new();
+        let mut credit_usage = 0.0_f64;
+        let mut credit_unit = None;
+
+        for frame in decoder.decode_iter() {
+            let frame = frame.map_err(|error| {
+                AdminServiceError::UpstreamError(format!("模型响应解析失败: {error}"))
+            })?;
+            let event = Event::from_frame(frame).map_err(|error| {
+                AdminServiceError::UpstreamError(format!("模型事件解析失败: {error}"))
+            })?;
+            match event {
+                Event::AssistantResponse(response) => response_text.push_str(&response.content),
+                Event::Metering(metering) => {
+                    credit_usage += metering.usage;
+                    if !metering.unit.is_empty() {
+                        credit_unit = Some(metering.unit);
+                    }
+                }
+                Event::Error {
+                    error_code,
+                    error_message,
+                } => {
+                    return Err(AdminServiceError::UpstreamError(format!(
+                        "{error_code}: {error_message}"
+                    )));
+                }
+                Event::Exception {
+                    exception_type,
+                    message,
+                } => {
+                    return Err(AdminServiceError::UpstreamError(format!(
+                        "{exception_type}: {message}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        let response_text = strip_tool_use_xml_leaks(&response_text);
+        if response_text.trim().is_empty() {
+            return Err(AdminServiceError::UpstreamError(
+                "模型返回了空响应".to_string(),
+            ));
+        }
+
+        Ok(ModelTestResponse {
+            model_id,
+            resolved_model_id,
+            thinking,
+            credential_id,
+            latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            response_text,
+            credit_usage: (credit_usage > 0.0).then_some(credit_usage),
+            credit_unit,
+        })
     }
 
     fn registry_store(
@@ -1858,8 +2046,8 @@ impl AdminService {
     /// `force=false` 时优先返回 30 分钟内的缓存结果；`force=true` 时强制查询
     /// 远端。查询失败但有旧缓存时，返回旧缓存并附带 warning。
     pub async fn check_update(&self, force: bool) -> UpdateCheckInfo {
-        if !force {
-            if let Some(cached) = self.update_check_cache.lock().clone() {
+        if !force
+            && let Some(cached) = self.update_check_cache.lock().clone() {
                 let age = Utc::now()
                     .signed_duration_since(cached.cached_at)
                     .num_seconds();
@@ -1869,7 +2057,6 @@ impl AdminService {
                     return info;
                 }
             }
-        }
 
         match self.fetch_latest_release().await {
             Ok(info) => {
@@ -2230,32 +2417,28 @@ impl AdminService {
             ("traceRetentionDays", req.trace_retention_days),
             ("usageLogRetentionDays", req.usage_log_retention_days),
         ] {
-            if let Some(d) = v {
-                if !(1..=365).contains(&d) {
+            if let Some(d) = v
+                && !(1..=365).contains(&d) {
                     return Err(AdminServiceError::InvalidCredential(format!(
                         "{} 必须在 1..=365 内: {}",
                         name, d
                     )));
                 }
-            }
         }
 
         // 先改运行时原子值
-        if let Some(enabled) = req.trace_enabled {
-            if let Some(s) = &self.trace_store {
+        if let Some(enabled) = req.trace_enabled
+            && let Some(s) = &self.trace_store {
                 s.set_enabled(enabled);
             }
-        }
-        if let Some(days) = req.trace_retention_days {
-            if let Some(s) = &self.trace_store {
+        if let Some(days) = req.trace_retention_days
+            && let Some(s) = &self.trace_store {
                 s.set_retention_days(days);
             }
-        }
-        if let Some(days) = req.usage_log_retention_days {
-            if let Some(r) = &self.usage_recorder {
+        if let Some(days) = req.usage_log_retention_days
+            && let Some(r) = &self.usage_recorder {
                 r.set_retention_days(days as i64);
             }
-        }
 
         // 持久化到 config.json
         if let Err(e) = self.persist_log_governance_config(&req) {
@@ -2623,12 +2806,11 @@ impl AdminService {
         self.token_manager
             .update_credential(
                 credential_id,
-                None,            // email 不修改
-                Some(proxy_url), // 设置或清除 proxy_url（Some(None) = 清除，Some(Some(url)) = 设置）
-                None,            // proxy_username 不修改
-                None,            // proxy_password 不修改
-                None,            // groups 不修改
-                None,            // source_channel 不修改
+                CredentialUpdate {
+                    // Some(None) = 清除，Some(Some(url)) = 设置。
+                    proxy_url: Some(proxy_url),
+                    ..CredentialUpdate::default()
+                },
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -2708,7 +2890,13 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None)
+                .update_credential(
+                    *cred_id,
+                    CredentialUpdate {
+                        proxy_url: Some(Some(url)),
+                        ..CredentialUpdate::default()
+                    },
+                )
                 .is_ok()
             {
                 assigned += 1;
@@ -2929,16 +3117,16 @@ impl AdminService {
         };
 
         match outcome {
-            PollOutcome::Pending => return Ok(PollIdcLoginResponse::Pending),
+            PollOutcome::Pending => Ok(PollIdcLoginResponse::Pending),
             PollOutcome::Expired => {
                 self.social_sessions.lock().remove(session_id);
-                return Ok(PollIdcLoginResponse::Expired);
+                Ok(PollIdcLoginResponse::Expired)
             }
             PollOutcome::Closed => {
                 self.social_sessions.lock().remove(session_id);
-                return Err(AdminServiceError::InternalError(
+                Err(AdminServiceError::InternalError(
                     "Social 登录回调服务器已关闭，请重新发起登录".to_string(),
-                ));
+                ))
             }
             PollOutcome::Received(callback) => {
                 self.do_complete_social_login(session_id, callback).await
@@ -3191,7 +3379,7 @@ impl AdminService {
             let sessions = self.idc_sessions.lock();
             let s = sessions
                 .get(session_id)
-                .ok_or_else(|| AdminServiceError::NotFound { id: 0 })?;
+                .ok_or(AdminServiceError::NotFound { id: 0 })?;
 
             if Utc::now() >= s.expires_at {
                 return Ok(PollIdcLoginResponse::Expired);
@@ -3492,34 +3680,30 @@ pub fn apply_model_patch(
     }
 
     // 先全部校验再落值：中途失败不能留下改了一半的行。
-    if let Some(v) = req.exposed_id.as_deref() {
-        if v.trim().is_empty() {
+    if let Some(v) = req.exposed_id.as_deref()
+        && v.trim().is_empty() {
             return Err(AdminServiceError::InvalidModelField(
                 "exposedId 不能为空".to_string(),
             ));
         }
-    }
-    if let Some(v) = req.display_name.as_deref() {
-        if v.trim().is_empty() {
+    if let Some(v) = req.display_name.as_deref()
+        && v.trim().is_empty() {
             return Err(AdminServiceError::InvalidModelField(
                 "displayName 不能为空".to_string(),
             ));
         }
-    }
-    if let Some(v) = req.context_window {
-        if v <= 0 {
+    if let Some(v) = req.context_window
+        && v <= 0 {
             return Err(AdminServiceError::InvalidModelField(
                 "contextWindow 必须为正数".to_string(),
             ));
         }
-    }
-    if let Some(v) = req.max_output_tokens {
-        if v <= 0 {
+    if let Some(v) = req.max_output_tokens
+        && v <= 0 {
             return Err(AdminServiceError::InvalidModelField(
                 "maxOutputTokens 必须为正数".to_string(),
             ));
         }
-    }
 
     let pin = |row: &mut crate::anthropic::model_registry::ModelRow, field: &str| {
         if PATCHABLE_PINNED_FIELDS.contains(&field) && !row.pinned.iter().any(|p| p == field) {
@@ -4608,6 +4792,85 @@ mod model_registry_tests {
         }
     }
 
+    // ============ POST /models/test：注册表拒绝时一次请求都不发 ============
+    //
+    // 下面两条测试用的 service **没有注入 kiro_provider**：一旦解析放行，
+    // 代码会在发请求前先撞上 `InternalError("Kiro Provider 未配置")`。
+    // 断言拿到的是 ModelNotFound / InvalidModelField，就证明拒绝发生在发请求之前。
+
+    /// 未收录且未开透传 → ModelNotFound（404 语义），不发请求
+    #[tokio::test]
+    async fn test_model_rejects_unknown_model_before_sending_request() {
+        let service = model_sync_test_service();
+        let err = service
+            .test_model(ModelTestRequest {
+                model_id: "  no-such-model-xyz  ".to_string(),
+                credential_id: None,
+            })
+            .await
+            .unwrap_err();
+        match err {
+            AdminServiceError::ModelNotFound(m) => {
+                assert_eq!(m, "no-such-model-xyz", "回显的模型名应已 trim")
+            }
+            other => panic!("期望 ModelNotFound（且未发出请求），实际 {:?}", other),
+        }
+    }
+
+    /// 配了但被人工禁用 → InvalidModelField（400 语义），不发请求。
+    /// 与「没配」区分开：两者的排查方向完全不同。
+    #[tokio::test]
+    async fn test_model_rejects_disabled_model_before_sending_request() {
+        let _guard = crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut row = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.8")
+            .unwrap();
+        row.enabled = false;
+        let exposed = row.exposed_id.clone();
+        let file = ModelRegistryFile {
+            models: vec![row],
+            ..ModelRegistryFile::default()
+        };
+        crate::anthropic::model_registry::install_registry(
+            ModelRegistry::from_file(file).unwrap(),
+        );
+
+        let service = model_sync_test_service();
+        let err = service
+            .test_model(ModelTestRequest {
+                model_id: exposed.clone(),
+                credential_id: None,
+            })
+            .await
+            .unwrap_err();
+        match err {
+            AdminServiceError::InvalidModelField(msg) => {
+                assert!(msg.contains(&exposed), "错误信息应点名被禁用的模型: {}", msg)
+            }
+            other => panic!("期望 InvalidModelField（且未发出请求），实际 {:?}", other),
+        }
+
+        crate::anthropic::model_registry::install_registry(ModelRegistry::builtin());
+    }
+
+    /// 空 modelId 属于请求本身有问题，不是「模型不存在」
+    #[tokio::test]
+    async fn test_model_rejects_blank_model_id() {
+        let service = model_sync_test_service();
+        let err = service
+            .test_model(ModelTestRequest {
+                model_id: "   ".to_string(),
+                credential_id: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AdminServiceError::InvalidModelField(_)), "实际 {:?}", err);
+    }
+
     /// M2：模型同步时间校验失败必须走 `InvalidModelField`，文案不得是「凭据无效」
     /// 或提及「自动更新」——那是另一条路径（二进制自动更新时间）复用解析器的副作用，
     /// 会把排查方向带偏到完全不相关的功能上。
@@ -4711,5 +4974,74 @@ mod tests {
         assert_eq!(subscription_type_from_title(Some("KIRO PRO")), "Pro");
         assert_eq!(subscription_type_from_title(Some("KIRO POWER")), "Enterprise");
         assert_eq!(subscription_type_from_title(None), "Free");
+    }
+
+    // ============ 凭据状态：current_id / is_current 的模式相关语义 ============
+
+    fn cred_with_priority(priority: u32) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.access_token = Some("tok".to_string());
+        // 未过期 → 不会触发刷新（测试环境没有上游）
+        c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        c.priority = priority;
+        c
+    }
+
+    /// 两条凭据（priority 0 / 1），负载均衡模式由参数决定。
+    fn service_with_balancing_mode(mode: &str) -> AdminService {
+        let mut config = Config::default();
+        config.load_balancing_mode = mode.to_string();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                vec![cred_with_priority(0), cred_with_priority(1)],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        AdminService::new(
+            manager,
+            Vec::<String>::new(),
+            Arc::new(ProxyPoolManager::new(
+                None,
+                crate::model::config::TlsBackend::Rustls,
+            )),
+        )
+    }
+
+    /// balanced 模式下 `current_id` 只是内部调度指针（每次请求都重新选号），
+    /// 把它渲染成「当前活跃账号」是假信息。对外必须固定为 0 / 全 false。
+    #[tokio::test]
+    async fn balanced_mode_exposes_no_current_credential() {
+        let service = service_with_balancing_mode("balanced");
+
+        let response = service.get_all_credentials();
+
+        assert_eq!(response.current_id, 0, "均衡模式不得对外暴露调度指针");
+        assert!(
+            response.credentials.iter().all(|item| !item.is_current),
+            "均衡模式下没有「当前活跃账号」这个概念，全部必须为 false"
+        );
+    }
+
+    /// priority 模式下该语义是真实的：最高优先级（priority 最小）的那条为当前凭据。
+    #[tokio::test]
+    async fn priority_mode_keeps_single_current_credential() {
+        let service = service_with_balancing_mode("priority");
+
+        let response = service.get_all_credentials();
+
+        // 列表已按 priority 升序排序，首条即最高优先级
+        assert_eq!(response.current_id, response.credentials[0].id);
+        assert!(
+            response.credentials[0].is_current,
+            "最高优先级的那条应为当前凭据"
+        );
+        assert!(
+            response.credentials[1..].iter().all(|item| !item.is_current),
+            "当前凭据必须唯一"
+        );
     }
 }

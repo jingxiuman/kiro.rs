@@ -73,11 +73,11 @@ impl UsageRecordHook {
         credential_id: u64,
         input_tokens: i32,
         output_tokens: i32,
-        cache_creation_tokens: i32,
-        cache_read_tokens: i32,
+        cache_tokens: (i32, i32),
         credits: f64,
         status: &str,
     ) {
+        let (cache_creation_tokens, cache_read_tokens) = cache_tokens;
         let rec = UsageRecord {
             ts: Utc::now().to_rfc3339(),
             key_id: self.key_id,
@@ -101,8 +101,8 @@ impl UsageRecordHook {
         if let Some(a) = &self.aggregator {
             a.ingest(&rec);
         }
-        if status == "success" && self.key_id != 0 {
-            if let Some(m) = &self.client_keys {
+        if status == "success" && self.key_id != 0
+            && let Some(m) = &self.client_keys {
                 m.record_usage(
                     self.key_id,
                     rec.input_tokens,
@@ -112,7 +112,6 @@ impl UsageRecordHook {
                     rec.credits,
                 );
             }
-        }
     }
 }
 
@@ -131,7 +130,7 @@ pub(crate) struct RequestTracer {
     key_source: TraceKeySource,
     model: String,
     is_stream: bool,
-    /// Claude Code 会话 id（metadata.user_id 的 `_session_<uuid>`），可为 None
+    /// Claude Code 会话 id（metadata.user_id 的 JSON 或 legacy 格式），可为 None
     session_id: Option<String>,
     started_at: Instant,
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
@@ -167,14 +166,23 @@ struct RequestTraceOptions {
     session_id: Option<String>,
 }
 
-/// 从请求 metadata.user_id 提取 Claude Code 会话 id（`_session_<uuid>`）。
-/// 无 metadata / 非该格式时返回 None。
+struct ResponseProcessingConfig {
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
+    cache_usage: super::cache_metering::CacheUsage,
+    group: Option<String>,
+    context_window: i32,
+}
+
+/// 从请求 metadata.user_id 提取 Claude Code 会话 id。
+/// 支持当前 JSON 格式与旧版 `_session_<uuid>` 格式。
 fn session_id_of(payload: &super::types::MessagesRequest) -> Option<String> {
     payload
         .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_deref())
-        .and_then(super::cache_metering::extract_session_id)
+        .and_then(super::metadata::extract_session_id)
 }
 
 impl RequestTracer {
@@ -612,6 +620,32 @@ fn available_models() -> Vec<Model> {
     crate::anthropic::model_registry::current_registry().exposed_models()
 }
 
+/// 按组支持集过滤 /v1/models 输出。
+/// `allowed` 为 upstream id 集合;exposed id 先经注册表 resolve 再比对。
+/// `auto` 恒保留;解析失败的行保留(保守,不因视图层吞行)。
+fn filter_models_by_group(
+    models: Vec<Model>,
+    allowed: &std::collections::HashSet<String>,
+) -> Vec<Model> {
+    use crate::anthropic::model_registry::{current_registry, Resolution};
+    let registry = current_registry();
+    models
+        .into_iter()
+        .filter(|m| {
+            if m.id == "auto" {
+                return true;
+            }
+            match registry.resolve(&m.id, false) {
+                Resolution::Mapped { upstream_id, .. }
+                | Resolution::Passthrough { upstream_id, .. } => {
+                    upstream_id == "auto" || allowed.contains(&upstream_id)
+                }
+                _ => true,
+            }
+        })
+        .collect()
+}
+
 /// 请求转换失败 → 对客户端的 HTTP 响应（anthropic 路由，中文文案）。
 ///
 /// **抽出来的唯一目的是可测**：`post_messages` 与 `post_messages_cc` 原先各内联
@@ -640,18 +674,79 @@ pub(crate) fn conversion_error_response(e: &ConversionError) -> (StatusCode, Jso
     )
 }
 
+/// 组支持校验的纯判定层：requested 先 resolve 成 upstream id 再比对。
+/// 放行条件：auto / 解析失败（交给下游既有 400 路径）/ allowed 命中。
+pub(crate) fn group_model_check_against(
+    allowed: &std::collections::HashSet<String>,
+    requested_model: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    use crate::anthropic::model_registry::{allow_passthrough, current_registry, Resolution};
+    let upstream = match current_registry().resolve(requested_model, allow_passthrough()) {
+        Resolution::Mapped { upstream_id, .. }
+        | Resolution::Passthrough { upstream_id, .. } => upstream_id,
+        _ => return Ok(()),
+    };
+    if upstream == "auto" || allowed.contains(&upstream) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse::new(
+            "not_found_error",
+            format!("model not supported for this key group: {}", requested_model),
+        )),
+    ))
+}
+
+/// 入口封装：取组支持集（None=不设限）后调用判定层。
+pub(crate) fn group_model_check(
+    state: &AppState,
+    group: Option<&str>,
+    requested_model: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(provider) = &state.kiro_provider else { return Ok(()) };
+    match provider.token_manager().group_supported_models(group) {
+        Some(allowed) => group_model_check_against(&allowed, requested_model),
+        None => Ok(()),
+    }
+}
+
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+pub async fn get_models(
+    State(state): State<AppState>,
+    Extension(key_ctx): Extension<KeyContext>,
+) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = available_models();
+    let mut models = available_models();
+    if let Some(provider) = &state.kiro_provider
+        && let Some(allowed) = provider
+            .token_manager()
+            .group_supported_models(key_ctx.group.as_deref())
+    {
+        models = filter_models_by_group(models, &allowed);
+    }
 
     Json(ModelsResponse {
         object: "list".to_string(),
         data: models,
     })
+}
+
+/// 校验 max_tokens：必须为正数
+///
+/// 上游对 `max_tokens <= 0` 会返回难以定位的错误，这里在入口处提前拒绝。
+fn validate_max_tokens(max_tokens: i32) -> Result<(), ErrorResponse> {
+    if max_tokens <= 0 {
+        Err(ErrorResponse::new(
+            "invalid_request_error",
+            "max_tokens must be greater than 0",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// POST /v1/messages
@@ -674,6 +769,9 @@ pub async fn post_messages(
         image_largest_b64_kb = %(img_stats.largest_b64_bytes / 1024),
         "Received POST /v1/messages request"
     );
+    if let Err(error) = validate_max_tokens(payload.max_tokens) {
+        return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+    }
     if img_stats.total_b64_bytes > IMAGE_BUDGET_WARN_BYTES {
         tracing::warn!(
             image_count = %img_stats.count,
@@ -687,7 +785,7 @@ pub async fn post_messages(
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, (0, 0), 0.0, "error");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -698,6 +796,12 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+
+    // 组支持校验：请求的模型不在该 key 所属组的支持集内 → 404，不再路由上游吃 400
+    if let Err(resp) = group_model_check(&state, key_ctx.group.as_deref(), &payload.model) {
+        hook.record(0, 0, 0, (0, 0), 0.0, "error");
+        return resp.into_response();
+    }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -723,7 +827,7 @@ pub async fn post_messages(
         .await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
         let status = if resp.status().is_success() { "success" } else { "error" };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        hook.record(0, input_tokens, 0, (0, 0), 0.0, status);
         return resp;
     }
 
@@ -741,7 +845,7 @@ pub async fn post_messages(
         Ok(result) => result,
         Err(e) => {
             tracing::warn!("请求转换失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, (0, 0), 0.0, "error");
             // 文案与状态码见 conversion_error_response（抽出来是为了可测）
             return conversion_error_response(&e).into_response();
         }
@@ -759,7 +863,7 @@ pub async fn post_messages(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, (0, 0), 0.0, "error");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -816,14 +920,16 @@ pub async fn post_messages(
             &request_body,
             &payload.model,
             total_input_tokens,
-            thinking_enabled,
-            tool_name_map,
-            known_tool_names,
             hook,
-            cache_usage,
             tracer,
-            key_ctx.group.clone(),
-            context_window,
+            ResponseProcessingConfig {
+                thinking_enabled,
+                tool_name_map,
+                known_tool_names,
+                cache_usage,
+                group: key_ctx.group.clone(),
+                context_window,
+            },
         )
         .await
     } else {
@@ -843,14 +949,16 @@ pub async fn post_messages(
             &request_body,
             &payload.model,
             total_input_tokens,
-            extract_thinking,
-            tool_name_map,
-            known_tool_names,
             hook,
-            cache_usage,
             tracer,
-            key_ctx.group.clone(),
-            context_window,
+            ResponseProcessingConfig {
+                thinking_enabled: extract_thinking,
+                tool_name_map,
+                known_tool_names,
+                cache_usage,
+                group: key_ctx.group.clone(),
+                context_window,
+            },
         )
         .await
     }
@@ -862,21 +970,23 @@ async fn handle_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
-    thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
-    known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
-    cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
-    // 请求入口随 ConversionResult 传入的输入上下文窗口，见 handle_non_stream_request 同名参数注释。
-    context_window: i32,
+    config: ResponseProcessingConfig,
 ) -> Response {
+    let ResponseProcessingConfig {
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+        cache_usage,
+        group,
+        context_window,
+    } = config;
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(0, input_tokens, 0, (0, 0), 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
             tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
@@ -1157,8 +1267,7 @@ fn record_stream_usage(
         credential_id,
         input,
         ctx.output_tokens,
-        cache_creation,
-        cache_read,
+        (cache_creation, cache_read),
         ctx.credits,
         status,
     );
@@ -1182,24 +1291,25 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
-    thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
-    // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探，
-    // 因此这里不需要工具表校验；保留参数以对齐调用方签名。
-    _known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
-    cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
-    // 请求入口随 ConversionResult 传入的输入上下文窗口，单请求内只取一次快照，
-    // 避免响应处理阶段回头查全局注册表（热重载可能导致「用旧表映射、用新表计量」）。
-    context_window: i32,
+    config: ResponseProcessingConfig,
 ) -> Response {
+    let ResponseProcessingConfig {
+        thinking_enabled,
+        tool_name_map,
+        // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探。
+        known_tool_names: _,
+        cache_usage,
+        group,
+        // 请求入口只取一次窗口快照，避免响应阶段读取热重载后的新注册表。
+        context_window,
+    } = config;
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(0, input_tokens, 0, (0, 0), 0.0, "error");
             tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
@@ -1215,7 +1325,7 @@ async fn handle_non_stream_request(
         Err(e) => {
             let detail = describe_reqwest_error(&e);
             tracing::error!("读取响应体失败: {}", detail);
-            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(credential_id, input_tokens, 0, (0, 0), 0.0, "error");
             // 连接已建立后 body 读取失败 = 传输链路失败，计入所用代理
             report_stream_outcome(&ops_feedback, true, &detail);
             tracer.finalize(
@@ -1331,11 +1441,10 @@ async fn handle_non_stream_request(
                             );
                             metering = Some(event_metering);
                         }
-                        Event::Exception { exception_type, .. } => {
-                            if exception_type == "ContentLengthExceededException" {
+                        Event::Exception { exception_type, .. }
+                            if exception_type == "ContentLengthExceededException" => {
                                 stop_reason = "max_tokens".to_string();
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -1361,7 +1470,7 @@ async fn handle_non_stream_request(
     if let Some(err) = tool_json_error {
         let incomplete = err.is_incomplete();
         let message = err.message();
-        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        hook.record(credential_id, input_tokens, 0, (0, 0), 0.0, "error");
         report_stream_outcome(&ops_feedback, incomplete, &message);
         tracer.finalize(
             "error",
@@ -1437,8 +1546,7 @@ async fn handle_non_stream_request(
         credential_id,
         final_input_tokens,
         output_tokens,
-        cache_creation_tokens,
-        cache_read_tokens,
+        (cache_creation_tokens, cache_read_tokens),
         credits,
         "success",
     );
@@ -1564,14 +1672,21 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 ///
 /// 计算消息的 token 数量
 pub async fn count_tokens(
-    Extension(_key_ctx): Extension<KeyContext>,
+    State(state): State<AppState>,
+    Extension(key_ctx): Extension<KeyContext>,
     JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
-) -> impl IntoResponse {
+) -> Response {
     tracing::info!(
         model = %payload.model,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages/count_tokens request"
     );
+
+    // 组支持校验：即便本端点是纯本地计数、不路由上游，视图仍需与组对齐 ——
+    // 客户端不该在 count_tokens 上看到一个之后 /v1/messages 会 404 的模型。
+    if let Err(resp) = group_model_check(&state, key_ctx.group.as_deref(), &payload.model) {
+        return resp.into_response();
+    }
 
     let total_tokens = token::count_all_tokens(
         payload.model,
@@ -1581,8 +1696,9 @@ pub async fn count_tokens(
     ) as i32;
 
     Json(CountTokensResponse {
-        input_tokens: total_tokens.max(1) as i32,
+        input_tokens: total_tokens.max(1),
     })
+    .into_response()
 }
 
 /// POST /cc/v1/messages
@@ -1602,6 +1718,9 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+    if let Err(error) = validate_max_tokens(payload.max_tokens) {
+        return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+    }
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
 
     // 检查 KiroProvider 是否可用
@@ -1609,7 +1728,7 @@ pub async fn post_messages_cc(
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, (0, 0), 0.0, "error");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -1620,6 +1739,12 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
+
+    // 组支持校验：请求的模型不在该 key 所属组的支持集内 → 404，不再路由上游吃 400
+    if let Err(resp) = group_model_check(&state, key_ctx.group.as_deref(), &payload.model) {
+        hook.record(0, 0, 0, (0, 0), 0.0, "error");
+        return resp.into_response();
+    }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -1644,7 +1769,7 @@ pub async fn post_messages_cc(
         )
         .await;
         let status = if resp.status().is_success() { "success" } else { "error" };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        hook.record(0, input_tokens, 0, (0, 0), 0.0, status);
         return resp;
     }
 
@@ -1662,7 +1787,7 @@ pub async fn post_messages_cc(
         Ok(result) => result,
         Err(e) => {
             tracing::warn!("请求转换失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, (0, 0), 0.0, "error");
             // 文案与状态码见 conversion_error_response（抽出来是为了可测）
             return conversion_error_response(&e).into_response();
         }
@@ -1680,7 +1805,7 @@ pub async fn post_messages_cc(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, (0, 0), 0.0, "error");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -1735,15 +1860,17 @@ pub async fn post_messages_cc(
             provider,
             &request_body,
             &payload.model,
-            thinking_enabled,
-            tool_name_map,
-            known_tool_names,
-            hook,
             total_input_tokens,
-            cache_usage,
+            hook,
             tracer,
-            key_ctx.group.clone(),
-            context_window,
+            ResponseProcessingConfig {
+                thinking_enabled,
+                tool_name_map,
+                known_tool_names,
+                cache_usage,
+                group: key_ctx.group.clone(),
+                context_window,
+            },
         )
         .await
     } else {
@@ -1763,14 +1890,16 @@ pub async fn post_messages_cc(
             &request_body,
             &payload.model,
             total_input_tokens,
-            extract_thinking,
-            tool_name_map,
-            known_tool_names,
             hook,
-            cache_usage,
             tracer,
-            key_ctx.group.clone(),
-            context_window,
+            ResponseProcessingConfig {
+                thinking_enabled: extract_thinking,
+                tool_name_map,
+                known_tool_names,
+                cache_usage,
+                group: key_ctx.group.clone(),
+                context_window,
+            },
         )
         .await
     }
@@ -1784,22 +1913,24 @@ async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
-    thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
-    known_tool_names: std::collections::HashSet<String>,
-    hook: UsageRecordHook,
     fallback_input_tokens: i32,
-    cache_usage: super::cache_metering::CacheUsage,
+    hook: UsageRecordHook,
     tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
-    // 请求入口随 ConversionResult 传入的输入上下文窗口，见 handle_non_stream_request 同名参数注释。
-    context_window: i32,
+    config: ResponseProcessingConfig,
 ) -> Response {
+    let ResponseProcessingConfig {
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+        cache_usage,
+        group,
+        context_window,
+    } = config;
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
-            hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(0, fallback_input_tokens, 0, (0, 0), 0.0, "error");
             tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
@@ -1931,7 +2062,7 @@ fn create_buffered_sse_stream(
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
-                                hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                hook.record(credential_id, i, o, (cc, cr), credits, "error");
                                 report_stream_outcome(&ops_feedback, true, &detail);
                                 // 缓冲模式 chunk 读取失败：上游中途断流
                                 tracer.finalize(
@@ -1982,7 +2113,7 @@ fn create_buffered_sse_stream(
                                     // 见实时流路径同名分支
                                     let incomplete =
                                         ctx.tool_json_error_incomplete().unwrap_or(true);
-                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                    hook.record(credential_id, i, o, (cc, cr), credits, "error");
                                     report_stream_outcome(&ops_feedback, incomplete, &message);
                                     tracer.finalize(
                                         "error",
@@ -1996,7 +2127,7 @@ fn create_buffered_sse_stream(
                                         trace_usage,
                                     );
                                 } else {
-                                    hook.record(credential_id, i, o, cc, cr, credits, "success");
+                                    hook.record(credential_id, i, o, (cc, cr), credits, "success");
                                     report_stream_outcome(&ops_feedback, false, "");
                                     tracer.finalize("success", None, None, None, trace_usage);
                                 }
@@ -2180,6 +2311,23 @@ mod tests {
     }
 
     #[test]
+    fn trace_session_id_supports_current_json_metadata() {
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+            "model": "claude-opus-5",
+            "max_tokens": 100,
+            "messages": [],
+            "metadata": {
+                "user_id": "{\"device_id\":\"device\",\"account_uuid\":\"\",\"session_id\":\"8bb5523b-ec7c-4540-a9ca-beb6d79f1552\"}"
+            }
+        }"#).unwrap();
+
+        assert_eq!(
+            session_id_of(&req).as_deref(),
+            Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552")
+        );
+    }
+
+    #[test]
     fn count_image_budget_counts_inline_base64() {
         let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
             "model": "claude-opus-4-7",
@@ -2339,6 +2487,32 @@ mod tests {
         assert!(unlisted_still_resolves, "listed=false 只影响列表，不影响解析");
     }
 
+    /// `/v1/models` 按调用 key 的凭据组收窄：`allowed` 之外的 upstream id 应被过滤掉，
+    /// `auto` 恒保留。
+    #[test]
+    fn models_list_narrowed_by_group_support_set() {
+        let registry = crate::anthropic::model_registry::current_registry();
+        let models = registry.exposed_models();
+        assert!(!models.is_empty(), "内置注册表不应为空");
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("claude-opus-5".to_string());
+        let filtered = filter_models_by_group(models.clone(), &allowed);
+        for m in &filtered {
+            if m.id == "auto" {
+                continue;
+            }
+            let upstream = match registry.resolve(&m.id, false) {
+                crate::anthropic::model_registry::Resolution::Mapped { upstream_id, .. }
+                | crate::anthropic::model_registry::Resolution::Passthrough { upstream_id, .. } => {
+                    upstream_id
+                }
+                _ => panic!("exposed 模型必可解析: {}", m.id),
+            };
+            assert_eq!(upstream, "claude-opus-5", "过滤后只应剩 allowed 内的模型: {}", m.id);
+        }
+        assert!(filtered.len() < models.len(), "应有收窄效果");
+    }
+
     /// `GET /v1/models` 的**响应报文**必须由注册表行逐字段派生。
     ///
     /// 单测 `exposed_models()` 断言的是 Vec<Model>，覆盖不到序列化这一层：
@@ -2365,7 +2539,13 @@ mod tests {
         }
         install_registry(r);
 
-        let resp = get_models().await.into_response();
+        let state = AppState::new(false, crate::model::config::ToolCompatibilityMode::default());
+        let key_ctx = KeyContext {
+            key_id: 0,
+            group: None,
+            key_source: crate::admin::trace_db::TraceKeySource::MasterApiKey,
+        };
+        let resp = get_models(State(state), Extension(key_ctx)).await.into_response();
         let status = resp.status();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -2571,6 +2751,51 @@ mod tests {
             zh.0.error.message, en.0.error.message,
             "两条路由的文案不得合并：客户端可能在匹配其中一份"
         );
+    }
+
+    /// 组支持校验（纯逻辑层）：allowed 集合里没有该模型解析出的 upstream id → 404 not_found_error。
+    ///
+    /// 用 `claude-opus-4-7` 而非 brief 草稿里的 `claude-opus-5`：注册表里没有
+    /// `-5` 这个 exposed_id，在 `allow_passthrough() == false`（测试期默认值）下
+    /// 会直接 `Rejected(Unknown)`，走的是"放行交给下游 400"分支而非本测试要
+    /// 覆盖的"命中但不在组内"分支——用一个真实存在于内置注册表的 exposed_id
+    /// 才能实际验证拒绝路径。
+    #[test]
+    fn group_model_check_rejects_with_404_not_found_error() {
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("glm-5".to_string());
+        let err = group_model_check_against(&allowed, "claude-opus-4-7")
+            .expect_err("组不支持应拒绝");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1.0.error.error_type, "not_found_error");
+        assert_eq!(
+            err.1.0.error.message,
+            "model not supported for this key group: claude-opus-4-7"
+        );
+    }
+
+    #[test]
+    fn group_model_check_allows_auto_alias_and_unresolvable() {
+        let allowed: std::collections::HashSet<String> =
+            [("glm-5".to_string())].into_iter().collect();
+        // auto 恒放行
+        assert!(group_model_check_against(&allowed, "auto").is_ok());
+        // 注册表不认识的名字：放行，交由既有 conversion_error_response 路径报 400，
+        // 两类错误不混同
+        assert!(group_model_check_against(&allowed, "no-such-model-xyz").is_ok());
+    }
+
+    /// max_tokens 必须为正数：0 与负数应被拒绝，正数放行。
+    #[test]
+    fn max_tokens_must_be_positive() {
+        assert!(validate_max_tokens(1).is_ok());
+        assert!(validate_max_tokens(super::super::types::DEFAULT_MAX_TOKENS).is_ok());
+
+        let err = validate_max_tokens(0).expect_err("0 必须被拒绝");
+        assert_eq!(err.error.error_type, "invalid_request_error");
+        assert_eq!(err.error.message, "max_tokens must be greater than 0");
+
+        assert!(validate_max_tokens(-1).is_err());
     }
 }
 

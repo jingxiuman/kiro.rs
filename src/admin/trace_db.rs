@@ -259,13 +259,11 @@ impl TraceStore {
         } else {
             path
         };
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty() && !parent.exists()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     tracing::warn!("创建 traces.db 目录失败 {}: {}", parent.display(), e);
                 }
-            }
-        }
         let conn = Connection::open(&path)?;
         // WAL：并发读不阻塞写；synchronous=NORMAL：写吞吐与崩溃安全的平衡
         conn.pragma_update(None, "journal_mode", "WAL")?;

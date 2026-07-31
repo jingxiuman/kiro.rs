@@ -3,6 +3,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// 未显式给出 max_tokens 时的默认输出上限（全局唯一来源）
+pub const DEFAULT_MAX_TOKENS: i32 = 32_000;
+
+/// serde 默认值钩子，见 [`DEFAULT_MAX_TOKENS`]
+fn default_max_tokens() -> i32 {
+    DEFAULT_MAX_TOKENS
+}
+
 // === 错误响应 ===
 
 /// API 错误响应
@@ -39,7 +47,7 @@ impl ErrorResponse {
 // === Models 端点类型 ===
 
 /// 模型信息
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Model {
     pub id: String,
     pub object: String,
@@ -116,6 +124,7 @@ pub struct Metadata {
 #[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
+    #[serde(default = "default_max_tokens")]
     pub max_tokens: i32,
     pub messages: Vec<Message>,
     #[serde(default)]
@@ -303,4 +312,26 @@ pub struct CountTokensRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CountTokensResponse {
     pub input_tokens: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 未给 max_tokens 时应回落到 DEFAULT_MAX_TOKENS（32000），而不是反序列化失败。
+    #[test]
+    fn messages_request_max_tokens_defaults_when_absent() {
+        let json = r#"{"model":"claude-sonnet-4","messages":[]}"#;
+        let req: MessagesRequest = serde_json::from_str(json).expect("缺省 max_tokens 应可反序列化");
+        assert_eq!(req.max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(req.max_tokens, 32_000);
+    }
+
+    /// 显式给出的 max_tokens 必须原样保留，不被默认值覆盖。
+    #[test]
+    fn messages_request_max_tokens_keeps_explicit_value() {
+        let json = r#"{"model":"claude-sonnet-4","messages":[],"max_tokens":4096}"#;
+        let req: MessagesRequest = serde_json::from_str(json).expect("显式 max_tokens 应可反序列化");
+        assert_eq!(req.max_tokens, 4096);
+    }
 }

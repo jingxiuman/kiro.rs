@@ -8,10 +8,26 @@ use std::time::Duration;
 
 use crate::model::config::TlsBackend;
 
+/// 上游链路保活参数。
+///
+/// 下游（客户端方向）已有 25s 的 SSE ping（handlers::PING_INTERVAL_SECS），但下游活着
+/// 不等于上游活着：Opus 长思考期间上游连接可能几分钟无数据帧，链路中间的代理会把
+/// 静默连接判死并 RST_STREAM（实测多次中断集中在 ~240s）。上游保活须独立配置，
+/// 且间隔必须显著小于链路上最短的 idle timeout。
+const HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 25;
+/// PING 发出后多久没有 ACK 判定连接已死。宁可早断快重试，不要挂在死连接上耗满总超时。
+const HTTP2_KEEP_ALIVE_TIMEOUT_SECS: u64 = 15;
+/// TCP 层保活首探时间。reqwest 0.12 默认已开（15s 起、15s 间隔、3 次重试），这里显式
+/// 钉住取值以免依赖升级悄悄改变行为。经代理隧道时 h2 PING 走端到端、TCP keepalive
+/// 只覆盖到代理这一跳，两层各防一段链路。
+const TCP_KEEPALIVE_SECS: u64 = 30;
+
 /// 进程级出网策略：开启后，任何「无代理」的出网请求都会被拒绝。
 ///
-/// 用全局状态而非函数参数，是为了让**新增的出网点默认受保护**——本模块是所有
+/// 用全局状态而非函数参数，是为了让**新增的出网点默认受保护**——本模块是 Kiro 上游
 /// reqwest::Client 的唯一出口，漏传一个参数就会静默裸连，而全局开关漏不掉。
+/// （admin 的更新器 binary_update.rs 与 release 检查 service.rs 各自独立建 client，
+/// 不走本出口，也不受本模块的代理策略与保活配置约束。）
 static REQUIRE_PROXY: AtomicBool = AtomicBool::new(false);
 
 /// 由 main 在读完配置后设置一次（config.requireProxy）
@@ -84,7 +100,13 @@ fn build_client_with_policy(
         );
     }
 
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .http2_keep_alive_interval(Duration::from_secs(HTTP2_KEEP_ALIVE_INTERVAL_SECS))
+        .http2_keep_alive_timeout(Duration::from_secs(HTTP2_KEEP_ALIVE_TIMEOUT_SECS))
+        // 不开 http2_keep_alive_while_idle：有活跃流时 PING 本来就发（覆盖流式长静默这个
+        // 目标场景）；池中全空闲连接 90s 就被驱逐，活不到需要保活的时刻，开了只多流量
+        .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_SECS));
 
     match tls_backend {
         TlsBackend::Rustls => {

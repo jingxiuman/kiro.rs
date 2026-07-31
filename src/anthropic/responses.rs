@@ -18,6 +18,7 @@
 //!   → 应答 `custom_tool_call`（原始字符串 `input`）。
 //!   Anthropic 侧没有自由文本工具，进方向包一层
 //!   `{"input": <string>}` 单字段 schema，出方向再解包。
+//!
 //! 每个请求维护一张 name → 声明类型 的 [`ToolKindMap`]，请求翻译时生成、
 //! 响应构造时消费，保证出方向 item 类型永远与声明一致。
 //!
@@ -49,13 +50,12 @@ use super::middleware::{AppState, KeyContext};
 use super::openai::{
     ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message, push_merged,
 };
-use super::types::{Message, MessagesRequest, OutputConfig, SystemMessage, Tool};
+use super::types::{
+    DEFAULT_MAX_TOKENS, Message, MessagesRequest, OutputConfig, SystemMessage, Tool,
+};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
-
-/// 未显式给出 max_output_tokens 时的默认输出上限
-const DEFAULT_MAX_TOKENS: i32 = 32000;
 
 /// 无 codex 工具时的严格提示（保持既有已验证的纯聊天/搜索行为）
 const NUDGE_STRICT: &str = "You have a web_search tool that returns live results. For anything \
@@ -222,14 +222,13 @@ fn responses_to_anthropic(
         .unwrap_or(DEFAULT_MAX_TOKENS);
 
     let mut system: Vec<SystemMessage> = Vec::new();
-    if let Some(instr) = req.instructions.as_ref() {
-        if !instr.trim().is_empty() {
+    if let Some(instr) = req.instructions.as_ref()
+        && !instr.trim().is_empty() {
             system.push(SystemMessage {
                 text: instr.clone(),
                 cache_control: None,
             });
         }
-    }
 
     let mut merged: Vec<(String, Vec<Value>)> = Vec::new();
     // codex 0.144 把工具声明放进 input 里的 `additional_tools` item
@@ -632,11 +631,10 @@ fn content_blocks(content: Option<&Value>) -> Vec<Value> {
                 let ty = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match ty {
                     "input_text" | "output_text" | "text" => {
-                        if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                            if !t.is_empty() {
+                        if let Some(t) = part.get("text").and_then(|v| v.as_str())
+                            && !t.is_empty() {
                                 out.push(json!({"type":"text","text":t}));
                             }
-                        }
                     }
                     "input_image" => {
                         // Responses: image_url 是字符串（可能是 data: URL）
@@ -739,11 +737,10 @@ fn custom_input_text(arguments_json: &str) -> String {
             if let Some(Value::String(s)) = map.get("input") {
                 return s.clone();
             }
-            if map.len() == 1 {
-                if let Some(Value::String(s)) = map.values().next() {
+            if map.len() == 1
+                && let Some(Value::String(s)) = map.values().next() {
                     return s.clone();
                 }
-            }
             arguments_json.to_string()
         }
         Value::String(s) => s,

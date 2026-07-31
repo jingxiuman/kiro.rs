@@ -13,7 +13,8 @@ pub struct CredentialsStatusResponse {
     pub total: usize,
     /// 可用凭据数量（未禁用）
     pub available: usize,
-    /// 当前活跃凭据 ID
+    /// 优先级模式下的当前优先凭据 ID；均衡模式固定为 0
+    /// （均衡模式每次请求重新选号，内部调度指针不是「当前活跃账号」）
     pub current_id: u64,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
@@ -33,7 +34,7 @@ pub struct CredentialStatusItem {
     pub failure_count: u32,
     /// 累计失败次数（所有失败类型，只增不减，仅手动重置归零）
     pub total_failure_count: u64,
-    /// 是否为当前活跃凭据
+    /// 是否为优先级模式下的当前优先凭据；均衡模式固定为 false
     pub is_current: bool,
     /// Token 过期时间（RFC3339 格式）
     pub expires_at: Option<String>,
@@ -369,6 +370,49 @@ pub struct AvailableModelItem {
     /// 最大输入 Token 数
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<i64>,
+}
+
+// ============ 模型真实请求测试 ============
+
+/// `POST /models/test` 请求参数。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTestRequest {
+    /// 客户端会发的模型名（走本地注册表解析：别名 / 禁用 / thinking 变体 / 透传）
+    pub model_id: String,
+    /// 指定凭据；缺省时走正常账号池调度
+    #[serde(default)]
+    pub credential_id: Option<u64>,
+}
+
+/// `POST /models/test` 结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTestResponse {
+    /// 请求里给的模型名（原样回显）
+    pub model_id: String,
+    /// 注册表解析后真正下发给上游的 ID
+    pub resolved_model_id: String,
+    /// 请求名是否被识别为 thinking 变体。
+    ///
+    /// **只反映名字解析，不代表本次探针请求真的开了 thinking**：探针发的是最小
+    /// 请求体（`additional_model_request_fields: None`、无 system 前缀），而生产
+    /// 链路的 thinking 由 `converter::build_additional_model_request_fields` 与
+    /// system 提示前缀共同决定。所以本端点验证的是「这个模型名能不能打通」，
+    /// 不是「thinking 参数会不会被上游接受」。
+    pub thinking: bool,
+    /// 本次实际使用的凭据 ID
+    pub credential_id: u64,
+    /// 端到端耗时（毫秒）
+    pub latency_ms: u64,
+    /// 上游返回的文本
+    pub response_text: String,
+    /// 本次消耗的计费额度（上游未下发计费事件时缺省）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_usage: Option<f64>,
+    /// 计费单位
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_unit: Option<String>,
 }
 
 // ============ 一键超额 ============
