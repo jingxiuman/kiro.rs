@@ -1,0 +1,19 @@
+docs/superpowers/specs/2026-07-31-group-model-view-design.md
+  s_ef0bb9ae6ef7d6::t_56f3d972bfb548 1-114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "6f946eaf7500b87e890928460f8de5b6eafa7aab",
+  "prompts": {},
+  "sessions": {
+    "s_ef0bb9ae6ef7d6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a07a60d2-98eb-43ff-aaf2-a572fbea1917",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
