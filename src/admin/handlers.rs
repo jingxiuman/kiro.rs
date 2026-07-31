@@ -1978,6 +1978,18 @@ pub async fn ops_by_proxy(
     Json(serde_json::json!({ "stats": stats, "pool": pool })).into_response()
 }
 
+/// GET /api/admin/ops/retry-effectiveness?hours=24
+/// 重试有效性阶梯：逐跳的到达数 / 救回数 / 边际收益，用于判断重试预算该不该下调
+pub async fn ops_retry_effectiveness(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(ops) = state.service.ops() else {
+        return ops_unavailable();
+    };
+    Json(ops.events().retry_effectiveness(parse_ops_hours(&params))).into_response()
+}
+
 /// GET /api/admin/ops/events?limit=100
 /// 最近的自动处置事件（代理自动禁用 / 换绑等）
 pub async fn ops_events(

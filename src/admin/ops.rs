@@ -41,6 +41,27 @@ const FINGERPRINT_SAMPLES: usize = 2;
 /// 指纹接口的 limit 上限
 pub const MAX_FINGERPRINT_LIMIT: usize = 200;
 
+/// 判定「这一跳的边际收益塌了」的阈值：到达该跳的请求里靠它救回的不足 1/5。
+///
+/// 为什么是 0.20 而不是别的数：实测 7 天分布的逐跳边际收益是
+/// 0.95 / 0.37 / 0.25 / 0.15 —— 前三跳落在 0.25 以上，最后一跳掉到 0.15，
+/// 中间那道空档（0.15 与 0.25 之间）就是自然分界，0.20 取在空档中点，
+/// 两侧各留 5 个百分点余量，日常波动不至于让判定来回翻。
+///
+/// 阈值的业务含义：跌破它意味着该跳约 4/5 的重试预算是在给注定失败的请求陪跑。
+/// 上游 429 多为账号级配额，这些白打的重试还会在账号间连环撞墙、放大限流
+/// （见 `provider.rs` 里 `MAX_TOTAL_RETRIES` 上方的注释），所以代价不只是延迟。
+///
+/// 这里刻意不取更严的 0.30：那会把第 3 跳（实测 0.25，净救回 61 条）也判成塌掉，
+/// 而那一跳还在实打实地救请求。
+const YIELD_COLLAPSE_THRESHOLD: f64 = 0.20;
+
+/// 重试阶梯的最大深度。与 `provider.rs` 的 `MAX_TOTAL_RETRIES` 对齐，
+/// 在此重复一份而非跨模块引用：这里只是聚合侧的防御性上限，
+/// 用来在库里出现异常大的 `total_attempts` 时截断输出，
+/// 不参与任何重试决策，两者不需要保持强耦合。
+const RETRY_LADDER_MAX_DEPTH: u32 = 4;
+
 /// 处置事件分类
 pub mod event_category {
     /// 请求级反馈触发的代理自动禁用
@@ -546,6 +567,85 @@ pub struct OpsProxyRow {
     pub other_failed: u64,
     /// 最终中断/截断的 trace 数（按该 trace 成功跳所用代理归属）
     pub interrupted: u64,
+}
+
+/// 重试阶梯的一级（第 `attempt` 跳）
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryLadderStep {
+    /// 第几跳，从 1 开始计（人读口径）。
+    ///
+    /// 注意与库里的 `trace_attempts.attempt` 差一：后者 0-based（provider 的
+    /// `for attempt in 0..max_retries`）。阶梯对外用 1-based，是为了和
+    /// `traces.total_attempts`（跳数，1 表示只跑了首跳）同口径 —— 这两个数
+    /// 摆在一起看的场合远多于和 attempt 下标对照。
+    pub attempt: u32,
+    /// 到达这一跳的请求数，**累积量**。
+    ///
+    /// 跑了 4 跳的请求同时算作到达过第 1/2/3 跳，即 `total_attempts >= attempt`。
+    /// 绝不能写成 `total_attempts = attempt`：那算的是"停在这一跳"，第 1 跳会
+    /// 只剩下单跳完成的请求（实测 8813 / 9189），把分母缩掉近 4%，
+    /// 于是每一跳的 `marginal_yield` 都被系统性抬高。
+    pub reached: u64,
+    /// 在这一跳成功的请求数，即 `total_attempts = attempt AND final_status = 'success'`。
+    /// 与 `reached` 相反，这里必须是等值条件 —— 它要的就是"恰好停在这一跳且成功"。
+    pub rescued: u64,
+    /// 边际收益 = `rescued / reached`。
+    ///
+    /// 读法：到达这一跳的请求里，有多大比例是靠这一跳救回来的。这是决定
+    /// "还值不值得再重试一次"的唯一指标 —— 累计救回数只会单调增，永远显得划算，
+    /// 看不出第几跳开始白打。`reached = 0` 时为 0.0。
+    pub marginal_yield: f64,
+    /// 进入这一跳前的退避间隔中位数（毫秒）。
+    ///
+    /// `None` = 该跳没有任何一对相邻跳两端 `started_ms` 都非 NULL（见
+    /// [`RetryEffectiveness::backoff_coverage`]）。第 1 跳恒为 `None`：它前面没有跳。
+    pub backoff_p50_ms: Option<u64>,
+}
+
+/// 重试有效性统计（窗口内）。
+///
+/// 存在的理由：`MAX_TOTAL_RETRIES` 一直是拍出来的常数，库里每一跳都留了痕
+/// （`trace_attempts`），但从没聚合回答过"重试到底救回了多少请求、第几跳开始白打"。
+/// 没有这张表就只能在"多重试总比少重试好"的直觉上调参数，而实测边际收益
+/// 在最后一跳掉到 ~0.15 —— 那一跳的绝大多数配额是在给注定失败的请求陪跑，
+/// 且 429 场景下还会在账号间连环撞墙（见 `MAX_TOTAL_RETRIES` 上方的注释）。
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryEffectiveness {
+    pub window_hours: i64,
+    /// 逐跳阶梯，按跳数升序。深度取窗口内实测最大跳数（见 `retry_effectiveness` 注释）
+    pub steps: Vec<RetryLadderStep>,
+    /// 重试净救回数 = 首跳没搞定、但最终成功的请求数（`total_attempts >= 2 AND success`）。
+    /// 这是"有重试"与"没重试"两个世界的差值，也是重试机制的全部收益。
+    pub total_rescued: u64,
+    /// 跑完全部重试仍失败的请求数（到达最深一跳且最终非 success）。
+    ///
+    /// 与 `total_rescued` 配成一对读：前者是收益，后者是"最贵的那批失败"——
+    /// 它们每个都占满了整份重试预算才放弃。
+    pub total_exhausted: u64,
+    /// 边际收益塌掉的跳数：首个 `marginal_yield < YIELD_COLLAPSE_THRESHOLD` 的跳。
+    ///
+    /// 只从第 2 跳起判定 —— 第 1 跳的 yield 就是整体成功率（实测 0.95），
+    /// 它不是"重试的收益"，拿同一把尺子量没有意义。
+    /// `None` = 没有任何一跳塌掉，当前重试预算还没打到收益悬崖。
+    pub yield_collapse_at: Option<u32>,
+    /// 退避间隔的可算比例 = 两端 `started_ms` 都非 NULL 的相邻跳对数 ÷ 相邻跳对总数。
+    ///
+    /// **这个字段是防静默低估的**：`started_ms` 是后加的列，历史行全是 NULL，
+    /// 算不出间隔的跳对会被直接跳过。没有这个数的话，跨越那次 schema 变更的窗口
+    /// 会拿极少数样本的中位数冒充全窗口的退避特征，而且看不出来。
+    /// 实测 7 天窗口该值为 0.00（`started_ms` 只覆盖最近约 1.4 小时，且那段时间
+    /// 没有任何多跳请求），此时 backoff 数字整体不可用。
+    pub backoff_coverage: f64,
+}
+
+/// 退避间隔的中间结果（内部用，不出接口）。
+/// 覆盖率与逐跳中位数必须一起返回：单看中位数无法判断它背后有多少样本。
+struct BackoffSamples {
+    coverage: f64,
+    /// 1-based 跳数 → 进入该跳前的退避间隔中位数（毫秒）
+    p50_by_hop: std::collections::BTreeMap<u32, u64>,
 }
 
 /// Ops SQLite 存储。
@@ -1159,6 +1259,209 @@ impl OpsStore {
         out
     }
 
+    /// 重试有效性阶梯：逐跳回答「到达这一跳的请求有多少、其中多少是靠这一跳救回的」。
+    ///
+    /// **口径全部建立在 `traces.total_attempts`（跳数）上，不数 `trace_attempts` 行数。**
+    /// 两者在正常情况下一致，但前者是 trace 落库时一次性写定的权威跳数，
+    /// 后者可能因 attempt 写入失败而缺行 —— 用它当分母会让阶梯凭空变浅。
+    ///
+    /// 阶梯深度取窗口内实测最大跳数（再压到 [`RETRY_LADDER_MAX_DEPTH`]），
+    /// 而不是固定输出 4 级：预算是按分组账号数动态算的（见 `provider.rs` 的
+    /// `retry_budget`），小分组根本到不了第 4 跳，硬输出 4 级只会多两行
+    /// `reached = 0` 的空行，还会让 `total_exhausted` 的"最深一跳"错位到没人到过的跳上。
+    ///
+    /// backoff 部分单独降级：它依赖后加的 `started_ms` 列，覆盖率由
+    /// [`RetryEffectiveness::backoff_coverage`] 单独报出，不与阶梯的可信度绑在一起。
+    pub fn retry_effectiveness(&self, hours: i64) -> RetryEffectiveness {
+        let cutoff = Self::window_cutoff(hours);
+        let conn = self.conn.lock();
+        let mut out = RetryEffectiveness {
+            window_hours: hours.clamp(1, MAX_WINDOW_HOURS),
+            // 无多跳请求时 backoff 没有任何待算的跳对，覆盖率按"该算的都算了"记 1.0；
+            // 记 0.0 会被误读成"数据丢了"，而这里根本没有数据需要算。
+            backoff_coverage: 1.0,
+            ..Default::default()
+        };
+
+        // (跳数 → 该跳数下的 trace 总数, 其中 success 数)。
+        // MAX(total_attempts, 1)：任何落库的 trace 至少跑过一跳，把异常的 0
+        // 归到第 1 跳，保证「第 1 跳 reached == 窗口内 trace 总数」这条恒等式
+        // 在脏数据下也不破 —— 它是这张表的自检锚点。
+        let mut buckets: std::collections::BTreeMap<u32, (u64, u64)> =
+            std::collections::BTreeMap::new();
+        let mut stmt = match conn.prepare(
+            "SELECT MAX(total_attempts, 1) AS hops, \
+             COUNT(*), COALESCE(SUM(final_status = 'success'), 0) \
+             FROM traces WHERE ts_epoch >= ?1 GROUP BY hops ORDER BY hops",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("ops 重试阶梯查询失败: {}", e);
+                return out;
+            }
+        };
+        match stmt.query_map([cutoff], |row| {
+            Ok((
+                row.get::<_, i64>(0)?.max(1) as u32,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+            ))
+        }) {
+            Ok(rows) => {
+                for (hops, total, success) in rows.flatten() {
+                    let e = buckets.entry(hops).or_insert((0, 0));
+                    e.0 += total;
+                    e.1 += success;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("ops 重试阶梯读取失败: {}", e);
+                return out;
+            }
+        }
+        if buckets.is_empty() {
+            return out;
+        }
+
+        let depth = buckets
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .clamp(1, RETRY_LADDER_MAX_DEPTH);
+
+        // 退避间隔：先算，供逐跳填充。库里 attempt 是 0-based，+1 换成阶梯的 1-based。
+        let backoff = self.collect_backoff(&conn, cutoff);
+        out.backoff_coverage = backoff.coverage;
+
+        for hop in 1..=depth {
+            // 累积到达数：跳数 >= hop 的全部 trace。深度被 RETRY_LADDER_MAX_DEPTH
+            // 截断时，超出的桶仍要计入最深一跳的 reached，否则会漏掉请求。
+            let reached: u64 = buckets
+                .iter()
+                .filter(|(h, _)| **h >= hop)
+                .map(|(_, (total, _))| *total)
+                .sum();
+            let rescued = buckets.get(&hop).map(|(_, s)| *s).unwrap_or(0);
+            out.steps.push(RetryLadderStep {
+                attempt: hop,
+                reached,
+                rescued,
+                marginal_yield: if reached == 0 {
+                    0.0
+                } else {
+                    rescued as f64 / reached as f64
+                },
+                backoff_p50_ms: backoff.p50_by_hop.get(&hop).copied(),
+            });
+        }
+
+        // 净收益：首跳没搞定但最终成功。这才是"有重试 vs 没重试"的差值。
+        out.total_rescued = buckets
+            .iter()
+            .filter(|(h, _)| **h >= 2)
+            .map(|(_, (_, success))| *success)
+            .sum();
+        // 最贵的那批失败：占满整份重试预算仍未成功。
+        out.total_exhausted = buckets
+            .iter()
+            .filter(|(h, _)| **h >= depth)
+            .map(|(_, (total, success))| total.saturating_sub(*success))
+            .sum();
+        // 从第 2 跳起找首个塌点：第 1 跳的 yield 是整体成功率，不是重试的收益。
+        out.yield_collapse_at = out
+            .steps
+            .iter()
+            .find(|s| s.attempt >= 2 && s.reached > 0 && s.marginal_yield < YIELD_COLLAPSE_THRESHOLD)
+            .map(|s| s.attempt);
+        out
+    }
+
+    /// 相邻跳的退避间隔样本 + 覆盖率。
+    ///
+    /// 间隔 = `后一跳.started_ms - (前一跳.started_ms + 前一跳.duration_ms)`，
+    /// 即扣掉前一跳自身耗时后剩下的纯等待。直接减 `started_ms` 之差会把上游
+    /// 耗时（可达几十秒）算进退避，得出的数字与 `retry_delay` 毫无关系。
+    ///
+    /// 只取两端 `started_ms` 都非 NULL 的跳对；分母是相邻跳对总数，
+    /// 二者之比即覆盖率（该列是后加的，历史行为 NULL）。
+    fn collect_backoff(&self, conn: &Connection, cutoff: i64) -> BackoffSamples {
+        let mut out = BackoffSamples {
+            coverage: 1.0,
+            p50_by_hop: std::collections::BTreeMap::new(),
+        };
+        // 覆盖率的分子分母一次查出，保证两者口径（同一 JOIN、同一窗口）严格一致。
+        let counted = conn.query_row(
+            "SELECT COUNT(*), \
+             COALESCE(SUM(a.started_ms IS NOT NULL AND b.started_ms IS NOT NULL), 0) \
+             FROM trace_attempts a \
+             JOIN trace_attempts b ON b.trace_id = a.trace_id AND b.attempt = a.attempt + 1 \
+             JOIN traces t ON t.trace_id = a.trace_id \
+             WHERE t.ts_epoch >= ?1",
+            [cutoff],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        );
+        match counted {
+            Ok((total_pairs, usable_pairs)) => {
+                out.coverage = if total_pairs <= 0 {
+                    1.0
+                } else {
+                    usable_pairs as f64 / total_pairs as f64
+                };
+                if usable_pairs <= 0 {
+                    return out;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("ops 退避覆盖率查询失败: {}", e);
+                // 覆盖率算不出来时不假装 1.0：报 0.0 并让所有 p50 缺席，
+                // 前端据此隐藏 backoff 而不是显示一个来源不明的中位数。
+                out.coverage = 0.0;
+                return out;
+            }
+        }
+
+        let mut samples: std::collections::BTreeMap<u32, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        let mut stmt = match conn.prepare(
+            "SELECT b.attempt, b.started_ms - (a.started_ms + a.duration_ms) AS gap \
+             FROM trace_attempts a \
+             JOIN trace_attempts b ON b.trace_id = a.trace_id AND b.attempt = a.attempt + 1 \
+             JOIN traces t ON t.trace_id = a.trace_id \
+             WHERE t.ts_epoch >= ?1 \
+             AND a.started_ms IS NOT NULL AND b.started_ms IS NOT NULL",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("ops 退避间隔查询失败: {}", e);
+                return out;
+            }
+        };
+        match stmt.query_map([cutoff], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        }) {
+            Ok(rows) => {
+                for (attempt_0based, gap) in rows.flatten() {
+                    // 0-based attempt → 1-based 跳数；间隔归给"进入的那一跳"
+                    let hop = (attempt_0based.max(0) as u32).saturating_add(1);
+                    // 负间隔只可能来自时钟/记账误差，钳到 0 而非丢弃：
+                    // 丢弃会让覆盖率与实际参与计算的样本数不一致。
+                    samples.entry(hop).or_default().push(gap.max(0) as u64);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("ops 退避间隔读取失败: {}", e);
+                return out;
+            }
+        }
+        for (hop, v) in samples {
+            if let Some(d) = percentiles(v) {
+                out.p50_by_hop.insert(hop, d.p50);
+            }
+        }
+        out
+    }
+
     /// 按 (段, 出口) 统计窗口内的失败率。
     /// 出口取该 trace 最后一跳的 proxy_url —— 流生命周期发生在最终成功建连的那一跳上。
     pub fn phase_baseline(&self, hours: i64) -> Vec<PhaseBaselineRow> {
@@ -1443,6 +1746,54 @@ mod tests {
                 "INSERT INTO trace_attempts (trace_id, attempt, credential_id, endpoint, \
                  outcome, duration_ms, proxy_url) VALUES (?1, 0, ?2, ?3, ?4, 100, ?5)",
                 rusqlite::params![trace_id, credential_id as i64, endpoint, outcome, proxy_url],
+            )
+            .unwrap();
+    }
+
+    /// 带 total_attempts 的 trace 插入。重试阶梯的口径完全建立在这一列上，
+    /// 而 [`insert_trace`] 把它硬编码为 1，故单独开一个。
+    fn insert_trace_hops(
+        store: &OpsStore,
+        trace_id: &str,
+        final_status: &str,
+        total_attempts: u32,
+    ) {
+        let epoch = Utc::now().timestamp() - 60;
+        store
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, is_stream, \
+                 final_status, final_credential_id, error_type, total_attempts, duration_ms) \
+                 VALUES (?1, '2026', ?2, 1, 'clientKey', 'm', 1, ?3, 1, NULL, ?4, 100)",
+                rusqlite::params![trace_id, epoch, final_status, total_attempts as i64],
+            )
+            .unwrap();
+    }
+
+    /// 带 attempt 下标与 started_ms 的 attempt 插入（`started_ms = None` 模拟历史行）
+    fn insert_attempt_at(
+        store: &OpsStore,
+        trace_id: &str,
+        attempt: u32,
+        outcome: &str,
+        started_ms: Option<u64>,
+        duration_ms: u64,
+    ) {
+        store
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO trace_attempts (trace_id, attempt, credential_id, endpoint, \
+                 outcome, duration_ms, started_ms, proxy_url) \
+                 VALUES (?1, ?2, 1, 'ide', ?3, ?4, ?5, NULL)",
+                rusqlite::params![
+                    trace_id,
+                    attempt as i64,
+                    outcome,
+                    duration_ms as i64,
+                    started_ms.map(|v| v as i64)
+                ],
             )
             .unwrap();
     }
@@ -1942,6 +2293,199 @@ mod tests {
             .find(|r| r.phase == "streaming" && r.proxy_url == "socks5://b:1080")
             .expect("应有出口 B 的 streaming 行");
         assert_eq!(b.failed, 0);
+    }
+
+    /// 构造一份形状与生产同类的跳数分布：绝大多数请求单跳成功，
+    /// 越深的跳到达越少、边际收益越低，最后一跳塌到阈值以下。
+    ///
+    /// 布局（跳数: 成功 / 失败）
+    /// - 1 跳: 80 / 0
+    /// - 2 跳:  6 / 4
+    /// - 3 跳:  4 / 4
+    /// - 4 跳:  1 / 9
+    fn ladder_fixture() -> OpsStore {
+        let store = mem_store_with_traces();
+        for (hops, ok, bad) in [(1u32, 80, 0), (2, 6, 4), (3, 4, 4), (4, 1, 9)] {
+            for i in 0..ok {
+                insert_trace_hops(&store, &format!("ok-{}-{}", hops, i), "success", hops);
+            }
+            for i in 0..bad {
+                insert_trace_hops(&store, &format!("bad-{}-{}", hops, i), "error", hops);
+            }
+        }
+        store
+    }
+
+    /// 这张表最容易写错的地方：`reached` 必须是累积量。
+    /// 跑了 4 跳的请求也算作到达过第 1/2/3 跳。
+    ///
+    /// 同时钉死自检恒等式：**第 1 跳的 reached == 窗口内 trace 总数**。
+    /// 如果实现误用了 `total_attempts = N` 这种等值条件，第 1 跳只会剩下
+    /// 单跳完成的请求（这里是 80 而不是 108），这条断言立刻炸。
+    #[test]
+    fn retry_ladder_reached_is_cumulative_and_first_hop_covers_all_traces() {
+        let store = ladder_fixture();
+        let r = store.retry_effectiveness(24);
+
+        // 窗口内 trace 总数，独立于被测方法算出来作对照
+        let win_total: u64 = store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM traces WHERE ts_epoch >= ?1",
+                [Utc::now().timestamp() - 24 * 3600],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64;
+        assert_eq!(win_total, 108, "fixture 总数");
+
+        assert_eq!(r.steps.len(), 4, "实测最大跳数为 4，应输出 4 级");
+        assert_eq!(
+            r.steps[0].reached, win_total,
+            "第 1 跳 reached 必须等于窗口内全部 trace 数（每个请求都跑过首跳）"
+        );
+
+        // 累积量：reached 逐跳严格递减，且等于「跳数 >= hop」的和
+        assert_eq!(r.steps[0].reached, 108); // 全部
+        assert_eq!(r.steps[1].reached, 28); // 10+8+10
+        assert_eq!(r.steps[2].reached, 18); // 8+10
+        assert_eq!(r.steps[3].reached, 10); // 10
+        for w in r.steps.windows(2) {
+            assert!(
+                w[0].reached >= w[1].reached,
+                "累积到达数必须单调不增，实际 {} → {}",
+                w[0].reached,
+                w[1].reached
+            );
+        }
+
+        // rescued 是等值条件：恰好停在这一跳且成功
+        assert_eq!(
+            r.steps.iter().map(|s| s.rescued).collect::<Vec<_>>(),
+            vec![80, 6, 4, 1]
+        );
+    }
+
+    /// 边际收益必须用累积分母算，且塌点判定要能把「还在救请求的跳」和
+    /// 「基本在陪跑的跳」分开 —— 这是决定是否下调重试预算的唯一依据。
+    #[test]
+    fn retry_ladder_marginal_yield_and_collapse_point() {
+        let store = ladder_fixture();
+        let r = store.retry_effectiveness(24);
+
+        // 第 2 跳 6/28 ≈ 0.214、第 3 跳 4/18 ≈ 0.222 —— 都在阈值之上
+        assert!(r.steps[1].marginal_yield > YIELD_COLLAPSE_THRESHOLD);
+        assert!(r.steps[2].marginal_yield > YIELD_COLLAPSE_THRESHOLD);
+        // 第 4 跳 1/10 = 0.10 —— 塌了
+        assert!((r.steps[3].marginal_yield - 0.10).abs() < 1e-9);
+        assert_eq!(
+            r.yield_collapse_at,
+            Some(4),
+            "塌点应指向第 4 跳，而不是仍在救请求的第 3 跳"
+        );
+
+        // 净收益 = 首跳没搞定但最终成功 = 6+4+1
+        assert_eq!(r.total_rescued, 11);
+        // 最贵的失败 = 到达最深一跳仍未成功 = 10-1
+        assert_eq!(r.total_exhausted, 9);
+
+        // 若用等值分母（rescued/停在该跳的数）算，第 2 跳会是 6/10 = 0.6，
+        // 三倍高于真实的 0.214 —— 这个对比就是累积口径存在的理由
+        assert!(
+            r.steps[1].marginal_yield < 0.3,
+            "累积分母下第 2 跳应约 0.214，实际 {:.3}",
+            r.steps[1].marginal_yield
+        );
+    }
+
+    /// 全是单跳请求时，阶梯只有 1 级，且不该报出任何塌点
+    /// （第 1 跳的 yield 是整体成功率，不是重试的收益）。
+    #[test]
+    fn retry_ladder_single_hop_window_has_no_collapse() {
+        let store = mem_store_with_traces();
+        for i in 0..5 {
+            insert_trace_hops(&store, &format!("s{}", i), "success", 1);
+        }
+        let r = store.retry_effectiveness(24);
+        assert_eq!(r.steps.len(), 1);
+        assert_eq!(r.steps[0].reached, 5);
+        assert_eq!(r.total_rescued, 0, "没有重试就没有救回");
+        assert_eq!(r.yield_collapse_at, None, "第 1 跳不参与塌点判定");
+        assert!(
+            (r.backoff_coverage - 1.0).abs() < 1e-9,
+            "没有相邻跳对时覆盖率记 1.0（该算的都算了），不是 0.0"
+        );
+    }
+
+    /// `started_ms` 是后加的列，历史行为 NULL。跨越那次 schema 变更的窗口里，
+    /// 算不出间隔的跳对被跳过，backoff 数字会**静默**基于极少数样本。
+    /// coverage 就是防这个的：它必须随 NULL 行的出现而下降。
+    #[test]
+    fn backoff_coverage_drops_when_started_ms_is_null() {
+        let store = mem_store_with_traces();
+        // 新行：两跳的 started_ms 都有 → 可算间隔
+        insert_trace_hops(&store, "new", "success", 2);
+        insert_attempt_at(&store, "new", 0, "transient", Some(1_000), 800);
+        insert_attempt_at(&store, "new", 1, "success", Some(5_000), 300);
+        // 历史行：started_ms 全 NULL → 算不出
+        insert_trace_hops(&store, "old", "success", 2);
+        insert_attempt_at(&store, "old", 0, "transient", None, 800);
+        insert_attempt_at(&store, "old", 1, "success", None, 300);
+
+        let r = store.retry_effectiveness(24);
+        // 2 对相邻跳，只有 1 对两端非 NULL
+        assert!(
+            (r.backoff_coverage - 0.5).abs() < 1e-9,
+            "覆盖率应为 1/2，实际 {:.3}",
+            r.backoff_coverage
+        );
+        // 间隔 = 5000 - (1000 + 800) = 3200，扣掉了前一跳自身耗时
+        assert_eq!(
+            r.steps[1].backoff_p50_ms,
+            Some(3_200),
+            "退避须扣除前一跳耗时，否则把上游耗时算成退避"
+        );
+        assert_eq!(r.steps[0].backoff_p50_ms, None, "第 1 跳前面没有跳");
+
+        // 全部为 NULL 时覆盖率归零，且不残留任何中位数
+        let empty = mem_store_with_traces();
+        insert_trace_hops(&empty, "o1", "success", 2);
+        insert_attempt_at(&empty, "o1", 0, "transient", None, 800);
+        insert_attempt_at(&empty, "o1", 1, "success", None, 300);
+        let r2 = empty.retry_effectiveness(24);
+        assert!(
+            r2.backoff_coverage.abs() < 1e-9,
+            "全 NULL 时覆盖率应为 0，实际 {:.3}",
+            r2.backoff_coverage
+        );
+        assert!(
+            r2.steps.iter().all(|s| s.backoff_p50_ms.is_none()),
+            "覆盖率为 0 时不得给出任何退避中位数"
+        );
+    }
+
+    /// 窗口外的 trace 不能进阶梯，否则「第 1 跳 == 窗口内总数」的恒等式会破。
+    #[test]
+    fn retry_ladder_respects_window() {
+        let store = mem_store_with_traces();
+        insert_trace_hops(&store, "in", "success", 1);
+        // 窗口外（48 小时前）
+        let epoch = Utc::now().timestamp() - 3600 * 48;
+        store
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, is_stream, \
+                 final_status, final_credential_id, error_type, total_attempts, duration_ms) \
+                 VALUES ('out', '2026', ?1, 1, 'clientKey', 'm', 1, 'error', 1, NULL, 4, 100)",
+                [epoch],
+            )
+            .unwrap();
+
+        let r = store.retry_effectiveness(24);
+        assert_eq!(r.steps.len(), 1, "窗口外的 4 跳 trace 不应把阶梯撑到 4 级");
+        assert_eq!(r.steps[0].reached, 1);
+        assert_eq!(r.total_exhausted, 0);
     }
 
     #[test]
