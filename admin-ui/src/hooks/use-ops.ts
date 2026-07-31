@@ -1,12 +1,14 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import {
   getOpsCredentials,
+  getOpsErrorCrosstab,
   getOpsEvents,
   getOpsOverview,
   getOpsProxies,
   getOpsTrend,
   getPhaseBaseline,
 } from '@/api/ops'
+import type { CrosstabDimension } from '@/types/api'
 
 /** 与 use-stats 同样的刷新策略：30s 轮询、切窗口保留旧数据 */
 const COMMON = {
@@ -20,6 +22,14 @@ export function useOpsOverview(hours: number) {
   return useQuery({
     queryKey: ['ops', 'overview', hours],
     queryFn: () => getOpsOverview(hours),
+    ...COMMON,
+  })
+}
+
+export function useOpsErrorCrosstab(hours: number, dim: CrosstabDimension) {
+  return useQuery({
+    queryKey: ['ops', 'error-crosstab', hours, dim],
+    queryFn: () => getOpsErrorCrosstab(hours, dim),
     ...COMMON,
   })
 }

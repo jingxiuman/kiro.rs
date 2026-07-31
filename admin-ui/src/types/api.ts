@@ -642,6 +642,42 @@ export interface DurationPercentiles {
   n: number
 }
 
+/** 交叉表维度 */
+export type CrosstabDimension = 'credential' | 'proxy' | 'model'
+
+/** 交叉表里的一个维度桶 */
+export interface CrosstabBucket {
+  /** credential 为 id 字符串；proxy 为 URL（'direct' = 直连，空串 = 未知）；model 为模型名 */
+  key: string
+  /** 仅 credential 维度有 */
+  email?: string | null
+  count: number
+  /** 该桶窗口内的全部请求数（成功+失败），即流量基线 */
+  traffic: number
+  /**
+   * 超额倍数 =（本桶错误份额）÷（本桶流量份额）。
+   *
+   * ≈1 表示错误份额与流量份额相称（不是问题，只是承载得多）；
+   * 明显 >1 才是「这个对象错得不成比例」。null = 该桶无流量，算不出。
+   */
+  lift?: number | null
+}
+
+/** 一个 error_type 在某维度上的分布 */
+export interface CrosstabRow {
+  errorType: string
+  total: number
+  buckets: CrosstabBucket[]
+  /** 最大桶占比。单看会被流量分布带偏，必须与桶上的 lift 一起读 */
+  concentration: number
+  distinctKeys: number
+}
+
+export interface OpsErrorCrosstab {
+  dimension: CrosstabDimension
+  rows: CrosstabRow[]
+}
+
 /** 按小时趋势点 */
 export interface OpsTrendPoint {
   bucketEpoch: number
