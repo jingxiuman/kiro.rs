@@ -318,7 +318,12 @@ impl RequestTracer {
 }
 
 impl TraceSink for RequestTracer {
-    fn on_attempt(&self, attempt: TraceAttempt) {
+    fn on_attempt(&self, mut attempt: TraceAttempt) {
+        // provider 只知道本跳耗时（它不持有请求起点），起点偏移在这里回推：
+        // 本跳结束时刻 = 现在（provider 上报即结束），减去本跳耗时即起点。
+        // 用 saturating_sub 兜住毫秒截断导致的 duration > elapsed 边界。
+        let elapsed = self.started_at.elapsed().as_millis() as u64;
+        attempt.started_ms = Some(elapsed.saturating_sub(attempt.duration_ms));
         self.attempts.lock().push(attempt);
     }
 }
@@ -385,12 +390,12 @@ impl StreamPhaseGuard {
         self.last_chunk_at.elapsed().as_millis() as u64
     }
 
-    /// 整条流中最长的 chunk 间隔（含末尾未闭合的那段）。
+    /// 收到响应头后，响应体各 chunk 之间的最长间隔（含首个 chunk 前与末尾未闭合段）。
     ///
-    /// 存在的理由：`idle_ms` 只在失败时被记录，于是「合法静默能有多长」这个分布
-    /// 完全不可见——只能看到被杀掉的那些，是删失数据。而 `STREAM_IDLE_TIMEOUT_SECS`
-    /// 的取值恰恰依赖这个上限（定得比它低就会亲手掐死正常请求）。成功流也记下来，
-    /// 才能用证据校准该常量，而不是猜。
+    /// guard 在 `reqwest::Response` 返回后才创建，因此不覆盖请求发出到响应头返回的
+    /// 等待；`read_timeout` 则从请求发出起生效。成功流记录该值可补充空闲阈值的观测
+    /// 依据，但本地超时会截断超过阈值的样本，成功样本集存在选择偏差，不能据此证明
+    /// 健康流与超时流互不重叠。
     pub fn max_idle_ms(&self) -> u64 {
         self.max_idle_ms.max(self.idle_ms())
     }
@@ -404,8 +409,7 @@ impl StreamPhaseGuard {
             self.current_phase,
             crate::admin::trace_db::outcome::SUCCESS,
             Some(sent_bytes),
-            // 成功流也写 max_idle_ms：这是校准 STREAM_IDLE_TIMEOUT_SECS 的唯一
-            // 非删失样本，见 max_idle_ms() 的说明
+            // 成功流也写响应体阶段的 max_idle_ms，供后续结合超时样本校准阈值。
             Some(format!("max_idle_ms={}", max_idle_ms)),
         );
     }
@@ -1307,6 +1311,83 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
 }
 
 /// 处理非流式请求
+/// 非流式 body 读取失败
+#[derive(Debug)]
+struct NonStreamBodyError {
+    /// 已归因的错误描述（同 `describe_reqwest_error`）
+    detail: String,
+    /// 断开前已从上游收到的字节数——区分「一个字节都没来」与「收了一半断了」
+    sent_bytes: u64,
+}
+
+/// 逐 chunk 收完非流式响应体，顺路量出首字节延迟并分段。
+///
+/// 为什么不用 `response.bytes()`：整段生成都塌在那一个 await 里，拆不开——
+/// 非流式请求慢，到底是等上游想（首字节前）还是传得慢（首字节后），日志里分不出。
+/// 逐 chunk 读之后 `first_token` 与 `body_read` 才成为两段。
+///
+/// **超时语义不变**：两条聊天路径共用 provider 的流式 client，同时受可配置的
+/// `read_timeout` 空闲超时与绝对总超时约束；逐 chunk 读与一把梭读受相同约束。
+///
+/// 累积完再一次性 `feed` 给 decoder，与原先按整块喂完全一致——响应内容零变化。
+async fn read_non_stream_body(
+    response: reqwest::Response,
+    tracer: &RequestTracer,
+) -> Result<Vec<u8>, NonStreamBodyError> {
+    tracer.open_phase(phase::FIRST_TOKEN);
+    let mut stream = response.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut first_seen = false;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                if !first_seen {
+                    first_seen = true;
+                    tracer.mark_first_token();
+                    tracer.close_phase(phase::FIRST_TOKEN, outcome::SUCCESS, None, None);
+                    tracer.open_phase(phase::BODY_READ);
+                }
+                buf.extend_from_slice(&bytes);
+            }
+            Err(e) => {
+                let detail = describe_reqwest_error(&e);
+                let sent = buf.len() as u64;
+                // 关在首字节前还是首字节后，决定了这次失败该归因给「上游没响应」
+                // 还是「传输中断」——两段各自的 outcome 都要落库。
+                let open = if first_seen {
+                    phase::BODY_READ
+                } else {
+                    phase::FIRST_TOKEN
+                };
+                tracer.close_phase(
+                    open,
+                    outcome::STREAM_INTERRUPTED,
+                    Some(sent),
+                    Some(detail.clone()),
+                );
+                return Err(NonStreamBodyError {
+                    detail,
+                    sent_bytes: sent,
+                });
+            }
+        }
+    }
+    let total = buf.len() as u64;
+    if first_seen {
+        tracer.close_phase(phase::BODY_READ, outcome::SUCCESS, Some(total), None);
+    } else {
+        // 上游返回 2xx 但 body 为空：first_token 段永远等不到 chunk，
+        // 在此显式关段，否则它会一直挂着、最终被 finalize 丢弃（埋点漏关）。
+        tracer.close_phase(
+            phase::FIRST_TOKEN,
+            outcome::UPSTREAM_TRUNCATED,
+            Some(0),
+            Some("上游响应体为空".to_string()),
+        );
+    }
+    Ok(buf)
+}
+
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -1341,10 +1422,9 @@ async fn handle_non_stream_request(
         StreamOpsFeedback::from_call(&provider, credential_id, call_result.proxy_url.clone());
 
     // 读取响应体
-    let body_bytes = match response.bytes().await {
+    let body_bytes = match read_non_stream_body(response, tracer.as_ref()).await {
         Ok(bytes) => bytes,
-        Err(e) => {
-            let detail = describe_reqwest_error(&e);
+        Err(NonStreamBodyError { detail, sent_bytes }) => {
             tracing::error!("读取响应体失败: {}", detail);
             hook.record(credential_id, input_tokens, 0, (0, 0), 0.0, "error");
             // 连接已建立后 body 读取失败 = 传输链路失败，计入所用代理
@@ -1353,14 +1433,17 @@ async fn handle_non_stream_request(
                 "interrupted",
                 Some(outcome::STREAM_INTERRUPTED),
                 Some(&detail),
-                None,
+                // 非流式没向客户端发过字节，这里记的是「从上游收到多少就断了」，
+                // 与流式的「已下发多少」语义不同；沿用同一字段是为了让 UI
+                // 统一显示「中断前 N 字节」，判断是空响应还是半截。
+                Some(sent_bytes),
                 TraceUsage::zero(),
             );
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
-                    format!("读取响应失败: {}", e),
+                    format!("读取响应失败: {}", detail),
                 )),
             )
                 .into_response();
@@ -1368,6 +1451,7 @@ async fn handle_non_stream_request(
     };
 
     // 解析事件流
+    tracer.open_phase(phase::DECODE);
     let mut decoder = EventStreamDecoder::new();
     if let Err(e) = decoder.feed(&body_bytes) {
         tracing::warn!("缓冲区溢出: {}", e);
@@ -1485,6 +1569,26 @@ async fn handle_non_stream_request(
         tool_json_error = Some(e);
     }
 
+    // decode 段到此结束（tool json 判定属于解码结果的一部分）
+    match &tool_json_error {
+        None => tracer.close_phase(
+            phase::DECODE,
+            outcome::SUCCESS,
+            Some(body_bytes.len() as u64),
+            None,
+        ),
+        Some(err) => tracer.close_phase(
+            phase::DECODE,
+            if err.is_incomplete() {
+                outcome::UPSTREAM_TRUNCATED
+            } else {
+                outcome::UPSTREAM_INVALID
+            },
+            Some(body_bytes.len() as u64),
+            Some(err.message()),
+        ),
+    }
+
     // 工具调用 JSON 半截 / 非法：非流式路径尚未发送任何字节，直接回 502，
     // 明确暴露上游问题，而不是把无法解析的参数当成完整调用返回。
     // 区分上游截断（传输，计代理失败 + upstream_truncated）与非法 JSON（内容，不罚代理 + upstream_invalid）。
@@ -1510,6 +1614,8 @@ async fn handle_non_stream_request(
         )
             .into_response();
     }
+
+    tracer.open_phase(phase::ASSEMBLE);
 
     // 确定 stop_reason
     if has_tool_use && stop_reason == "end_turn" {
@@ -1562,6 +1668,8 @@ async fn handle_non_stream_request(
         "stop_sequence": null,
         "usage": usage_json
     });
+
+    tracer.close_phase(phase::ASSEMBLE, outcome::SUCCESS, None, None);
 
     hook.record(
         credential_id,
@@ -2844,6 +2952,86 @@ mod tracer_tests {
         }
     }
 
+    /// 用给定 chunk 序列拼一个真 `reqwest::Response`（走 http::Response 转换，
+    /// 不起网络），用来驱动 `read_non_stream_body` 的分段逻辑。
+    fn fake_response(chunks: Vec<&'static [u8]>) -> reqwest::Response {
+        let stream = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<_, std::io::Error>(Bytes::from_static(c))),
+        );
+        let body = reqwest::Body::wrap_stream(stream);
+        reqwest::Response::from(http::Response::new(body))
+    }
+
+    /// 非流式必须给出 first_token / body_read 两段，而不是一个黑盒总时长。
+    /// 这是本次埋点的目的：区分「等上游想」与「收得慢」。
+    #[tokio::test]
+    async fn non_stream_body_read_splits_first_token_from_body() {
+        let t = detached_tracer();
+        let body = read_non_stream_body(fake_response(vec![b"abc", b"defg"]), &t)
+            .await
+            .expect("读取应成功");
+        assert_eq!(body, b"abcdefg", "分片累积后必须与原始字节完全一致");
+
+        let phases = t.phases.lock();
+        assert_eq!(
+            phases.iter().map(|p| p.phase.as_str()).collect::<Vec<_>>(),
+            vec![phase::FIRST_TOKEN, phase::BODY_READ],
+        );
+        assert!(phases.iter().all(|p| p.outcome == outcome::SUCCESS));
+        assert_eq!(phases[1].bytes, Some(7), "body_read 记的是累计字节");
+        assert!(t.first_token_at.lock().is_some(), "非流式也要标记首字节");
+    }
+
+    /// 上游 2xx 但 body 为空：first_token 段永远等不到 chunk。必须显式关段，
+    /// 否则它一直挂在 open_phase 里、被 finalize 静默丢弃——这条链路在
+    /// 日志里就完全没有分段，等于回到改动前。
+    #[tokio::test]
+    async fn empty_upstream_body_still_closes_first_token_phase() {
+        let t = detached_tracer();
+        let body = read_non_stream_body(fake_response(vec![]), &t)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+
+        let phases = t.phases.lock();
+        assert_eq!(phases.len(), 1, "空 body 只有 first_token 一段");
+        assert_eq!(phases[0].phase, phase::FIRST_TOKEN);
+        assert_eq!(
+            phases[0].outcome,
+            outcome::UPSTREAM_TRUNCATED,
+            "空响应体是上游问题，不能记成 success"
+        );
+        assert!(
+            t.first_token_at.lock().is_none(),
+            "一个 chunk 都没来，first_token_ms 必须保持 None 而非 0"
+        );
+    }
+
+    /// attempt 的 started_ms 由 sink 侧回推——provider 填的是 None。
+    /// 没有它，色块条无法把重试 backoff 与真实跳耗时区分开。
+    #[test]
+    fn on_attempt_backfills_started_ms_from_duration() {
+        let t = detached_tracer();
+        t.on_attempt(TraceAttempt {
+            attempt: 0,
+            credential_id: 1,
+            endpoint: "ide".to_string(),
+            http_status: Some(200),
+            outcome: outcome::SUCCESS.to_string(),
+            error_snippet: None,
+            duration_ms: 5,
+            started_ms: None,
+            proxy_url: None,
+        });
+        let got = t.attempts.lock();
+        assert!(
+            got[0].started_ms.is_some(),
+            "provider 传 None，sink 必须补上偏移"
+        );
+    }
+
     #[test]
     fn phases_accumulate_in_order_with_seq() {
         let t = detached_tracer();
@@ -2870,11 +3058,10 @@ mod tracer_tests {
         assert_eq!(got[2].bytes, Some(20211));
     }
 
-    /// max_idle_ms 必须是整条流的**最大** chunk 间隔，不是最后一段。
+    /// max_idle_ms 必须是响应体阶段的**最大** chunk 间隔，不是最后一段。
     ///
     /// 这个区别就是它存在的意义：卡死通常发生在流中段（长思考），末尾往往是连续
-    /// 输出，只记末值会把最长静默完全漏掉——而校准 STREAM_IDLE_TIMEOUT_SECS 要的
-    /// 恰是那个最长值。
+    /// 输出，只记末值会把最长静默完全漏掉；该峰值是校准空闲超时的观测之一。
     #[test]
     fn max_idle_ms_tracks_the_largest_gap_not_the_last() {
         let t = std::sync::Arc::new(detached_tracer());
