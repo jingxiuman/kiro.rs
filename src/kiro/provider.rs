@@ -181,6 +181,11 @@ impl KiroProvider {
         self.ops.clone()
     }
 
+    /// 暴露 token_manager,供 handlers 查询组支持集等只读信息。
+    pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
+        &self.token_manager
+    }
+
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());

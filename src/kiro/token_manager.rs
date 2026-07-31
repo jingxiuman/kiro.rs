@@ -1099,6 +1099,34 @@ pub fn credential_supports_model(
     }
 }
 
+/// 组内凭据可用上游模型 id 的并集。
+///
+/// 返回 `None` 表示"不设限",两种情形:
+/// - 组内存在无 `credential_support` 记录的未禁用凭据(未知=放行,
+///   与 `credential_supports_model` 的保守语义一致);
+/// - 组内没有任何未禁用凭据(交由既有"无可用凭据"错误路径,不在本层报错)。
+///
+/// `creds` 元组:(凭据 id, groups, disabled)。禁用凭据不计入。
+pub fn group_supported_models_from(
+    creds: &[(u64, Vec<String>, bool)],
+    group: Option<&str>,
+    support: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<std::collections::HashSet<String>> {
+    let mut union = std::collections::HashSet::new();
+    let mut any = false;
+    for (id, groups, disabled) in creds {
+        if *disabled || !group_matches(groups, group) {
+            continue;
+        }
+        any = true;
+        match support.get(&id.to_string()) {
+            Some(models) => union.extend(models.iter().cloned()),
+            None => return None,
+        }
+    }
+    if any { Some(union) } else { None }
+}
+
 fn credential_matches_request(
     credentials: &KiroCredentials,
     credential_id: u64,
@@ -1315,6 +1343,21 @@ impl MultiTokenManager {
     /// 避免只凭"调用过 set_ 了"就宣称接线完成。
     pub fn credential_support(&self) -> std::collections::HashMap<String, Vec<String>> {
         self.credential_support.read().clone()
+    }
+
+    /// 见 [`group_supported_models_from`]。entries 快照 + credential_support 缓存。
+    pub fn group_supported_models(
+        &self,
+        group: Option<&str>,
+    ) -> Option<std::collections::HashSet<String>> {
+        let creds: Vec<(u64, Vec<String>, bool)> = self
+            .entries
+            .lock()
+            .iter()
+            .map(|e| (e.id, e.credentials.groups.clone(), e.disabled))
+            .collect();
+        let support = self.credential_support.read();
+        group_supported_models_from(&creds, group, &support)
     }
 
     pub fn available_count(&self) -> usize {
@@ -5001,5 +5044,59 @@ mod tests {
 
         // 不存在的 id 必须是明确错误，而不是悄悄换一张
         assert!(manager.acquire_context_pinned(999).await.is_err());
+    }
+
+    #[test]
+    fn group_supported_models_union_of_group_credentials() {
+        use std::collections::HashMap;
+        let support: HashMap<String, Vec<String>> = HashMap::from([
+            ("1".into(), vec!["auto".into(), "claude-opus-5".into(), "claude-opus-4.8".into()]),
+            ("2".into(), vec!["auto".into(), "claude-opus-5".into()]),
+        ]);
+        let creds = vec![
+            (1u64, vec!["own".to_string()], false),
+            (2u64, vec!["own".to_string()], false),
+            (3u64, vec!["other".to_string()], false),
+        ];
+        // 组内并集:1 号有 opus-4.8,2 号没有 → 并集含 opus-4.8
+        let set = group_supported_models_from(&creds, Some("own"), &support)
+            .expect("全部有记录,应返回 Some");
+        assert!(set.contains("claude-opus-4.8"));
+        assert!(set.contains("claude-opus-5"));
+    }
+
+    #[test]
+    fn group_supported_models_unknown_credential_means_unrestricted() {
+        use std::collections::HashMap;
+        // 凭据 2 无记录 → 整组不设限(None)
+        let support: HashMap<String, Vec<String>> =
+            HashMap::from([("1".into(), vec!["claude-opus-5".into()])]);
+        let creds = vec![
+            (1u64, vec!["own".to_string()], false),
+            (2u64, vec!["own".to_string()], false),
+        ];
+        assert!(group_supported_models_from(&creds, Some("own"), &support).is_none());
+    }
+
+    #[test]
+    fn group_supported_models_skips_disabled_and_empty_group_is_none() {
+        use std::collections::HashMap;
+        let support: HashMap<String, Vec<String>> = HashMap::from([
+            ("1".into(), vec!["claude-opus-5".into()]),
+            ("2".into(), vec!["glm-5".into()]),
+        ]);
+        // 2 号禁用:不计入并集,也不因它触发"无记录放行"以外的语义
+        let creds = vec![
+            (1u64, vec!["own".to_string()], false),
+            (2u64, vec!["own".to_string()], true),
+        ];
+        let set = group_supported_models_from(&creds, Some("own"), &support).unwrap();
+        assert!(set.contains("claude-opus-5"));
+        assert!(!set.contains("glm-5"));
+        // 组内无凭据 → None(不设限,由既有"无可用凭据"路径兜底报错)
+        assert!(group_supported_models_from(&creds, Some("ghost"), &support).is_none());
+        // group=None → 按全部未禁用凭据计算
+        let all = group_supported_models_from(&creds, None, &support).unwrap();
+        assert!(all.contains("claude-opus-5"));
     }
 }
