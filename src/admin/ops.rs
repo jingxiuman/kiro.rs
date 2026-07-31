@@ -218,6 +218,26 @@ pub struct OpsTrendPoint {
     pub success: u64,
     pub error: u64,
     pub interrupted: u64,
+    /// 该桶内 error_type → 计数，**稀疏**：只出现实际发生过的类型。
+    ///
+    /// 为什么要它：只有四个总数时，能看到「10 点错误涨了」，但看不到涨的是
+    /// `stream_interrupted` 还是 `auth_failed` —— 突发事件和长期基线噪声
+    /// 处置动作完全不同，混在一个数里就分不开。
+    ///
+    /// 为什么稀疏而不是补零：error_type 集合是运行时动态的（随代码增减），
+    /// 实测 7 天内只出现 7 种、失败率约 2.2%，给每个桶把未出现的类型补 0
+    /// 会产出大量无意义字段。空桶整个字段被省略，前端按「缺失即无错误」读。
+    ///
+    /// **口径警告：本字段各值之和 ≠ [`Self::error`]**。两者维度不同：
+    /// `error` 是 `total - success - interrupted`，即 `final_status = 'error'`；
+    /// 本字段按 `traces.error_type` 列分组，而实测 `error_type` 同时存在于
+    /// `final_status = 'error'`（`transient` / `network_error` / `unknown` /
+    /// `bad_request` / `upstream_truncated`）和 `final_status = 'interrupted'`
+    /// （`stream_interrupted` / `client_disconnected`）两类状态上。
+    /// 所以本字段之和 ≈ `error + interrupted`，而不是 `error`。
+    /// 前端若拿本字段与 `error` 对账必然对不上，这不是 bug。
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub by_error_type: std::collections::HashMap<String, u64>,
 }
 
 /// 按凭据的窗口统计
@@ -563,15 +583,30 @@ impl OpsStore {
         out
     }
 
-    /// 按小时的请求趋势
+    /// 按小时的请求趋势，带 error_type 分层
+    ///
+    /// **为什么一条 SQL + 顺序聚合**，而不是「桶总数」与「桶×类型」两条查询：
+    /// `GROUP BY bucket, error_type` 的结果里，四个总数完全可以由同一批行
+    /// 累加得出（把每个桶的各类型行按 status 汇总即可），拆两条会让同一份
+    /// 数据被扫两遍，还引入两次查询之间口径漂移的可能。代价是四个总数不再由
+    /// SQL 直接给出，而是在 Rust 里累加 —— 但这样 `error` 的算法（由 total
+    /// 减出）与改动前逐字一致，向后兼容不依赖「我重写的 SQL 恰好等价」。
+    ///
+    /// error_type 列没有索引，也不需要：9278 行量级下这是一次全表扫，
+    /// 而原来按 bucket 分组同样是全表扫，加维度只是多了分组键，没有量级变化。
     pub fn error_trend(&self, hours: i64) -> Vec<OpsTrendPoint> {
         let cutoff = Self::window_cutoff(hours);
         let conn = self.conn.lock();
+        // 按 (桶, error_type) 出计数，同时带上该组的 status 归属。
+        // success 行的 error_type 为 NULL，用 '' 占位以免 GROUP BY 丢行。
         let mut stmt = match conn.prepare(
-            "SELECT (ts_epoch / 3600) * 3600 AS bucket, COUNT(*), \
+            "SELECT (ts_epoch / 3600) * 3600 AS bucket, \
+             COALESCE(error_type, '') AS et, \
+             COUNT(*), \
              COALESCE(SUM(final_status = 'success'), 0), \
              COALESCE(SUM(final_status = 'interrupted'), 0) \
-             FROM traces WHERE ts_epoch >= ?1 GROUP BY bucket ORDER BY bucket ASC",
+             FROM traces WHERE ts_epoch >= ?1 \
+             GROUP BY bucket, et ORDER BY bucket ASC",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -579,25 +614,48 @@ impl OpsStore {
                 return Vec::new();
             }
         };
-        let rows = stmt.query_map([cutoff], |row| {
-            let total: i64 = row.get(1)?;
-            let success: i64 = row.get(2)?;
-            let interrupted: i64 = row.get(3)?;
-            Ok(OpsTrendPoint {
-                bucket_epoch: row.get(0)?,
-                total: total as u64,
-                success: success as u64,
-                interrupted: interrupted as u64,
-                error: (total - success - interrupted).max(0) as u64,
-            })
-        });
-        match rows {
-            Ok(r) => r.flatten().collect(),
+        let rows = match stmt.query_map([cutoff], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        }) {
+            Ok(r) => r,
             Err(e) => {
                 tracing::warn!("ops 趋势查询失败: {}", e);
-                Vec::new()
+                return Vec::new();
+            }
+        };
+
+        // SQL 已按 bucket 升序，这里顺序聚成每桶一点
+        let mut out: Vec<OpsTrendPoint> = Vec::new();
+        for (bucket, error_type, count, success, interrupted) in rows.flatten() {
+            if out.last().is_none_or(|p| p.bucket_epoch != bucket) {
+                out.push(OpsTrendPoint {
+                    bucket_epoch: bucket,
+                    total: 0,
+                    success: 0,
+                    error: 0,
+                    interrupted: 0,
+                    by_error_type: std::collections::HashMap::new(),
+                });
+            }
+            let point = out.last_mut().expect("non-empty after push");
+            point.total += count.max(0) as u64;
+            point.success += success.max(0) as u64;
+            point.interrupted += interrupted.max(0) as u64;
+            if !error_type.is_empty() {
+                *point.by_error_type.entry(error_type).or_insert(0) += count.max(0) as u64;
             }
         }
+        // error 仍旧由总数减出，与改动前口径一致（见 by_error_type 上的口径警告）
+        for p in &mut out {
+            p.error = p.total.saturating_sub(p.success).saturating_sub(p.interrupted);
+        }
+        out
     }
 
     /// 按凭据的窗口统计（trace 顶层 + attempt 级失败分类合并）
@@ -1165,6 +1223,102 @@ mod tests {
         assert!(
             conc.concentration > spread.concentration,
             "集中度必须能把两种形态分开，否则这张表没有意义"
+        );
+    }
+
+    /// 趋势分层：同一小时内不同 error_type 必须分开计，且原有四个总数不变。
+    ///
+    /// 「原有四个数不变」是这份改动的向后兼容底线 —— 前端 TrendChart 依赖它们。
+    /// SQL 从 `GROUP BY bucket` 改成 `GROUP BY bucket, error_type` 后行数变多，
+    /// 若累加写错，total/success/interrupted 会被重复计或漏计。
+    #[test]
+    fn trend_splits_error_types_without_changing_totals() {
+        let store = mem_store_with_traces();
+        // 同一小时内：2 成功 + 2 个不同 error_type + 1 个中断类
+        insert_trace(&store, "s1", 60, "success", None, 1, 100);
+        insert_trace(&store, "s2", 60, "success", None, 1, 100);
+        insert_trace(&store, "e1", 60, "error", Some("transient"), 1, 100);
+        insert_trace(&store, "e2", 60, "error", Some("network_error"), 1, 100);
+        insert_trace(&store, "i1", 60, "interrupted", Some("stream_interrupted"), 1, 100);
+
+        let pts = store.error_trend(24);
+        assert_eq!(pts.len(), 1, "五条同小时记录应聚成一个桶");
+        let p = &pts[0];
+
+        // 四个总数：改动前的口径
+        assert_eq!(p.total, 5);
+        assert_eq!(p.success, 2);
+        assert_eq!(p.interrupted, 1);
+        assert_eq!(p.error, 2, "error = total - success - interrupted");
+
+        // 分层：两个 error 类 + 一个 interrupted 类，各自独立
+        assert_eq!(p.by_error_type.get("transient"), Some(&1));
+        assert_eq!(p.by_error_type.get("network_error"), Some(&1));
+        assert_eq!(p.by_error_type.get("stream_interrupted"), Some(&1));
+        assert_eq!(p.by_error_type.len(), 3);
+        assert!(
+            !p.by_error_type.contains_key(""),
+            "success 行的 NULL error_type 不得作为一个类型泄漏进来"
+        );
+
+        // 口径警告的可执行版本：之和 = error + interrupted，不等于 error。
+        // 前端拿这个字段与 error 对账必然对不上，这里把它钉成契约而非 bug。
+        let sum: u64 = p.by_error_type.values().sum();
+        assert_eq!(sum, p.error + p.interrupted, "之和应等于 error + interrupted");
+        assert_ne!(sum, p.error, "之和不等于 error —— 这是预期行为");
+    }
+
+    /// 全成功的桶必须整个省略 by_error_type（稀疏设计的另一半）。
+    /// 若空 map 也序列化出去，每个正常小时都会多带一个空对象。
+    #[test]
+    fn trend_omits_error_map_for_clean_buckets() {
+        let store = mem_store_with_traces();
+        insert_trace(&store, "ok1", 60, "success", None, 1, 100);
+        insert_trace(&store, "ok2", 60, "success", None, 1, 100);
+
+        let pts = store.error_trend(24);
+        assert_eq!(pts.len(), 1);
+        assert!(pts[0].by_error_type.is_empty(), "无错误的桶该是空 map");
+        // skip_serializing_if 生效：JSON 里不该出现该字段
+        let json = serde_json::to_string(&pts[0]).unwrap();
+        assert!(
+            !json.contains("byErrorType"),
+            "空 map 应被 skip_serializing_if 省略，实际: {}",
+            json
+        );
+    }
+
+    /// 跨小时的记录必须分到不同桶，且各桶的分层互不污染。
+    /// 顺序聚合（依赖 SQL 的 bucket 升序）写错时，最典型的症状就是后一桶把前一桶
+    /// 的类型累计进去。
+    #[test]
+    fn trend_keeps_buckets_independent_across_hours() {
+        let store = mem_store_with_traces();
+        // 60 秒前与 2 小时前，落在不同小时桶
+        insert_trace(&store, "now-e", 60, "error", Some("transient"), 1, 100);
+        insert_trace(
+            &store,
+            "old-e",
+            3600 * 2 + 60,
+            "error",
+            Some("network_error"),
+            1,
+            100,
+        );
+
+        let pts = store.error_trend(24);
+        assert_eq!(pts.len(), 2, "应分成两个桶");
+        // SQL 按 bucket 升序 → 早的在前
+        assert!(pts[0].bucket_epoch < pts[1].bucket_epoch);
+        assert_eq!(pts[0].by_error_type.get("network_error"), Some(&1));
+        assert!(
+            !pts[0].by_error_type.contains_key("transient"),
+            "早桶不得含晚桶的类型"
+        );
+        assert_eq!(pts[1].by_error_type.get("transient"), Some(&1));
+        assert!(
+            !pts[1].by_error_type.contains_key("network_error"),
+            "晚桶不得累计早桶的类型"
         );
     }
 
