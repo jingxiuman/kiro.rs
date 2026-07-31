@@ -1,0 +1,19 @@
+docs/superpowers/plans/2026-07-31-group-model-view.md
+  s_ef0bb9ae6ef7d6::t_db5c195911bbed 1-508
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "cbde525ac2354e519912cf8b15e4c039bd95e5e4",
+  "prompts": {},
+  "sessions": {
+    "s_ef0bb9ae6ef7d6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a07a60d2-98eb-43ff-aaf2-a572fbea1917",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
