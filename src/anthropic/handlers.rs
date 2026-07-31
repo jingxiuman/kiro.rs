@@ -674,6 +674,43 @@ pub(crate) fn conversion_error_response(e: &ConversionError) -> (StatusCode, Jso
     )
 }
 
+/// 组支持校验的纯判定层：requested 先 resolve 成 upstream id 再比对。
+/// 放行条件：auto / 解析失败（交给下游既有 400 路径）/ allowed 命中。
+pub(crate) fn group_model_check_against(
+    allowed: &std::collections::HashSet<String>,
+    requested_model: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    use crate::anthropic::model_registry::{allow_passthrough, current_registry, Resolution};
+    let upstream = match current_registry().resolve(requested_model, allow_passthrough()) {
+        Resolution::Mapped { upstream_id, .. }
+        | Resolution::Passthrough { upstream_id, .. } => upstream_id,
+        _ => return Ok(()),
+    };
+    if upstream == "auto" || allowed.contains(&upstream) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse::new(
+            "not_found_error",
+            format!("model not supported for this key group: {}", requested_model),
+        )),
+    ))
+}
+
+/// 入口封装：取组支持集（None=不设限）后调用判定层。
+pub(crate) fn group_model_check(
+    state: &AppState,
+    group: Option<&str>,
+    requested_model: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(provider) = &state.kiro_provider else { return Ok(()) };
+    match provider.token_manager().group_supported_models(group) {
+        Some(allowed) => group_model_check_against(&allowed, requested_model),
+        None => Ok(()),
+    }
+}
+
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
@@ -759,6 +796,12 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+
+    // 组支持校验：请求的模型不在该 key 所属组的支持集内 → 404，不再路由上游吃 400
+    if let Err(resp) = group_model_check(&state, key_ctx.group.as_deref(), &payload.model) {
+        hook.record(0, 0, 0, (0, 0), 0.0, "error");
+        return resp.into_response();
+    }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -1629,14 +1672,21 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 ///
 /// 计算消息的 token 数量
 pub async fn count_tokens(
-    Extension(_key_ctx): Extension<KeyContext>,
+    State(state): State<AppState>,
+    Extension(key_ctx): Extension<KeyContext>,
     JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
-) -> impl IntoResponse {
+) -> Response {
     tracing::info!(
         model = %payload.model,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages/count_tokens request"
     );
+
+    // 组支持校验：即便本端点是纯本地计数、不路由上游，视图仍需与组对齐 ——
+    // 客户端不该在 count_tokens 上看到一个之后 /v1/messages 会 404 的模型。
+    if let Err(resp) = group_model_check(&state, key_ctx.group.as_deref(), &payload.model) {
+        return resp.into_response();
+    }
 
     let total_tokens = token::count_all_tokens(
         payload.model,
@@ -1648,6 +1698,7 @@ pub async fn count_tokens(
     Json(CountTokensResponse {
         input_tokens: total_tokens.max(1),
     })
+    .into_response()
 }
 
 /// POST /cc/v1/messages
@@ -1688,6 +1739,12 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
+
+    // 组支持校验：请求的模型不在该 key 所属组的支持集内 → 404，不再路由上游吃 400
+    if let Err(resp) = group_model_check(&state, key_ctx.group.as_deref(), &payload.model) {
+        hook.record(0, 0, 0, (0, 0), 0.0, "error");
+        return resp.into_response();
+    }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -2694,6 +2751,38 @@ mod tests {
             zh.0.error.message, en.0.error.message,
             "两条路由的文案不得合并：客户端可能在匹配其中一份"
         );
+    }
+
+    /// 组支持校验（纯逻辑层）：allowed 集合里没有该模型解析出的 upstream id → 404 not_found_error。
+    ///
+    /// 用 `claude-opus-4-7` 而非 brief 草稿里的 `claude-opus-5`：注册表里没有
+    /// `-5` 这个 exposed_id，在 `allow_passthrough() == false`（测试期默认值）下
+    /// 会直接 `Rejected(Unknown)`，走的是"放行交给下游 400"分支而非本测试要
+    /// 覆盖的"命中但不在组内"分支——用一个真实存在于内置注册表的 exposed_id
+    /// 才能实际验证拒绝路径。
+    #[test]
+    fn group_model_check_rejects_with_404_not_found_error() {
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("glm-5".to_string());
+        let err = group_model_check_against(&allowed, "claude-opus-4-7")
+            .expect_err("组不支持应拒绝");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1.0.error.error_type, "not_found_error");
+        assert_eq!(
+            err.1.0.error.message,
+            "model not supported for this key group: claude-opus-4-7"
+        );
+    }
+
+    #[test]
+    fn group_model_check_allows_auto_alias_and_unresolvable() {
+        let allowed: std::collections::HashSet<String> =
+            [("glm-5".to_string())].into_iter().collect();
+        // auto 恒放行
+        assert!(group_model_check_against(&allowed, "auto").is_ok());
+        // 注册表不认识的名字：放行，交由既有 conversion_error_response 路径报 400，
+        // 两类错误不混同
+        assert!(group_model_check_against(&allowed, "no-such-model-xyz").is_ok());
     }
 
     /// max_tokens 必须为正数：0 与负数应被拒绝，正数放行。
