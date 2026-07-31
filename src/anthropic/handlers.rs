@@ -1341,7 +1341,10 @@ async fn read_non_stream_body(
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(bytes) => {
-                if !first_seen {
+                // 空 data frame（h2 允许）不算"首字节到达"：算了的话 first_token_ms
+                // 会提前、且后续读失败会被误归因到 BODY_READ 而非 FIRST_TOKEN。
+                // 空 chunk 仍照常参与循环，只是不推进段状态。
+                if !first_seen && !bytes.is_empty() {
                     first_seen = true;
                     tracer.mark_first_token();
                     tracer.close_phase(phase::FIRST_TOKEN, outcome::SUCCESS, None, None);
@@ -1453,9 +1456,13 @@ async fn handle_non_stream_request(
     // 解析事件流
     tracer.open_phase(phase::DECODE);
     let mut decoder = EventStreamDecoder::new();
-    if let Err(e) = decoder.feed(&body_bytes) {
+    // feed 失败（缓冲区溢出）保持既有行为——继续用已解出的部分组装响应，不改状态码。
+    // 但必须把错误留下来喂给 close_phase：否则一次确凿的解码失败会被记成 success，
+    // 污染刚建立的 phase 成功率基线。埋点不得比它所观测的现实更乐观。
+    let decode_error = decoder.feed(&body_bytes).err().map(|e| {
         tracing::warn!("缓冲区溢出: {}", e);
-    }
+        e.to_string()
+    });
 
     let mut text_content = String::new();
     let mut native_thinking = String::new();
@@ -1569,25 +1576,28 @@ async fn handle_non_stream_request(
         tool_json_error = Some(e);
     }
 
-    // decode 段到此结束（tool json 判定属于解码结果的一部分）
-    match &tool_json_error {
-        None => tracer.close_phase(
-            phase::DECODE,
-            outcome::SUCCESS,
-            Some(body_bytes.len() as u64),
-            None,
-        ),
-        Some(err) => tracer.close_phase(
-            phase::DECODE,
+    // decode 段到此结束（tool json 判定属于解码结果的一部分）。
+    //
+    // 优先级：帧解码失败 > tool json 失败。前者说明字节流本身就没读全（缓冲区溢出），
+    // 后者只是解出来的内容不合法；先报更靠底层的那个，归因才不会指错方向。
+    let (decode_outcome, decode_detail) = match (&decode_error, &tool_json_error) {
+        (Some(e), _) => (outcome::UPSTREAM_TRUNCATED, Some(format!("帧解码失败: {e}"))),
+        (None, Some(err)) => (
             if err.is_incomplete() {
                 outcome::UPSTREAM_TRUNCATED
             } else {
                 outcome::UPSTREAM_INVALID
             },
-            Some(body_bytes.len() as u64),
             Some(err.message()),
         ),
-    }
+        (None, None) => (outcome::SUCCESS, None),
+    };
+    tracer.close_phase(
+        phase::DECODE,
+        decode_outcome,
+        Some(body_bytes.len() as u64),
+        decode_detail,
+    );
 
     // 工具调用 JSON 半截 / 非法：非流式路径尚未发送任何字节，直接回 502，
     // 明确暴露上游问题，而不是把无法解析的参数当成完整调用返回。
@@ -3009,26 +3019,84 @@ mod tracer_tests {
         );
     }
 
+    /// 空 data frame 不得算作首字节：算了的话 first_token_ms 会提前，
+    /// 且"上游一个字节都没吐"这件事会被伪装成"已开始传输"。
+    #[tokio::test]
+    async fn empty_leading_chunk_does_not_count_as_first_token() {
+        let t = detached_tracer();
+        // 只有空 chunk，随后干净 EOF —— 等价于空响应体
+        let body = read_non_stream_body(fake_response(vec![b"", b""]), &t)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+
+        let phases = t.phases.lock();
+        assert_eq!(phases.len(), 1, "空 chunk 不应推进到 body_read 段");
+        assert_eq!(phases[0].phase, phase::FIRST_TOKEN);
+        assert_eq!(phases[0].outcome, outcome::UPSTREAM_TRUNCATED);
+        assert!(
+            t.first_token_at.lock().is_none(),
+            "没有任何实际字节，first_token_ms 必须保持 None"
+        );
+    }
+
+    /// 空 chunk 之后才来真数据：首字节应记在真数据那一刻，段照常推进。
+    #[tokio::test]
+    async fn empty_chunk_followed_by_data_marks_first_token_on_the_data() {
+        let t = detached_tracer();
+        let body = read_non_stream_body(fake_response(vec![b"", b"xy"]), &t)
+            .await
+            .unwrap();
+        assert_eq!(body, b"xy");
+
+        let phases = t.phases.lock();
+        assert_eq!(
+            phases.iter().map(|p| p.phase.as_str()).collect::<Vec<_>>(),
+            vec![phase::FIRST_TOKEN, phase::BODY_READ],
+        );
+        assert_eq!(phases[1].bytes, Some(2));
+        assert!(t.first_token_at.lock().is_some());
+    }
+
     /// attempt 的 started_ms 由 sink 侧回推——provider 填的是 None。
     /// 没有它，色块条无法把重试 backoff 与真实跳耗时区分开。
-    #[test]
-    fn on_attempt_backfills_started_ms_from_duration() {
+    /// `started_ms` 由 sink 侧回推——provider 填 None（它不持有请求起点）。
+    ///
+    /// 断言到具体数值而非仅 `is_some()`：只测非空的话，即使所有跳都错算成 0
+    /// 也能通过，而"全 0"恰好等于"色块条上重试 backoff 全部消失"这个失败形态。
+    #[tokio::test]
+    async fn on_attempt_backfills_started_ms_preserving_gap_between_hops() {
         let t = detached_tracer();
-        t.on_attempt(TraceAttempt {
-            attempt: 0,
+        let mk = |attempt: u32, duration_ms: u64| TraceAttempt {
+            attempt,
             credential_id: 1,
             endpoint: "ide".to_string(),
             http_status: Some(200),
             outcome: outcome::SUCCESS.to_string(),
             error_snippet: None,
-            duration_ms: 5,
+            duration_ms,
             started_ms: None,
             proxy_url: None,
-        });
+        };
+        // 第 0 跳：耗时 20ms，在请求开始后不久上报 → 起点应接近 0
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        t.on_attempt(mk(0, 20));
+        // 模拟 backoff：等 40ms 再跑第 1 跳（耗时 20ms）
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        t.on_attempt(mk(1, 20));
+
         let got = t.attempts.lock();
+        let s0 = got[0].started_ms.expect("第 0 跳应有起点");
+        let s1 = got[1].started_ms.expect("第 1 跳应有起点");
+        // 采样延迟只会让起点右移，给宽容上界即可；关键是别退化成 0
+        assert!(s0 <= 15, "第 0 跳起点应接近请求起点，实际 {s0}");
         assert!(
-            got[0].started_ms.is_some(),
-            "provider 传 None，sink 必须补上偏移"
+            s1 >= s0 + 20,
+            "第 1 跳起点必须晚于第 0 跳终点，否则 backoff 空隙会被抹平：s0={s0} s1={s1}"
+        );
+        assert!(
+            s1 > got[0].started_ms.unwrap() + got[0].duration_ms,
+            "两跳之间应留出可识别的 backoff 空隙"
         );
     }
 

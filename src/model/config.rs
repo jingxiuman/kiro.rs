@@ -486,11 +486,23 @@ mod model_sync_config_tests {
 mod streaming_timeout_config_tests {
     use super::*;
 
+    /// 缺字段的老配置必须仍能解析，并落到代码默认值上（向后兼容）。
+    ///
+    /// 断言跟随 `DEFAULT_STREAM_*` 常量而不写死数值：本测试的意图是「有默认值可用」，
+    /// 具体取值是运维折中、会随实测分布调整（已从 90s 调过一次，因为 90s 实证会误杀
+    /// 健康长生成）。把数值写死会让每次调阈值都要改这里，且失败信息指向"兼容性坏了"
+    /// 这个错误方向。取值本身的合理性由 `http_client` 侧的常量注释与断言把关。
     #[test]
     fn streaming_timeouts_have_backward_compatible_defaults() {
         let cfg: Config = serde_json::from_str(r#"{"apiKey":"sk-x"}"#).unwrap();
-        assert_eq!(cfg.stream_idle_timeout_secs, 90);
-        assert_eq!(cfg.stream_total_timeout_secs, 1800);
+        assert_eq!(
+            cfg.stream_idle_timeout_secs,
+            crate::http_client::DEFAULT_STREAM_IDLE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            cfg.stream_total_timeout_secs,
+            crate::http_client::DEFAULT_STREAM_TOTAL_TIMEOUT_SECS
+        );
     }
 
     #[test]

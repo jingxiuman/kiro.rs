@@ -135,13 +135,18 @@ function layout(segs: RawSegment[], total: number): LaidOutSegment[] {
       cursor = s.startedMs
     }
     const end = s.startedMs + s.durationMs
-    if (end <= cursor) return // 完全被前一段吞掉，不占格
-    const widthMs = end - cursor
+    // 0ms 段与被前一段完全吞掉的段：widthMs 记 0 而**不丢弃**。
+    // 丢弃过会导致真实发生过的段（例如 0ms 的 finish、或落在前一跳区间里的
+    // 失败段）从条形和图例里一并消失——组件本该暴露这些段，不能因为它太短就藏掉。
+    // 宽度交给 barWidths 垫到最小可见值。
+    const widthMs = Math.max(0, end - cursor)
     out.push({ ...s, widthMs, clamped: widthMs < s.durationMs })
-    cursor = end
+    if (end > cursor) cursor = end
   })
-  if (total - cursor > 1) {
-    // 阈值 1ms：毫秒截断本身就有 ±1ms 噪声，低于此不值得占一格
+  if (total > cursor) {
+    // 只要有剩余就补 tail，不设 1ms 阈值：阈值会让条形和小于 100%，
+    // 末尾露出一段无标签、无 tooltip 的空轨道——看起来像渲染坏了，
+    // 而不像"这段时间没归因"。短请求（总时长几 ms）时这段空白占比尤其刺眼。
     out.push({
       key: 'tail',
       label: '未归因',
@@ -170,13 +175,27 @@ const MIN_VISIBLE_PCT = 0.5
  * 列着它。一个"本该暴露说不清的时间"的设计，因为布局细节把它藏了起来。
  */
 function barWidths(rawPcts: number[]): number[] {
+  if (rawPcts.length === 0) return []
   const out = rawPcts.map((p) => Math.max(p, MIN_VISIBLE_PCT))
-  const debt = out.reduce((s, p) => s + p, 0) - 100
-  if (debt <= 0) return out
-  // 只从高于下限的段扣，且扣完不得跌破下限；按"可扣余量"比例分摊
+  const sum = out.reduce((s, p) => s + p, 0)
+  const debt = sum - 100
+  if (Math.abs(debt) < 1e-9) return out
+  if (debt < 0) {
+    // 总和不足 100%（例如尾隙被并入、或浮点误差）：把差额补给最宽的那段。
+    // 补给最宽段而非平摊，是为了不让任何窄段的占比被明显放大。
+    const widest = out.reduce((bi, p, i) => (p > out[bi] ? i : bi), 0)
+    out[widest] -= debt
+    return out
+  }
+  // 超出 100%：只从高于下限的段扣，且扣完不得跌破下限；按"可扣余量"比例分摊
   const slack = out.map((p) => Math.max(0, p - MIN_VISIBLE_PCT))
   const totalSlack = slack.reduce((s, v) => s + v, 0)
-  if (totalSlack <= 0) return out // 段太多、全在下限上：无处可扣，交给 flex 收缩
+  if (totalSlack <= 0) {
+    // 段数多到连下限都放不下（约 200 段）。此时等比压缩全部段：
+    // 保证总和为 100%，代价是所有段都低于最小可见宽度。不能原样返回——
+    // flexShrink 为 0，超出部分会被父容器从尾部裁掉，末段直接看不见。
+    return out.map((p) => (p * 100) / sum)
+  }
   return out.map((p, i) => p - (debt * slack[i]) / totalSlack)
 }
 
@@ -202,6 +221,16 @@ export function TraceTimingBar({ rec }: { rec: TraceRecord }) {
   const laid = layout(segs, total)
   const pct = (ms: number) => (ms / total) * 100
   const widths = barWidths(laid.map((s) => pct(s.widthMs)))
+
+  // layout 理论上总会补出 tail，这里兜住"一段都没铺出来"的意外，
+  // 避免渲染一根没有任何色块的空条（看起来像坏了，而不像没数据）。
+  if (laid.length === 0) {
+    return (
+      <div className="text-[12px] text-muted-foreground">
+        无法铺出耗时分段（分段数据与总时长不一致）
+      </div>
+    )
+  }
 
   return (
     <TooltipProvider delayDuration={100}>

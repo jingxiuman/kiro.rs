@@ -34,11 +34,19 @@ const TCP_KEEPALIVE_SECS: u64 = 30;
 /// `streamIdleTimeoutSecs` 调大空闲阈值。
 ///
 /// 历史上也观测到若干流在静默约 240s 后被上游清理，但这是外部行为假设，不作为
-/// 代码不变量。90s 默认值是在更快释放疑似停滞连接与避免误杀健康流之间的运维折中。
+/// 代码不变量。
+///
+/// **默认 300s 而非更短，是被生产事故推着定的**：曾默认 90s，上线 100 秒内即误杀一条
+/// 已正常产出 6614 tokens / 380KB、跑了 421s 的健康流（错误串 `[timeout+decode]` 表明
+/// 是本地超时而非上游 RST）。代价是白烧十分钟与全部输入 token，正是本模块要消除的
+/// 失败形态。300s 让上游自己约 240s 的清理先动手（真卡死仍会被 RST，归因更准），
+/// runaway 则交给下面的总超时兜住——空闲超时不必兼任那个角色。
+/// 判断误杀 vs 真卡死看**产出量**：真卡死只产出 1~228 tokens，误杀的已产出数千。
+/// 详见 `docs/streaming-timeouts.md`。
 ///
 /// 总超时默认 1800s：约为已观测 712s 长生成的 2.5 倍，能覆盖正常长生成，同时把
 /// 极低速率流的资源占用限制在 30 分钟内。部署方可通过 `streamTotalTimeoutSecs` 调整。
-pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_STREAM_TOTAL_TIMEOUT_SECS: u64 = 1800;
 
 /// 默认值只断言代码自身依赖的关系；外部上游的清理时限不属于编译期不变量。

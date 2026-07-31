@@ -291,11 +291,17 @@ codex
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/v1/models` | 返回本服务声明支持的模型列表 |
+| `GET` | `/v1/models` | 返回调用 Key 所属凭据组可用的模型列表（组内并集，见下） |
 | `POST` | `/v1/messages` | Anthropic Messages API 兼容入口 |
 | `POST` | `/v1/messages/count_tokens` | Anthropic count_tokens 兼容入口 |
 | `POST` | `/cc/v1/messages` | Claude Code 兼容入口，流式事件顺序针对 Claude Code 调整 |
 | `POST` | `/cc/v1/messages/count_tokens` | Claude Code 兼容 count_tokens |
+
+**模型视图按凭据组收窄**：不同 Kiro 账号从上游拉到的可用模型集不同，因此 `/v1/models`
+只返回调用 Key 所属分组内**至少一个凭据**支持的模型（并集语义；`auto` 恒可见）。
+请求分组内无任何凭据支持的模型时，直接返回 `404 not_found_error`，不再路由到上游换取
+`400 INVALID_MODEL_ID`。凭据可用模型集由模型同步逐凭据拉取，落在 `models.json` 的
+`credentialSupport`；**无记录视为未知并放行**（保守，避免新加凭据被误排除）。
 
 ### OpenAI 兼容
 
