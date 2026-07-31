@@ -1,0 +1,20 @@
+src/admin/ops.rs
+  s_9a6f841432c23b::t_701d4dc276bf69 221-240,586-596,600-601,603-605,608-609,617-626,629-651,654-658
+  s_9a6f841432c23b::t_41ad8d23d1bbeb 1229-1324
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "8e7cd598f8dc241bf5c13ac55fb2b88da78383ef",
+  "prompts": {},
+  "sessions": {
+    "s_9a6f841432c23b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3288a3ad-dcfe-4a5a-9ece-c573fec8d0ee",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
