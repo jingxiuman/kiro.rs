@@ -1221,11 +1221,81 @@ pub async fn stats_by_credential(
                 "calls": d.calls,
                 "inputTokens": d.input_tokens,
                 "outputTokens": d.output_tokens,
+                "cacheCreationTokens": d.cache_creation_tokens,
+                "cacheReadTokens": d.cache_read_tokens,
                 "errors": d.errors,
             })
         })
         .collect();
     Json(enriched).into_response()
+}
+
+/// 各账号积分时序默认返回的账号数上限。
+/// 折线图超过约 10 条就难以分辨颜色，多出来的靠 totalCredentials 如实告知。
+const CREDIT_SERIES_DEFAULT_LIMIT: usize = 10;
+/// limit 上限，防手工构造大 limit 把响应撑爆
+const CREDIT_SERIES_MAX_LIMIT: usize = 50;
+
+/// GET /api/admin/stats/credits-by-credential?granularity=hour|day&startDate=&endDate=&keyId=&group=&limit=
+///
+/// 返回各账号的积分消耗时序（Top N）。与 by-credential 的差别是保留时间维度。
+pub async fn stats_credits_by_credential(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let (window, key_id) = match stats_query_parts(&params) {
+        Ok(parts) => parts,
+        Err(message) => return stats_bad_request(message),
+    };
+    let limit = match params.get("limit") {
+        None => CREDIT_SERIES_DEFAULT_LIMIT,
+        Some(s) => match s.trim().parse::<usize>() {
+            Ok(v) if (1..=CREDIT_SERIES_MAX_LIMIT).contains(&v) => v,
+            _ => {
+                return stats_bad_request(format!(
+                    "limit 必须是 1..={} 的整数",
+                    CREDIT_SERIES_MAX_LIMIT
+                ));
+            }
+        },
+    };
+    let group = parse_group_filter(&params);
+    // 一份快照同时用于 group 白名单与图例 email，避免查两次
+    let snapshot = state.service.get_all_credentials();
+    let email_map: std::collections::HashMap<u64, Option<String>> = snapshot
+        .credentials
+        .iter()
+        .map(|c| (c.id, c.email.clone()))
+        .collect();
+    let cred_ids: Option<std::collections::HashSet<u64>> = group.as_deref().map(|g| {
+        snapshot
+            .credentials
+            .iter()
+            .filter(|c| c.groups.iter().any(|cg| cg == g))
+            .map(|c| c.id)
+            .collect()
+    });
+    let data =
+        state
+            .usage_aggregator
+            .query_credits_by_credential(window, key_id, cred_ids.as_ref(), limit);
+    let series: Vec<serde_json::Value> = data
+        .series
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "credentialId": s.credential_id,
+                "email": email_map.get(&s.credential_id).cloned().flatten(),
+                "totalCredits": s.total_credits,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "series": series,
+        "points": data.points,
+        "totalCredentials": data.total_credentials,
+    }))
+    .into_response()
 }
 
 /// GET /api/admin/traces
@@ -1319,11 +1389,12 @@ pub async fn list_traces(
                         "outcome": a.outcome,
                         "errorSnippet": a.error_snippet,
                         "durationMs": a.duration_ms,
+                        "startedMs": a.started_ms,
                         "proxyUrl": a.proxy_url,
                     })
                 })
                 .collect();
-            // 流生命周期分段；非流式请求为空数组（前端据此渲染「非流式请求，无流生命周期分段」）
+            // 响应处理分段；流式与非流式段名不同，早期失败（未到达上游）为空数组
             let phases: Vec<serde_json::Value> = r
                 .phases
                 .iter()

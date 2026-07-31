@@ -311,6 +311,8 @@ pub struct ModelDistribution {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
 }
 
 /// 上游凭据分布
@@ -321,7 +323,44 @@ pub struct CredentialDistribution {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
     pub errors: u64,
+}
+
+/// 各账号积分消耗时序中，单个账号的系列元信息（图例 + 排序依据）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditSeriesMeta {
+    pub credential_id: u64,
+    /// 窗口内该账号的积分合计，用于挑 Top N 与图例排序
+    pub total_credits: f64,
+}
+
+/// 各账号积分消耗时序
+///
+/// 为什么不复用 `TimeSeriesPoint`：那个是「一个时间点一行、字段固定」的结构，
+/// 装不下「账号数不定」的第二维度。这里把维度显式拆成 series（有哪些账号）
+/// 与 points（每桶各账号多少），前端据此 pivot 成宽表。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditsByCredential {
+    /// 入选的账号系列，按窗口内总积分降序
+    pub series: Vec<CreditSeriesMeta>,
+    pub points: Vec<CreditPoint>,
+    /// 窗口内有积分消耗的账号总数。> series.len() 说明被 Top N 截断了，
+    /// 前端必须如实标注，否则「图上就这几个账号」是错的。
+    pub total_credentials: usize,
+}
+
+/// 单个时间桶内各账号的积分
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditPoint {
+    pub ts: String,
+    /// credential_id（转成字符串做 JSON key）→ 该桶该账号的积分。
+    /// 稀疏存储：没有消耗的账号不出现，避免 N 账号 × M 桶 全量补零。
+    pub credits: HashMap<String, f64>,
 }
 
 /// 概览：今日 + 累计
@@ -491,6 +530,8 @@ impl UsageAggregator {
                 let entry = acc.entry(model.clone()).or_default();
                 entry.input_tokens += stats.input_tokens;
                 entry.output_tokens += stats.output_tokens;
+                entry.cache_creation_tokens += stats.cache_creation_tokens;
+                entry.cache_read_tokens += stats.cache_read_tokens;
                 entry.calls += stats.calls;
             }
         }
@@ -501,6 +542,8 @@ impl UsageAggregator {
                 calls: stats.calls,
                 input_tokens: stats.input_tokens,
                 output_tokens: stats.output_tokens,
+                cache_creation_tokens: stats.cache_creation_tokens,
+                cache_read_tokens: stats.cache_read_tokens,
             })
             .collect();
         out.sort_by_key(|row| std::cmp::Reverse(row.calls));
@@ -529,6 +572,8 @@ impl UsageAggregator {
                 let entry = acc.entry(*id).or_default();
                 entry.input_tokens += stats.input_tokens;
                 entry.output_tokens += stats.output_tokens;
+                entry.cache_creation_tokens += stats.cache_creation_tokens;
+                entry.cache_read_tokens += stats.cache_read_tokens;
                 entry.calls += stats.calls;
                 entry.errors += stats.errors;
             }
@@ -540,11 +585,91 @@ impl UsageAggregator {
                 calls: stats.calls,
                 input_tokens: stats.input_tokens,
                 output_tokens: stats.output_tokens,
+                cache_creation_tokens: stats.cache_creation_tokens,
+                cache_read_tokens: stats.cache_read_tokens,
                 errors: stats.errors,
             })
             .collect();
         out.sort_by_key(|row| std::cmp::Reverse(row.calls));
         out
+    }
+
+    /// 各账号积分消耗时序（Top `limit` 个账号，按窗口内总积分降序）
+    ///
+    /// 与 [`Self::query_by_credential`] 的分工：那个把整个窗口压成每账号一个总数，
+    /// 这个保留时间维度，用来看「某账号是持续烧还是某一小时突刺」。
+    ///
+    /// 桶保留策略与 [`Self::query_timeseries`] 一致：只产出实际有记录的桶
+    /// （`upsert_bucket` 仅在收到记录时物化桶），完全无流量的时段不会出现在结果里。
+    /// 前端 pivot 时对入选账号缺失的桶补 0——积分是流量型指标，没消耗就是 0，
+    /// 不是「无数据」。
+    pub fn query_credits_by_credential(
+        &self,
+        window: StatsQueryWindow,
+        key_id: Option<u64>,
+        cred_filter: Option<&std::collections::HashSet<u64>>,
+        limit: usize,
+    ) -> CreditsByCredential {
+        let inner = self.inner.read();
+        let buckets = select_buckets(&inner, window.granularity);
+
+        // 第一遍：窗口内每账号的积分合计，用来定 Top N
+        let mut totals: HashMap<u64, f64> = HashMap::new();
+        for b in buckets.iter().filter(|b| bucket_in_window(b, window)) {
+            let Some(group) = credential_group_for_key(b, key_id) else {
+                continue;
+            };
+            for (id, stats) in group {
+                if let Some(allow) = cred_filter
+                    && !allow.contains(id)
+                {
+                    continue;
+                }
+                if stats.credits > 0.0 {
+                    *totals.entry(*id).or_default() += stats.credits;
+                }
+            }
+        }
+        let total_credentials = totals.len();
+
+        let mut ranked: Vec<(u64, f64)> = totals.into_iter().collect();
+        // 积分降序；并列时按 id 升序，保证同样数据每次返回同样顺序（否则图例会闪）
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        ranked.truncate(limit);
+        let selected: std::collections::HashSet<u64> = ranked.iter().map(|(id, _)| *id).collect();
+
+        // 第二遍：只为入选账号铺时序
+        let mut points: Vec<CreditPoint> = buckets
+            .iter()
+            .filter(|b| bucket_in_window(b, window))
+            .map(|b| {
+                let mut credits: HashMap<String, f64> = HashMap::new();
+                if let Some(group) = credential_group_for_key(b, key_id) {
+                    for (id, stats) in group {
+                        if selected.contains(id) && stats.credits > 0.0 {
+                            credits.insert(id.to_string(), stats.credits);
+                        }
+                    }
+                }
+                CreditPoint {
+                    ts: ts_to_rfc3339(b.ts),
+                    credits,
+                }
+            })
+            .collect();
+        points.sort_by(|a, b| a.ts.cmp(&b.ts));
+
+        CreditsByCredential {
+            series: ranked
+                .into_iter()
+                .map(|(credential_id, total_credits)| CreditSeriesMeta {
+                    credential_id,
+                    total_credits,
+                })
+                .collect(),
+            points,
+            total_credentials,
+        }
     }
 
     /// 概览（今日 + 最近 7 天）
@@ -725,8 +850,8 @@ mod tests {
             model: "claude-opus-4-7".to_string(),
             input_tokens: 1000,
             output_tokens: 200,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
+            cache_creation_tokens: 300,
+            cache_read_tokens: 4000,
             credits: 0.05,
             duration_ms: 1500,
             status: "success".to_string(),
@@ -746,10 +871,144 @@ mod tests {
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].model, "claude-opus-4-7");
         assert_eq!(by_model[0].calls, 2);
+        assert_eq!(by_model[0].cache_creation_tokens, 600);
+        assert_eq!(by_model[0].cache_read_tokens, 8000);
 
         let by_cred = agg.query_by_credential(window, None, None);
         assert_eq!(by_cred.len(), 1);
         assert_eq!(by_cred[0].credential_id, 5);
+        assert_eq!(by_cred[0].cache_creation_tokens, 600);
+        assert_eq!(by_cred[0].cache_read_tokens, 8000);
+    }
+
+    /// 构造一条指定账号/时间/积分的记录，其余字段取无关默认值
+    #[cfg(test)]
+    fn credit_rec(ts: DateTime<Utc>, credential_id: u64, credits: f64) -> UsageRecord {
+        UsageRecord {
+            ts: ts.to_rfc3339(),
+            key_id: 1,
+            credential_id,
+            model: "m".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits,
+            duration_ms: 0,
+            status: "success".to_string(),
+        }
+    }
+
+    /// 积分时序必须保留时间维度：同一账号跨两个小时桶的消耗不能被压成一个总数，
+    /// 否则「持续烧」和「某一小时突刺」在图上无法区分——这正是加这个图的目的。
+    #[test]
+    fn credits_by_credential_keeps_time_dimension() {
+        let agg = UsageAggregator::new();
+        let now = Utc::now();
+        let two_hours_ago = now - Duration::hours(2);
+        agg.ingest(&credit_rec(two_hours_ago, 5, 1.0));
+        agg.ingest(&credit_rec(now, 5, 0.25));
+        agg.ingest(&credit_rec(now, 7, 4.0));
+
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let out = agg.query_credits_by_credential(window, None, None, 10);
+
+        assert_eq!(out.total_credentials, 2);
+        // 按总积分降序：7 号 4.0 在 5 号 1.25 之前
+        assert_eq!(
+            out.series.iter().map(|s| s.credential_id).collect::<Vec<_>>(),
+            vec![7, 5]
+        );
+        assert!((out.series[0].total_credits - 4.0).abs() < 1e-9);
+        assert!((out.series[1].total_credits - 1.25).abs() < 1e-9);
+
+        // 5 号的 1.0 与 0.25 必须落在不同的桶里
+        let buckets_with_5: Vec<f64> = out
+            .points
+            .iter()
+            .filter_map(|p| p.credits.get("5").copied())
+            .collect();
+        assert_eq!(
+            buckets_with_5.len(),
+            2,
+            "跨两小时的消耗应占两个桶，不能被压成一个"
+        );
+        assert!(buckets_with_5.iter().any(|v| (v - 1.0).abs() < 1e-9));
+        assert!(buckets_with_5.iter().any(|v| (v - 0.25).abs() < 1e-9));
+
+        // 桶按时间升序，前端直接照序画
+        let ts: Vec<&str> = out.points.iter().map(|p| p.ts.as_str()).collect();
+        let mut sorted = ts.clone();
+        sorted.sort_unstable();
+        assert_eq!(ts, sorted, "points 必须按时间升序");
+
+        // 只有实际有记录的两个小时桶，中间那一小时没有流量、不物化
+        assert_eq!(out.points.len(), 2, "只产出有记录的桶");
+    }
+
+    /// Top N 截断时 total_credentials 必须报全量，否则 UI 会把「图上 1 个」
+    /// 说成「只有 1 个账号在消耗」。
+    #[test]
+    fn credits_by_credential_reports_truncation() {
+        let agg = UsageAggregator::new();
+        let now = Utc::now();
+        for id in 1..=5u64 {
+            agg.ingest(&credit_rec(now, id, id as f64));
+        }
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let out = agg.query_credits_by_credential(window, None, None, 2);
+
+        assert_eq!(out.series.len(), 2, "limit 应生效");
+        assert_eq!(out.total_credentials, 5, "总数须报全量而非截断后的数量");
+        // 取的是积分最高的两个
+        assert_eq!(
+            out.series.iter().map(|s| s.credential_id).collect::<Vec<_>>(),
+            vec![5, 4]
+        );
+        // 未入选账号不得出现在 points 里
+        assert!(
+            out.points
+                .iter()
+                .all(|p| p.credits.keys().all(|k| k == "5" || k == "4")),
+            "points 只应包含入选账号"
+        );
+    }
+
+    /// 零积分账号不该占一条线（图例里全是平地会挤掉真正在烧的账号）
+    #[test]
+    fn credits_by_credential_skips_zero_credit_accounts() {
+        let agg = UsageAggregator::new();
+        let now = Utc::now();
+        agg.ingest(&credit_rec(now, 5, 0.0));
+        agg.ingest(&credit_rec(now, 7, 2.0));
+
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let out = agg.query_credits_by_credential(window, None, None, 10);
+        assert_eq!(out.total_credentials, 1);
+        assert_eq!(
+            out.series.iter().map(|s| s.credential_id).collect::<Vec<_>>(),
+            vec![7]
+        );
+    }
+
+    /// group 白名单必须同时约束 Top N 排名与 points，否则筛了分组还能看到组外账号
+    #[test]
+    fn credits_by_credential_respects_cred_filter() {
+        let agg = UsageAggregator::new();
+        let now = Utc::now();
+        agg.ingest(&credit_rec(now, 5, 1.0));
+        agg.ingest(&credit_rec(now, 7, 9.0));
+
+        let allow: std::collections::HashSet<u64> = [5u64].into_iter().collect();
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let out = agg.query_credits_by_credential(window, None, Some(&allow), 10);
+
+        assert_eq!(out.total_credentials, 1);
+        assert_eq!(out.series[0].credential_id, 5);
+        assert!(
+            out.points.iter().all(|p| !p.credits.contains_key("7")),
+            "组外账号不得出现在 points"
+        );
     }
 
     #[test]

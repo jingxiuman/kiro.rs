@@ -65,6 +65,12 @@ pub struct OpsOverview {
     /// error_type → 数量（含 interrupted 类）
     pub by_error_type: Vec<ErrorTypeCount>,
     pub avg_duration_ms: u64,
+    /// 平均首 token 延迟，**仅统计流式请求**。
+    ///
+    /// 非流式自 0.8.7 起也有 `first_token_ms`，但混进来会让这个指标的口径从
+    /// 「流式首 token」变成「流式+非流式混合平均」，与历史窗口不可比 ——
+    /// 非流式的首字节含义（等上游吐第一口，之后还要收完整段）与流式（此后即可
+    /// 边收边发给客户端）对运维决策的指向也不同。故显式钉死在流式上。
     pub avg_first_token_ms: Option<u64>,
     /// 中断类请求（stream_interrupted / upstream_truncated）的平均持续时长。
     /// 多次中断集中在同一时长（如 ~245s）通常指向链路上的固定超时。
@@ -240,7 +246,7 @@ impl OpsStore {
              COALESCE(SUM(final_status = 'success'), 0), \
              COALESCE(SUM(final_status = 'interrupted'), 0), \
              COALESCE(CAST(AVG(duration_ms) AS INTEGER), 0), \
-             CAST(AVG(first_token_ms) AS INTEGER) \
+             CAST(AVG(CASE WHEN is_stream = 1 THEN first_token_ms END) AS INTEGER) \
              FROM traces WHERE ts_epoch >= ?1",
             [cutoff],
             |row| {

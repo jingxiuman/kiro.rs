@@ -45,6 +45,7 @@ import {
 import { extractErrorMessage } from '@/lib/utils'
 import { formatDuration } from '@/lib/format'
 import { TracePhaseLane } from '@/components/trace-phase-lane'
+import { TraceTimingBar } from '@/components/trace-timing-bar'
 import { usePhaseBaseline } from '@/hooks/use-ops'
 import type { PhaseBaselineRow, TraceAttempt, TraceQuery, TraceRecord } from '@/types/api'
 
@@ -331,7 +332,7 @@ function ExpandedTraceRow({
   )
 }
 
-/** 展开后的链路详情：错误摘要 + 每跳时间线 + 流生命周期泳道 */
+/** 展开后的链路详情：错误摘要 + 耗时分布条 + 每跳时间线 + 分段明细 */
 function ExpandedDetail({
   rec,
   baseline,
@@ -365,10 +366,17 @@ function ExpandedDetail({
         </div>
       )}
       {rec.interruptedAfterBytes != null && (
+        // 同一字段两条路径语义不同：流式是「已下发给客户端」，非流式一个字节都没
+        // 下发过，记的是「从上游收到多少就断了」。文案必须跟着分，否则非流式会
+        // 被读成「已经发了一半给客户端」——归因方向正好相反。
         <div className="text-[12px] text-muted-foreground">
-          中断前已发送 {rec.interruptedAfterBytes} 字节
+          {rec.isStream
+            ? `中断前已下发 ${rec.interruptedAfterBytes} 字节`
+            : `中断前已从上游收到 ${rec.interruptedAfterBytes} 字节`}
         </div>
       )}
+      <div className="text-[12px] font-medium text-muted-foreground">耗时分布</div>
+      <TraceTimingBar rec={rec} />
       <div className="text-[12px] font-medium text-muted-foreground">
         尝试链路（{rec.attempts.length} 次
         {rec.attempts.length > 1 ? `，含 ${rec.attempts.length - 1} 次重试` : "，未重试"}）
@@ -380,7 +388,7 @@ function ExpandedDetail({
           rec.attempts.map((a) => <AttemptRow key={a.attempt} a={a} />)
         )}
       </div>
-      <div className="mt-3 text-[13px] font-medium text-muted-foreground">流生命周期</div>
+      <div className="mt-3 text-[13px] font-medium text-muted-foreground">分段明细</div>
       <div className="mt-2">
         <TracePhaseLane
           phases={rec.phases ?? []}

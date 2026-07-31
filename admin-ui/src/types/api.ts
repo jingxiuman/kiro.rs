@@ -453,6 +453,30 @@ export interface ModelDistribution {
   calls: number
   inputTokens: number
   outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+}
+
+/** 各账号积分时序里的一条账号系列（图例项） */
+export interface CreditSeriesMeta {
+  credentialId: number
+  email: string | null
+  /** 窗口内该账号积分合计，决定图例排序与 Top N 入选 */
+  totalCredits: number
+}
+
+/** 单个时间桶内各账号的积分；key = credentialId 的字符串形式，稀疏（无消耗不出现） */
+export interface CreditPoint {
+  ts: string
+  credits: Record<string, number>
+}
+
+/** GET /stats/credits-by-credential 响应 */
+export interface CreditsByCredential {
+  series: CreditSeriesMeta[]
+  points: CreditPoint[]
+  /** 窗口内有消耗的账号总数；> series.length 表示被 Top N 截断 */
+  totalCredentials: number
 }
 
 export interface CredentialDistribution {
@@ -461,6 +485,8 @@ export interface CredentialDistribution {
   calls: number
   inputTokens: number
   outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
   errors: number
 }
 
@@ -479,14 +505,16 @@ export interface TraceAttempt {
   /** 上游错误体片段（已截断） */
   errorSnippet: string | null
   durationMs: number
+  /** 本跳相对请求起点的偏移；null/undefined = 未知（该列存在前的历史行），此时只能顺序堆叠 */
+  startedMs?: number | null
   /** 本跳出口：'direct' = 直连；null/undefined = 未知（该列存在前的历史行）；其余为代理 URL */
   proxyUrl?: string | null
 }
 
-/** 流生命周期的一段；仅流式请求有 */
+/** 响应处理的一段；流式与非流式段名不同 */
 export interface TracePhase {
   seq: number
-  /** first_token | streaming | finish */
+  /** 流式：first_token | streaming | finish；非流式：first_token | body_read | decode | assemble */
   phase: string
   startedMs: number
   durationMs: number

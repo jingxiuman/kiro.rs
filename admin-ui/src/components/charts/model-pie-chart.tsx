@@ -9,6 +9,8 @@ interface Props {
 }
 
 interface ChartDatum {
+  cacheCreationTokens: number
+  cacheReadTokens: number
   inputTokens: number
   name: string
   outputTokens: number
@@ -33,6 +35,8 @@ function ModelPieChartImpl({ data }: Props) {
 function buildChartData(data: ModelDistribution[]) {
   const total = data.reduce((s, d) => s + d.calls, 0) || 1
   const chartData = data.map((d) => ({
+    cacheCreationTokens: d.cacheCreationTokens,
+    cacheReadTokens: d.cacheReadTokens,
     inputTokens: d.inputTokens,
     name: d.model,
     outputTokens: d.outputTokens,
@@ -103,7 +107,12 @@ function formatTooltipValue({
   const payload = item?.payload
   const input = formatNumber(payload?.inputTokens ?? 0)
   const output = formatNumber(payload?.outputTokens ?? 0)
-  return [`${formatNumber(value)} 次（${pct}%）  in ${input} / out ${output}`, payload?.name ?? '']
+  const cacheWrite = formatNumber(payload?.cacheCreationTokens ?? 0)
+  const cacheRead = formatNumber(payload?.cacheReadTokens ?? 0)
+  return [
+    `${formatNumber(value)} 次（${pct}%）  in ${input} / out ${output} / 缓存写 ${cacheWrite} / 缓存读 ${cacheRead}`,
+    payload?.name ?? '',
+  ]
 }
 
 export const ModelPieChart = memo(ModelPieChartImpl)

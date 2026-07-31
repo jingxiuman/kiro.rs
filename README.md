@@ -363,6 +363,8 @@ Admin API 鉴权同样支持：
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
 | `requireProxy` | `false` | 强制走代理：无可用代理时拒绝出网而非降级直连（见「代理优先级」） |
+| `streamIdleTimeoutSecs` | `90` | 流式上游相邻数据帧的最大空闲秒数；必须大于 HTTP/2 keep-alive 探测窗口（40s） |
+| `streamTotalTimeoutSecs` | `1800` | 流式上游请求的绝对总时限（秒）；必须大于 `streamIdleTimeoutSecs` |
 | `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
 | `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |

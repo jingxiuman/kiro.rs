@@ -2,10 +2,14 @@ import type { PhaseBaselineRow, TracePhase } from '@/types/api'
 import { Badge } from '@/components/ui/badge'
 import { formatDuration } from '@/lib/format'
 
+/** 与 trace-timing-bar.tsx 的 PHASE_LABEL 保持一致 */
 const PHASE_LABEL: Record<string, string> = {
-  first_token: '首 token',
+  first_token: '等首字节',
   streaming: '流传输',
   finish: '收尾',
+  body_read: '收 body',
+  decode: '解码',
+  assemble: '组装',
 }
 
 /** 该段是否算失败。client_disconnected 是客户端行为，不算故障。 */
@@ -30,9 +34,13 @@ function baselineFor(
   }
 }
 
-/** 流生命周期泳道：与「尝试链路」（attempts，N 跳重试）并列的第二层，
- * 覆盖 headers 之后的流传输本身（1 条流的 first_token/streaming/finish 三段）。
- * 每段挂近 24h 同出口该段失败率，用于区分「这次异常」还是「该出口一贯如此」。 */
+/** 分段明细：与「尝试链路」（attempts，N 跳重试）并列的第二层，
+ * 覆盖 headers 之后的响应处理（流式 first_token/streaming/finish；
+ * 非流式 first_token/body_read/decode/assemble）。
+ *
+ * 与 `TraceTimingBar` 的分工：条形图给比例，这里给条形图放不下的证据——
+ * 每段字节数、近 24h 同出口该段失败率（区分「这次异常」还是「该出口一贯如此」）、
+ * 错误片段全文。 */
 export function TracePhaseLane({
   phases,
   proxyUrl,
@@ -46,7 +54,7 @@ export function TracePhaseLane({
   if (phases.length === 0) {
     return (
       <div className="text-[12px] text-muted-foreground">
-        非流式请求，无流生命周期分段
+        无分段记录（请求未到达上游，或该记录早于分段埋点）
       </div>
     )
   }
