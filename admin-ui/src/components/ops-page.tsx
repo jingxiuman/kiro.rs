@@ -219,6 +219,7 @@ const CROSSTAB_DIMS: { label: string; value: CrosstabDimension }[] = [
   { label: '按凭据', value: 'credential' },
   { label: '按代理', value: 'proxy' },
   { label: '按模型', value: 'model' },
+  { label: '按端点', value: 'endpoint' },
 ]
 
 /** lift 判读阈值。≥2 视为超额，<1.25 视为与流量相称，中间为灰区 */
@@ -237,9 +238,17 @@ const LIFT_MIN_TRAFFIC = 30
  */
 const LIFT_MIN_ERRORS = 3
 
-function bucketLabel(b: CrosstabBucket): string {
+/**
+ * 桶标签。空串在不同维度含义不同，必须按维度分别解释：
+ * proxy 维度的空串 = 出口未知（该列存在前的历史行）；
+ * endpoint 维度的空串 = 请求没走到上游，压根没有端点可记（实测这类行全属凭据 0）。
+ * 一律显示成「直连/未知」会把后者说成一个不存在的事实。
+ */
+function bucketLabel(b: CrosstabBucket, dim: CrosstabDimension): string {
   if (b.email) return b.email
-  if (b.key === '') return '(直连/未知)'
+  if (b.key === '') {
+    return dim === 'endpoint' ? '(未到达上游)' : '(直连/未知)'
+  }
   if (b.key === 'direct') return '直连'
   return b.key
 }
@@ -286,7 +295,7 @@ function ErrorCrosstabPanel({ hours }: { hours: number }) {
         ) : (
           <div className="space-y-3">
             {rows.map((r) => (
-              <CrosstabRowBlock key={r.errorType} row={r} />
+              <CrosstabRowBlock key={r.errorType} row={r} dim={dim} />
             ))}
           </div>
         )}
@@ -295,7 +304,7 @@ function ErrorCrosstabPanel({ hours }: { hours: number }) {
   )
 }
 
-function CrosstabRowBlock({ row }: { row: CrosstabRow }) {
+function CrosstabRowBlock({ row, dim }: { row: CrosstabRow; dim: CrosstabDimension }) {
   return (
     <div className="rounded-lg border border-border/50 p-3">
       <div className="mb-2 flex flex-wrap items-center gap-2">
@@ -307,7 +316,7 @@ function CrosstabRowBlock({ row }: { row: CrosstabRow }) {
       </div>
       <div className="space-y-1">
         {row.buckets.map((b) => (
-          <CrosstabBucketRow key={b.key} bucket={b} />
+          <CrosstabBucketRow key={b.key} bucket={b} dim={dim} />
         ))}
       </div>
     </div>
@@ -319,6 +328,18 @@ function CrosstabRowBlock({ row }: { row: CrosstabRow }) {
  * 但两者的原因不同，提示文案也应不同 —— 否则用户看到「样本过小」会去看流量，
  * 而真正的问题可能在错误数只有 1。
  */
+/**
+ * lift 在该桶上是否根本没有意义（区别于「样本不足所以不可信」）。
+ *
+ * endpoint 维度的空串桶 = 请求没走到上游。这类请求按定义 100% 失败，
+ * 错误数恒等于流量数，于是 lift 必然是个巨大的数（实测 380）—— 它是同义反复，
+ * 不是信号，但因为满足「100% 失败率」豁免又不会被样本守卫拦住，
+ * 会以最高 lift 出现在面板上，抢掉真实信号的注意力。
+ */
+function liftIsMeaningless(b: CrosstabBucket, dim: CrosstabDimension): boolean {
+  return dim === 'endpoint' && b.key === ''
+}
+
 function liftSampleWarning(b: CrosstabBucket): string | null {
   // 分子守卫无豁免：错误数太少，无论分母多大都不成模式
   if (b.count < LIFT_MIN_ERRORS) {
@@ -335,9 +356,16 @@ function liftSampleWarning(b: CrosstabBucket): string | null {
   return null
 }
 
-function CrosstabBucketRow({ bucket }: { bucket: CrosstabBucket }) {
-  const lift = bucket.lift
-  const warning = liftSampleWarning(bucket)
+function CrosstabBucketRow({
+  bucket,
+  dim,
+}: {
+  bucket: CrosstabBucket
+  dim: CrosstabDimension
+}) {
+  const meaningless = liftIsMeaningless(bucket, dim)
+  const lift = meaningless ? null : bucket.lift
+  const warning = meaningless ? null : liftSampleWarning(bucket)
   // 样本不足时一律不着色：着色等于在说"这里有问题"，而噪声不该触发告警观感
   const tone =
     lift == null || warning != null
@@ -351,13 +379,19 @@ function CrosstabBucketRow({ bucket }: { bucket: CrosstabBucket }) {
   return (
     <div className="flex items-center gap-2 text-[12px]">
       <span className="min-w-0 flex-1 truncate" title={bucket.key}>
-        {bucketLabel(bucket)}
+        {bucketLabel(bucket, dim)}
       </span>
       <span className="shrink-0 tabular-nums text-muted-foreground">
         错误 {formatNumber(bucket.count)} / 流量 {formatNumber(bucket.traffic)}
       </span>
       <span className={cn('w-[112px] shrink-0 text-right tabular-nums', tone)}>
-        {lift == null ? 'lift n/a' : `lift ${lift.toFixed(2)}`}
+        {meaningless ? (
+          <span title="这类请求按定义 100% 失败，lift 无意义">lift —</span>
+        ) : lift == null ? (
+          'lift n/a'
+        ) : (
+          `lift ${lift.toFixed(2)}`
+        )}
         {warning && (
           <span className="ml-1 cursor-help text-muted-foreground" title={warning}>
             ⚠

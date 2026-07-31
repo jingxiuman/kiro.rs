@@ -130,6 +130,13 @@ pub enum CrosstabDimension {
     Credential,
     Proxy,
     Model,
+    /// 上游端点（`cli` / `ide`）。
+    ///
+    /// 加这个维度的直接原因：实测 transient 类错误（占全部错误约一半）在控制模型
+    /// 后，`cli` 端点的失败率是 `ide` 的两个数量级以上，而 credential 与 proxy
+    /// 两个维度上看到的信号都只是它的下游投影——那张凭据恰好绑着 cli。
+    /// 少了这个维度，面板会把人引向「禁用某张凭据/某个代理」，而真正的杠杆在端点。
+    Endpoint,
 }
 
 impl CrosstabDimension {
@@ -138,15 +145,22 @@ impl CrosstabDimension {
             "credential" => Some(Self::Credential),
             "proxy" => Some(Self::Proxy),
             "model" => Some(Self::Model),
+            "endpoint" => Some(Self::Endpoint),
             _ => None,
         }
     }
+
+    /// 可接受取值，供 handler 拼错误消息用。
+    /// 单独抽出来是为了新增维度时不会漏改那条 400 文案（漏改的话，
+    /// 用户会被告知一个已经支持的维度不被支持）。
+    pub const ALL: [&'static str; 4] = ["credential", "proxy", "model", "endpoint"];
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Credential => "credential",
             Self::Proxy => "proxy",
             Self::Model => "model",
+            Self::Endpoint => "endpoint",
         }
     }
 }
@@ -435,16 +449,16 @@ impl OpsStore {
         let cutoff = Self::window_cutoff(hours);
         let conn = self.conn.lock();
 
-        // 维度取值表达式。proxy 需要关联最后一跳；另两个直接取 traces 列。
+        // 最后一跳的关联。proxy 与 endpoint 都只存在于 trace_attempts 上，
+        // 共用这一段；credential 与 model 直接取 traces 列，不需要 join。
+        const LAST_HOP_JOIN: &str = " JOIN trace_attempts a ON a.trace_id = t.trace_id \
+             AND a.attempt = (SELECT MAX(a2.attempt) FROM trace_attempts a2 \
+                              WHERE a2.trace_id = t.trace_id)";
         let (key_expr, join) = match dim {
             CrosstabDimension::Credential => ("CAST(t.final_credential_id AS TEXT)", ""),
             CrosstabDimension::Model => ("t.model", ""),
-            CrosstabDimension::Proxy => (
-                "COALESCE(a.proxy_url, '')",
-                " JOIN trace_attempts a ON a.trace_id = t.trace_id \
-                  AND a.attempt = (SELECT MAX(a2.attempt) FROM trace_attempts a2 \
-                                   WHERE a2.trace_id = t.trace_id)",
-            ),
+            CrosstabDimension::Proxy => ("COALESCE(a.proxy_url, '')", LAST_HOP_JOIN),
+            CrosstabDimension::Endpoint => ("COALESCE(a.endpoint, '')", LAST_HOP_JOIN),
         };
         let sql = format!(
             "SELECT t.error_type, {key} AS k, COUNT(*) AS c \
@@ -994,13 +1008,26 @@ mod tests {
         credential_id: u64,
         proxy_url: Option<&str>,
     ) {
+        insert_attempt_on(store, trace_id, outcome, credential_id, proxy_url, "ide");
+    }
+
+    /// 可指定端点的变体。真实库里目前只有 `ide` 一个端点，端点维度的行为
+    /// 无法用真实数据覆盖，只能在测试里构造多端点场景。
+    fn insert_attempt_on(
+        store: &OpsStore,
+        trace_id: &str,
+        outcome: &str,
+        credential_id: u64,
+        proxy_url: Option<&str>,
+        endpoint: &str,
+    ) {
         store
             .conn
             .lock()
             .execute(
                 "INSERT INTO trace_attempts (trace_id, attempt, credential_id, endpoint, \
-                 outcome, duration_ms, proxy_url) VALUES (?1, 0, ?2, 'ide', ?3, 100, ?4)",
-                rusqlite::params![trace_id, credential_id as i64, outcome, proxy_url],
+                 outcome, duration_ms, proxy_url) VALUES (?1, 0, ?2, ?3, ?4, 100, ?5)",
+                rusqlite::params![trace_id, credential_id as i64, endpoint, outcome, proxy_url],
             )
             .unwrap();
     }
@@ -1139,6 +1166,67 @@ mod tests {
             conc.concentration > spread.concentration,
             "集中度必须能把两种形态分开，否则这张表没有意义"
         );
+    }
+
+    /// endpoint 维度：错误集中在某个端点时必须能被区分出来。
+    ///
+    /// 这个维度在当前生产数据上没有区分力（实测 `trace_attempts.endpoint` 只有
+    /// `ide` 与空串两个取值，全部 transient 错误都在 ide 上、lift 恰为 1.00），
+    /// 所以行为只能靠构造数据覆盖 —— 这也正是加测试而非依赖线上观察的理由。
+    #[test]
+    fn crosstab_endpoint_dimension_separates_endpoints() {
+        let store = mem_store_with_traces();
+        // cli 端点：3 条 transient（少量流量、全是错）
+        for i in 0..3 {
+            let id = format!("cli{}", i);
+            insert_trace(&store, &id, 60, "error", Some("transient"), 1, 100);
+            insert_attempt_on(&store, &id, "transient", 1, None, "cli");
+        }
+        // ide 端点：1 条 transient + 6 条成功
+        insert_trace(&store, "ide-err", 60, "error", Some("transient"), 1, 100);
+        insert_attempt_on(&store, "ide-err", "transient", 1, None, "ide");
+        for i in 0..6 {
+            let id = format!("ide-ok{}", i);
+            insert_trace(&store, &id, 60, "success", None, 1, 100);
+            insert_attempt_on(&store, &id, "success", 1, None, "ide");
+        }
+
+        let rows = store.error_crosstab(24, CrosstabDimension::Endpoint);
+        let tr = rows
+            .iter()
+            .find(|r| r.error_type == "transient")
+            .expect("应有 transient 行");
+        assert_eq!(tr.total, 4);
+
+        let cli = tr.buckets.iter().find(|b| b.key == "cli").unwrap();
+        let ide = tr.buckets.iter().find(|b| b.key == "ide").unwrap();
+        assert_eq!(cli.traffic, 3, "cli 端点流量只有那 3 条");
+        assert_eq!(ide.traffic, 7, "ide 端点流量含成功的 6 条");
+        // cli：错误份额 3/4=75%，流量份额 3/10=30% → lift 2.5
+        let cli_lift = cli.lift.unwrap();
+        assert!(
+            (cli_lift - 2.5).abs() < 1e-9,
+            "cli lift 应为 2.5，实际 {}",
+            cli_lift
+        );
+        assert!(
+            cli_lift > ide.lift.unwrap(),
+            "错误集中的端点 lift 必须高于另一端点"
+        );
+    }
+
+    /// 端点为空串（请求未走到上游、没有端点可记）时不能崩、也不能被当成一个
+    /// 正常端点混进排名。实测生产库里这类行有 72 条，全部属于凭据 0。
+    #[test]
+    fn crosstab_endpoint_handles_empty_endpoint() {
+        let store = mem_store_with_traces();
+        insert_trace(&store, "noep", 60, "error", Some("unknown"), 0, 100);
+        insert_attempt_on(&store, "noep", "unknown", 0, None, "");
+
+        let rows = store.error_crosstab(24, CrosstabDimension::Endpoint);
+        let unk = rows.iter().find(|r| r.error_type == "unknown").unwrap();
+        assert_eq!(unk.buckets[0].key, "", "空端点保持空串，由前端决定如何展示");
+        assert_eq!(unk.total, 1);
     }
 
     /// lift 存在的理由必须可执行验证：流量分布不均时，裸集中度会把"承载最多的

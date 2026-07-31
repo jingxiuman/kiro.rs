@@ -643,7 +643,7 @@ export interface DurationPercentiles {
 }
 
 /** 交叉表维度 */
-export type CrosstabDimension = 'credential' | 'proxy' | 'model'
+export type CrosstabDimension = 'credential' | 'proxy' | 'model' | 'endpoint'
 
 /** 交叉表里的一个维度桶 */
 export interface CrosstabBucket {

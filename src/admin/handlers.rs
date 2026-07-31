@@ -1849,7 +1849,12 @@ pub async fn ops_error_crosstab(
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "credential".to_string());
     let Some(dim) = super::ops::CrosstabDimension::parse(&dim_str) else {
-        return stats_bad_request("dim 必须是 credential / proxy / model 之一".to_string());
+        // 文案从 ALL 生成而非硬编码：新增维度时漏改这里，用户会被告知一个
+        // 其实已经支持的维度不被支持
+        return stats_bad_request(format!(
+            "dim 必须是 {} 之一",
+            super::ops::CrosstabDimension::ALL.join(" / ")
+        ));
     };
     let rows = ops.events().error_crosstab(parse_ops_hours(&params), dim);
     // credential 维度补 email，否则前端只能显示裸 id
