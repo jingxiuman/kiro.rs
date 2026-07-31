@@ -620,6 +620,32 @@ fn available_models() -> Vec<Model> {
     crate::anthropic::model_registry::current_registry().exposed_models()
 }
 
+/// 按组支持集过滤 /v1/models 输出。
+/// `allowed` 为 upstream id 集合;exposed id 先经注册表 resolve 再比对。
+/// `auto` 恒保留;解析失败的行保留(保守,不因视图层吞行)。
+fn filter_models_by_group(
+    models: Vec<Model>,
+    allowed: &std::collections::HashSet<String>,
+) -> Vec<Model> {
+    use crate::anthropic::model_registry::{current_registry, Resolution};
+    let registry = current_registry();
+    models
+        .into_iter()
+        .filter(|m| {
+            if m.id == "auto" {
+                return true;
+            }
+            match registry.resolve(&m.id, false) {
+                Resolution::Mapped { upstream_id, .. }
+                | Resolution::Passthrough { upstream_id, .. } => {
+                    upstream_id == "auto" || allowed.contains(&upstream_id)
+                }
+                _ => true,
+            }
+        })
+        .collect()
+}
+
 /// 请求转换失败 → 对客户端的 HTTP 响应（anthropic 路由，中文文案）。
 ///
 /// **抽出来的唯一目的是可测**：`post_messages` 与 `post_messages_cc` 原先各内联
@@ -651,10 +677,20 @@ pub(crate) fn conversion_error_response(e: &ConversionError) -> (StatusCode, Jso
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+pub async fn get_models(
+    State(state): State<AppState>,
+    Extension(key_ctx): Extension<KeyContext>,
+) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = available_models();
+    let mut models = available_models();
+    if let Some(provider) = &state.kiro_provider
+        && let Some(allowed) = provider
+            .token_manager()
+            .group_supported_models(key_ctx.group.as_deref())
+    {
+        models = filter_models_by_group(models, &allowed);
+    }
 
     Json(ModelsResponse {
         object: "list".to_string(),
@@ -2394,6 +2430,32 @@ mod tests {
         assert!(unlisted_still_resolves, "listed=false 只影响列表，不影响解析");
     }
 
+    /// `/v1/models` 按调用 key 的凭据组收窄：`allowed` 之外的 upstream id 应被过滤掉，
+    /// `auto` 恒保留。
+    #[test]
+    fn models_list_narrowed_by_group_support_set() {
+        let registry = crate::anthropic::model_registry::current_registry();
+        let models = registry.exposed_models();
+        assert!(!models.is_empty(), "内置注册表不应为空");
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("claude-opus-5".to_string());
+        let filtered = filter_models_by_group(models.clone(), &allowed);
+        for m in &filtered {
+            if m.id == "auto" {
+                continue;
+            }
+            let upstream = match registry.resolve(&m.id, false) {
+                crate::anthropic::model_registry::Resolution::Mapped { upstream_id, .. }
+                | crate::anthropic::model_registry::Resolution::Passthrough { upstream_id, .. } => {
+                    upstream_id
+                }
+                _ => panic!("exposed 模型必可解析: {}", m.id),
+            };
+            assert_eq!(upstream, "claude-opus-5", "过滤后只应剩 allowed 内的模型: {}", m.id);
+        }
+        assert!(filtered.len() < models.len(), "应有收窄效果");
+    }
+
     /// `GET /v1/models` 的**响应报文**必须由注册表行逐字段派生。
     ///
     /// 单测 `exposed_models()` 断言的是 Vec<Model>，覆盖不到序列化这一层：
@@ -2420,7 +2482,13 @@ mod tests {
         }
         install_registry(r);
 
-        let resp = get_models().await.into_response();
+        let state = AppState::new(false, crate::model::config::ToolCompatibilityMode::default());
+        let key_ctx = KeyContext {
+            key_id: 0,
+            group: None,
+            key_source: crate::admin::trace_db::TraceKeySource::MasterApiKey,
+        };
+        let resp = get_models(State(state), Extension(key_ctx)).await.into_response();
         let status = resp.status();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
