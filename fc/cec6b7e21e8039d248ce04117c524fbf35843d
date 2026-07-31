@@ -1,0 +1,20 @@
+src/anthropic/model_sync.rs
+  s_ef0bb9ae6ef7d6::t_b90f6a36051ca0 330-359
+  s_ef0bb9ae6ef7d6::t_f7f3ed77325288 1827-1871
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "fccec6b7e21e8039d248ce04117c524fbf35843d",
+  "prompts": {},
+  "sessions": {
+    "s_ef0bb9ae6ef7d6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a07a60d2-98eb-43ff-aaf2-a572fbea1917",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
