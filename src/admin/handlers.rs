@@ -1897,6 +1897,37 @@ pub async fn ops_error_crosstab(
     Json(serde_json::json!({ "dimension": dim_str, "rows": enriched })).into_response()
 }
 
+/// GET /api/admin/ops/error-fingerprints?hours=24&limit=50
+///
+/// 错误消息按归一化指纹归并。`error_type` 只有十几种取值，看不出「一个上游错误
+/// 刷了几百次」与「几百个互不相同的错误」的区别，而两者处置动作相反。
+/// `samples` 里的原始消息是校验归一化没把不同根因误并的唯一途径，前端必须展示。
+pub async fn ops_error_fingerprints(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let Some(ops) = state.service.ops() else {
+        return ops_unavailable();
+    };
+    // limit 显式校验而非 clamp：越界大多是调用方拼错了参数，静默改值会让人
+    // 以为拿到的是自己要的窗口
+    let limit = match params.get("limit").map(|s| s.trim()) {
+        None | Some("") => 50usize,
+        Some(s) => match s.parse::<usize>() {
+            Ok(v) if (1..=super::ops::MAX_FINGERPRINT_LIMIT).contains(&v) => v,
+            _ => {
+                return stats_bad_request(format!(
+                    "limit 必须是 1..={} 的整数",
+                    super::ops::MAX_FINGERPRINT_LIMIT
+                ));
+            }
+        },
+    };
+    let hours = parse_ops_hours(&params);
+    let rows = ops.events().error_fingerprints(hours, limit);
+    Json(serde_json::json!({ "windowHours": hours, "rows": rows })).into_response()
+}
+
 /// GET /api/admin/ops/trend?hours=24
 /// 按小时的请求/错误/中断趋势
 pub async fn ops_trend(

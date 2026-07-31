@@ -29,6 +29,17 @@ const MAX_WINDOW_HOURS: i64 = 24 * 31;
 /// 交叉表每个 error_type 最多回多少个维度桶。
 /// 判断"是否集中"只需要看头部几个，全量回传对结论无增益。
 const CROSSTAB_TOP_BUCKETS: usize = 6;
+/// 错误指纹模板的最大长度（字符）。
+///
+/// 上游 500 会把整个 JSON body 拼进消息，不截断的话模板本身就是几百字符的
+/// 唯一串，归并率归零。110 是实测取值：足够放下 `{"message":"…"}` 里区分
+/// 根因的那句话（如 `unexpectedly high load` vs `an unexpected error`），
+/// 又短到能把后面的 `reason` 字段等尾部差异切掉。
+const FINGERPRINT_MAX_CHARS: usize = 110;
+/// 每个指纹保留的原始样本条数上限
+const FINGERPRINT_SAMPLES: usize = 2;
+/// 指纹接口的 limit 上限
+pub const MAX_FINGERPRINT_LIMIT: usize = 200;
 
 /// 处置事件分类
 pub mod event_category {
@@ -124,6 +135,237 @@ fn percentiles(mut v: Vec<u64>) -> Option<DurationPercentiles> {
     })
 }
 
+/// 把一条自由文本错误消息归一化成 `(HTTP 状态码, 指纹模板)`。
+///
+/// 纯函数，不碰数据库 —— 归一化规则的对错只能靠样例验证，能单测是硬要求。
+///
+/// 全部规则按此顺序生效，顺序本身承载语义：
+/// 1. 空白折叠：504 的 HTML body 里有换行，不折叠会让同一模板出现多种写法。
+/// 2. 砍掉 ` <- ` 之后的 reqwest 因果链。同一根因有时带链有时不带（取决于
+///    错误在哪一层被捕获），不砍就会分裂成两类。
+/// 3. 剥掉 reqwest 的 kind 标签（`[decode]` / `[timeout+decode]`）。它是分类
+///    元信息而非消息内容，留着会让同源错误按标签再分裂一次。**代价**：
+///    `timeout+decode` 与纯 `decode` 会被并进同一指纹，两者修法其实不同 ——
+///    这一维差异只能从 `samples` 里的原始消息看回来。
+/// 4. 提取状态码并换成 `<status>` 占位。必须早于第 6 步，否则状态码会被
+///    当成普通数字抹平，`500 Internal Server Error` 和 `400 Bad Request`
+///    就并成一类了，而它俩是必须分开的两件事。
+/// 5. URL 只留到 path，砍掉 query。当前样本里的 URL 本身是稳定的，这条是
+///    防御性规则（上游一旦带上时间戳/请求 id 参数，指纹会立刻爆炸）。
+/// 6. 长 id 收敛成 `<id>`：`toolu_bdrk_013iHieazSJUr5RHg31UftAr` 这类 token
+///    每次调用都不同。判据是「≥12 字符且数字 ≥4 个」，刻意排除 `us-east-1`、
+///    `claude-opus-5` 这类含少量数字的稳定标识 —— 它们整体被抹成 `<id>` 会
+///    直接丢掉可读性，而下一条只动其中的数字，模板仍认得出是什么。
+/// 7. 余下数字一律换 `N`：覆盖 `（8/1）`→`（N/N）`、`bytes=26719`、
+///    `idle_ms=9086` 等计数/时长。**代价**：区号/版本号也在内 ——
+///    `us-east-1`→`us-east-N`、`claude-opus-5` 与 `-4` 会同模板。可接受的理由是
+///    模型与地域维度另有 [`OpsStore::error_crosstab`] 可看，指纹这一维不重复承担。
+/// 8. 截断到 [`FINGERPRINT_MAX_CHARS`]，防超长 JSON body 把指纹撑成唯一串。
+pub fn normalize_error_message(raw: &str) -> (Option<u16>, String) {
+    // 1. 空白折叠
+    let mut s: String = {
+        let mut out = String::with_capacity(raw.len());
+        let mut in_ws = false;
+        for ch in raw.trim().chars() {
+            if ch.is_whitespace() {
+                in_ws = true;
+            } else {
+                if in_ws && !out.is_empty() {
+                    out.push(' ');
+                }
+                in_ws = false;
+                out.push(ch);
+            }
+        }
+        out
+    };
+    // 2. 砍因果链
+    if let Some(idx) = s.find(" <- ") {
+        s.truncate(idx);
+    }
+    // 3. kind 标签（形如 ` [timeout+decode]`）**保留不剥**。
+    //
+    // 它由 describe_reqwest_error 从固定谓词集生成，携带这类错误里最关键的归因
+    // 区分：`[timeout+decode]` = 本地超时掐死了流（我们的配置杀了健康流），
+    // `[decode]` = 上游断了。两者处置动作相反。
+    //
+    // 实测代价：剥掉会把 9 条裸消息 + 6 条 `[decode]` + 3 条 `[timeout+decode]`
+    // 并成同一个指纹（共 18 条），把最该分开的三种情况混成一条。
+    // 标签基数有界（谓词集固定），保留它不会让指纹数爆炸。
+    // 4. 提状态码
+    let (status, s) = extract_http_status(&s);
+    // 5. URL 去 query
+    let s = strip_url_queries(&s);
+    // 6~7. 逐 token 归一化
+    let mut out = String::with_capacity(s.len());
+    for token in split_keep_delims(&s) {
+        match token {
+            Token::Delim(d) => out.push(d),
+            Token::Word(w) => out.push_str(&normalize_token(w)),
+        }
+    }
+    // 8. 截断
+    let mut fingerprint = String::new();
+    for (i, ch) in out.chars().enumerate() {
+        if i >= FINGERPRINT_MAX_CHARS {
+            fingerprint.push('…');
+            break;
+        }
+        fingerprint.push(ch);
+    }
+    (status, fingerprint)
+}
+
+/// 剥掉紧跟顶层消息的 reqwest kind 标签（形如 ` [timeout+decode]`）。
+///
+/// **归一化流程刻意不用它** —— 见 [`normalize_error_message`] 第 3 步的说明。
+/// 保留这个函数是因为它单独测试过、且未来若出现基数失控的标签仍可启用。
+#[allow(dead_code)]
+fn strip_kind_tag(s: &str) -> String {
+    let Some(open) = s.find(" [") else {
+        return s.to_string();
+    };
+    let rest = &s[open + 2..];
+    let Some(close) = rest.find(']') else {
+        return s.to_string();
+    };
+    let inner = &rest[..close];
+    let looks_like_tag = !inner.is_empty()
+        && inner.len() <= 30
+        && inner
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '+' || c == '_');
+    if !looks_like_tag {
+        return s.to_string();
+    }
+    let mut out = s[..open].to_string();
+    out.push_str(&rest[close + 1..]);
+    out
+}
+
+/// 从消息里摘出 HTTP 状态码，并把它换成 `<status>` 占位。
+///
+/// 只认「独立的 3 位数字（100..=599），且后面紧跟以大写字母开头的原因短语」
+/// 这一形态。宽松匹配任意 3 位数会把 `idle_ms=218`、`bytes=26719` 里的片段
+/// 当成状态码 —— 那比不提取更糟，会造出假的状态码维度。
+fn extract_http_status(s: &str) -> (Option<u16>, String) {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i + 3 <= bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        // 数字串必须恰好 3 位，且左边界不是字母/数字/`.`/`=`/`/`
+        let start = i;
+        let mut end = i;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        let left_ok = start == 0 || {
+            let p = bytes[start - 1];
+            !(p as char).is_ascii_alphanumeric() && !matches!(p, b'.' | b'=' | b'/' | b'_' | b'-')
+        };
+        if end - start == 3 && left_ok {
+            let code: u16 = s[start..end].parse().unwrap_or(0);
+            // 右边必须是空格 + 大写字母开头的原因短语（`500 Internal Server Error`）
+            let reason_ok = s[end..]
+                .strip_prefix(' ')
+                .and_then(|r| r.chars().next())
+                .is_some_and(|c| c.is_ascii_uppercase());
+            if (100..=599).contains(&code) && reason_ok {
+                let mut out = String::with_capacity(s.len());
+                out.push_str(&s[..start]);
+                out.push_str("<status>");
+                out.push_str(&s[end..]);
+                return (Some(code), out);
+            }
+        }
+        i = end.max(start + 1);
+    }
+    (None, s.to_string())
+}
+
+/// 把消息里每个 URL 截到 path，丢掉 `?` 之后的 query。
+///
+/// query 里常带请求 id / 时间戳，是指纹爆炸的经典来源。当前样本的 URL 恰好
+/// 不带 query，所以这条规则在生产数据上是空操作 —— 保留它是因为上游一变就来不及。
+fn strip_url_queries(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find("://") {
+        // scheme://host/path 的结束边界：空白或右括号
+        let after = &rest[pos + 3..];
+        let url_end = after
+            .find(|c: char| c.is_whitespace() || c == ')' || c == '"')
+            .unwrap_or(after.len());
+        let url = &after[..url_end];
+        out.push_str(&rest[..pos + 3]);
+        match url.find('?') {
+            Some(q) => out.push_str(&url[..q]),
+            None => out.push_str(url),
+        }
+        rest = &after[url_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 分词结果：word 参与归一化，delim 原样保留（保留标点才看得出模板结构）
+enum Token<'a> {
+    Word(&'a str),
+    Delim(char),
+}
+
+/// 按「非字母数字下划线」切分，同时保留分隔符本身。
+///
+/// 不把 `-` 算进 word：否则 `us-east-1`、`claude-opus-5` 会被当成一个长 token，
+/// 撞上 [`normalize_token`] 的长 id 规则被整体抹成 `<id>`，丢掉可读性。
+fn split_keep_delims(s: &str) -> Vec<Token<'_>> {
+    let mut out = Vec::new();
+    let mut word_start: Option<usize> = None;
+    for (idx, ch) in s.char_indices() {
+        if ch.is_alphanumeric() || ch == '_' {
+            word_start.get_or_insert(idx);
+        } else {
+            if let Some(st) = word_start.take() {
+                out.push(Token::Word(&s[st..idx]));
+            }
+            out.push(Token::Delim(ch));
+        }
+    }
+    if let Some(st) = word_start.take() {
+        out.push(Token::Word(&s[st..]));
+    }
+    out
+}
+
+/// 单 token 归一化：长随机 id → `<id>`，其余数字 → `N`（连续数字折叠成一个 `N`）
+fn normalize_token(w: &str) -> String {
+    let digits = w.chars().filter(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return w.to_string();
+    }
+    let has_alpha = w.chars().any(|c| c.is_alphabetic());
+    if has_alpha && w.chars().count() >= 12 && digits >= 4 {
+        return "<id>".to_string();
+    }
+    let mut out = String::with_capacity(w.len());
+    let mut prev_digit = false;
+    for ch in w.chars() {
+        if ch.is_ascii_digit() {
+            if !prev_digit {
+                out.push('N');
+            }
+            prev_digit = true;
+        } else {
+            prev_digit = false;
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// 交叉表的维度
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrosstabDimension {
@@ -206,6 +448,39 @@ pub struct CrosstabRow {
     pub concentration: f64,
     /// 该 error_type 覆盖到的不同维度取值数，用来判断 concentration 的分母量级
     pub distinct_keys: u64,
+}
+
+/// 一类归一化后的错误消息（指纹）
+///
+/// 为什么需要它：`error_type` 只有十几种取值，`error_message` 却是自由文本，
+/// 面板上「同一个上游错误重复 400 次」与「400 个各不相同的错误」长得一样，
+/// 而两者的处置动作相反（等上游恢复 vs 逐条排查）。实测 7 天窗口内 201 条
+/// 非空消息只对应 15 个不同取值（13:1），归并后头部两三条就解释了大半错误量。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorFingerprint {
+    /// 归一化后的模板
+    pub fingerprint: String,
+    /// 从消息里提取出的 HTTP 状态码。
+    ///
+    /// 提取成独立字段而不是留在模板里，是为了让它先于数字归一化被摘走 ——
+    /// 否则 `500 Internal Server Error` 与 `400 Bad Request` 会被并成一类，
+    /// 而状态码恰是这类消息里最有区分度的一维。
+    pub http_status: Option<u16>,
+    pub count: u64,
+    /// 1~2 条**原始未归一化**消息。
+    ///
+    /// 归一化规则出错时（把两个不同根因误并成一类），这是唯一能发现问题的途径：
+    /// 只看模板永远看不出它盖住了什么。不可省略。
+    pub samples: Vec<String>,
+    /// 首末出现时间（RFC3339），用来区分「历史遗留」与「正在发生」
+    pub first_seen: String,
+    pub last_seen: String,
+    /// 映射到该指纹的 error_type 列表。
+    ///
+    /// 长度 > 1 说明同一句消息被归到了不同 error_type —— 分类逻辑与消息内容
+    /// 存在歧义，值得暴露而不是隐藏。
+    pub error_types: Vec<String>,
 }
 
 /// 按小时的请求趋势点
@@ -580,6 +855,88 @@ impl OpsStore {
             }
         }
         out.sort_by_key(|row| std::cmp::Reverse(row.total));
+        out
+    }
+
+    /// 错误消息按指纹归并，降序。
+    ///
+    /// 回答 [`Self::error_crosstab`] 答不出的那一问：同一个 `error_type` 里，
+    /// 到底是一个上游错误刷了几百次，还是几百个互不相同的错误。前者等上游恢复，
+    /// 后者要逐条排查 —— 不归并的话面板上这两种情况完全同形。
+    ///
+    /// 归并在 Rust 侧做而不是 SQL：归一化要按顺序做状态码提取、因果链截断、
+    /// token 级数字抹平，SQLite 没有正则，拼 `REPLACE` 既读不懂也测不了。
+    /// 窗口内消息量在千级以下，全取回内存聚合的代价可以忽略。
+    pub fn error_fingerprints(&self, hours: i64, limit: usize) -> Vec<ErrorFingerprint> {
+        let cutoff = Self::window_cutoff(hours);
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT error_message, COALESCE(error_type, ''), ts_epoch FROM traces \
+             WHERE ts_epoch >= ?1 AND error_message IS NOT NULL AND error_message <> '' \
+             ORDER BY ts_epoch ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("ops 错误指纹查询失败: {}", e);
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map([cutoff], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("ops 错误指纹查询失败: {}", e);
+                return Vec::new();
+            }
+        };
+
+        // key = (状态码, 模板)。状态码进 key 是关键：同一模板不同状态码必须分开。
+        let mut acc: std::collections::HashMap<(Option<u16>, String), ErrorFingerprint> =
+            std::collections::HashMap::new();
+        for (message, error_type, ts_epoch) in rows.flatten() {
+            let (http_status, fingerprint) = normalize_error_message(&message);
+            let ts = chrono::DateTime::<Utc>::from_timestamp(ts_epoch, 0)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default();
+            let entry = acc
+                .entry((http_status, fingerprint.clone()))
+                .or_insert_with(|| ErrorFingerprint {
+                    fingerprint,
+                    http_status,
+                    count: 0,
+                    samples: Vec::new(),
+                    // SQL 已按 ts 升序，首条即 first_seen
+                    first_seen: ts.clone(),
+                    last_seen: ts.clone(),
+                    error_types: Vec::new(),
+                });
+            entry.count += 1;
+            entry.last_seen = ts;
+            // 样本取**互不相同**的原始串：两条一样的样本无法暴露误并
+            if entry.samples.len() < FINGERPRINT_SAMPLES && !entry.samples.contains(&message) {
+                entry.samples.push(message);
+            }
+            if !error_type.is_empty() && !entry.error_types.contains(&error_type) {
+                entry.error_types.push(error_type);
+            }
+        }
+
+        let mut out: Vec<ErrorFingerprint> = acc.into_values().collect();
+        for row in &mut out {
+            row.error_types.sort();
+        }
+        // count 相同时按 fingerprint 定序，保证输出稳定（HashMap 遍历序不定）
+        out.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.fingerprint.cmp(&b.fingerprint))
+        });
+        out.truncate(limit);
         out
     }
 
@@ -1598,5 +1955,243 @@ mod tests {
         let row = rows.iter().find(|r| r.phase == "streaming").unwrap();
         assert_eq!(row.failed, 0, "客户端断开不是故障，不得计入失败率");
         assert_eq!(row.total, 1, "但仍计入总数");
+    }
+
+    // ===== 错误消息指纹 =====
+
+    /// 真实样本（取自生产库 7 天窗口），测试直接用原串，避免手编的消息
+    /// 掩盖真实模式。
+    const MSG_HIGH_LOAD: &str = "流式 API 请求失败: 500 Internal Server Error {\"message\":\"Encountered unexpectedly high load when processing the request, please try again.\",\"reason\":\"MODEL_TEMPORARILY_UNAVAILABLE\"}";
+    const MSG_UNEXPECTED: &str = "流式 API 请求失败: 500 Internal Server Error {\"message\":\"Encountered an unexpected error when processing the request, please try again.\",\"reason\":null}";
+    const MSG_BAD_MODEL: &str = "流式 API 请求失败: 400 Bad Request {\"message\":\"Invalid model ID. Please select a different model to continue.\",\"reason\":\"INVALID_MODEL_ID\"}";
+    const MSG_DECODE_BARE: &str = "error decoding response body";
+    const MSG_DECODE_CHAINED: &str = "error decoding response body [decode] <- request or response body error <- error reading a body from connection <- stream error received: unexpected internal error encountered";
+
+    fn insert_trace_with_message(
+        store: &OpsStore,
+        trace_id: &str,
+        epoch_offset_secs: i64,
+        error_type: &str,
+        error_message: &str,
+    ) {
+        let epoch = Utc::now().timestamp() - epoch_offset_secs;
+        store
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, is_stream, \
+                 final_status, final_credential_id, error_type, error_message, total_attempts, \
+                 duration_ms) VALUES (?1, '2026', ?2, 1, 'clientKey', 'm', 1, 'error', 1, ?3, ?4, 1, 500)",
+                rusqlite::params![trace_id, epoch, error_type, error_message],
+            )
+            .unwrap();
+    }
+
+    /// 防过度归一化的守卫。两条消息都是 500、前缀完全一致，只在 JSON body 里
+    /// 分叉：`unexpectedly high load`（上游过载，等它恢复）vs
+    /// `an unexpected error`（上游内部错误，要报 case）。根因与处置都不同，
+    /// 一旦被并成一类，面板就会把两件事报成一件 —— 这是本模块最容易犯且
+    /// 最难发现的错误，故单列一个测试钉死。
+    #[test]
+    fn two_distinct_500s_must_not_merge() {
+        let (s1, f1) = normalize_error_message(MSG_HIGH_LOAD);
+        let (s2, f2) = normalize_error_message(MSG_UNEXPECTED);
+        assert_eq!(s1, Some(500));
+        assert_eq!(s2, Some(500));
+        assert_ne!(f1, f2, "两种 500 根因不同，指纹不得相同");
+        // 截断长度必须留够到分叉点，否则上面的 assert_ne 会因为都被截在
+        // 公共前缀里而失效 —— 这里显式验证分叉词进了模板
+        assert!(f1.contains("high load"), "过载特征词应在模板内: {f1}");
+        assert!(
+            f2.contains("unexpected error"),
+            "内部错误特征词应在模板内: {f2}"
+        );
+    }
+
+    /// 状态码必须先摘成独立字段再抹数字。若顺序反了，`500 Internal Server Error`
+    /// 与 `400 Bad Request` 的数字都变成 `N`，两者只剩原因短语可区分，而更长的
+    /// JSON body 一截断就可能同模板。
+    #[test]
+    fn http_status_extracted_before_digit_normalization() {
+        let (s500, f500) = normalize_error_message(MSG_HIGH_LOAD);
+        let (s400, f400) = normalize_error_message(MSG_BAD_MODEL);
+        assert_eq!(s500, Some(500));
+        assert_eq!(s400, Some(400));
+        assert!(!f500.contains("500"), "状态码应被占位替换: {f500}");
+        assert!(f500.contains("<status>"));
+        assert_ne!(f500, f400);
+    }
+
+    /// 计数/时长里的三位数不是状态码。宽松匹配任意三位数会给
+    /// `idle_ms=218` 造出一个假的 218 状态码，凭空多出一维错误分类。
+    #[test]
+    fn three_digit_counters_are_not_mistaken_for_status() {
+        let (status, fp) = normalize_error_message("client_gone=true bytes=26719 idle_ms=218");
+        assert_eq!(status, None, "计数里的三位数不得被当成状态码");
+        assert_eq!(fp, "client_gone=true bytes=N idle_ms=N");
+    }
+
+    /// 同一根因有时带 reqwest 因果链有时不带（取决于在哪一层被捕获）。
+    /// 不砍链就分裂成两类，头部排序被稀释。
+    #[test]
+    fn causal_chain_stripped_but_kind_tag_kept() {
+        // 因果链（`<- ` 之后）剥掉：它是同一根因的下游转述，保留会让每种链条
+        // 组合各成一个指纹。
+        let (_, bare) = normalize_error_message(MSG_DECODE_BARE);
+        assert_eq!(bare, "error decoding response body");
+        let (_, chained) = normalize_error_message(MSG_DECODE_CHAINED);
+        assert!(
+            !chained.contains(" <- "),
+            "因果链应被剥掉: {chained}"
+        );
+
+        // 但 kind 标签必须留住。`[timeout+decode]` = 本地超时掐死了一条健康流
+        // （我们的配置造成的），`[decode]` = 上游断了。两者处置动作相反：
+        // 前者要调 streamIdleTimeoutSecs，后者只能等上游。
+        // http_client.rs 里 describe_reqwest_error 的注释就明确写了这个用途。
+        let (_, timeout) = normalize_error_message(
+            "error decoding response body [timeout+decode] <- request or response body error <- operation timed out",
+        );
+        assert!(
+            timeout.contains("timeout"),
+            "本地超时的标签必须留在指纹里: {timeout}"
+        );
+        assert_ne!(
+            timeout, chained,
+            "本地超时与上游断流不得并成一类——这是这类错误里最重要的归因区分"
+        );
+        assert_ne!(timeout, bare, "带超时标签的与裸消息不得并成一类");
+    }
+
+    /// 括号内的日期/计数归一化：`（8/1）`与`（9/1）`是同一条「凭据全禁用」告警，
+    /// 分开看会让它在头部排序里被拆成两条。全角括号必须与半角同样处理。
+    #[test]
+    fn digits_in_brackets_normalized() {
+        let (_, a) = normalize_error_message("所有凭据均已禁用（8/1）");
+        let (_, b) = normalize_error_message("所有凭据均已禁用（9/1）");
+        assert_eq!(a, b);
+        assert_eq!(a, "所有凭据均已禁用（N/N）");
+    }
+
+    /// 长随机 id 每次调用都不同，不收敛的话每条都是独立指纹。
+    /// 同时验证不误伤 `claude-opus-5` / `us-east-1` 这类含少量数字的稳定标识。
+    #[test]
+    fn random_ids_collapse_but_stable_identifiers_survive() {
+        let (_, fp) = normalize_error_message(
+            "Upstream ended before completing tool_use toolu_bdrk_013iHieazSJUr5RHg31UftAr (str_replace) JSON input; buffered 0 bytes.",
+        );
+        assert!(fp.contains("<id>"), "随机 tool id 应收敛: {fp}");
+        assert!(
+            fp.contains("str_replace"),
+            "工具名是有效区分维度，须保留: {fp}"
+        );
+        assert!(fp.contains("buffered N bytes"));
+
+        let (_, url) = normalize_error_message(
+            "error sending request for url (https://q.us-east-1.amazonaws.com/generateAssistantResponse)",
+        );
+        assert!(
+            url.contains("amazonaws.com/generateAssistantResponse"),
+            "稳定 URL 不得被抹成 <id>: {url}"
+        );
+    }
+
+    /// URL 的 query 是指纹爆炸的经典来源（请求 id / 时间戳）。
+    #[test]
+    fn url_query_stripped() {
+        let (_, a) = normalize_error_message("failed GET https://h.example.com/v1/chat?rid=abc111");
+        let (_, b) = normalize_error_message("failed GET https://h.example.com/v1/chat?rid=xyz999");
+        assert_eq!(a, b);
+        assert!(!a.contains('?'), "query 应被砍掉: {a}");
+    }
+
+    /// 超长 JSON body 不截断的话模板本身就是唯一串，归并率归零。
+    #[test]
+    fn long_message_truncated() {
+        let raw = format!("boom {}", "x".repeat(500));
+        let (_, fp) = normalize_error_message(&raw);
+        assert!(
+            fp.chars().count() <= FINGERPRINT_MAX_CHARS + 1,
+            "模板长度应受限，实际 {}",
+            fp.chars().count()
+        );
+        assert!(fp.ends_with('…'), "截断应有可见标记: {fp}");
+    }
+
+    /// 端到端：归并、计数降序、原始样本保留、时间窗过滤。
+    #[test]
+    fn fingerprints_aggregate_and_keep_raw_samples() {
+        let store = mem_store_with_traces();
+        for i in 0..5 {
+            insert_trace_with_message(&store, &format!("hl{i}"), 60, "transient", MSG_HIGH_LOAD);
+        }
+        for i in 0..2 {
+            insert_trace_with_message(&store, &format!("ue{i}"), 60, "transient", MSG_UNEXPECTED);
+        }
+        insert_trace_with_message(&store, "d0", 60, "stream_interrupted", MSG_DECODE_BARE);
+        insert_trace_with_message(&store, "d1", 60, "stream_interrupted", MSG_DECODE_CHAINED);
+        // 窗口外不计
+        insert_trace_with_message(&store, "old", 3600 * 48, "transient", MSG_HIGH_LOAD);
+
+        let rows = store.error_fingerprints(24, 50);
+        // 4 个指纹：两种 500 各一个，decode 裸消息与带 [decode] 标签的各一个。
+        // 后两者不合并是刻意的（标签携带归因信息，见 normalize_error_message
+        // 第 3 步）—— 这里正是钉住「不过度归并」的地方。
+        assert_eq!(rows.len(), 4, "5+2+1+1 条应归成 4 个指纹: {rows:#?}");
+        assert_eq!(rows[0].count, 5, "应按 count 降序");
+        assert_eq!(rows[0].http_status, Some(500));
+        // 样本必须是原始未归一化串，否则误并无从发现
+        assert_eq!(rows[0].samples[0], MSG_HIGH_LOAD);
+        assert!(!rows[0].samples[0].contains("<status>"));
+        assert!(!rows[0].first_seen.is_empty() && !rows[0].last_seen.is_empty());
+
+        let bare = rows
+            .iter()
+            .find(|r| r.fingerprint == "error decoding response body")
+            .expect("裸 decode 消息应自成一条");
+        assert_eq!(bare.count, 1);
+        assert_eq!(bare.http_status, None);
+
+        let tagged = rows
+            .iter()
+            .find(|r| r.fingerprint.contains("[decode]"))
+            .expect("带 [decode] 标签的应自成一条，标签不剥");
+        assert_eq!(tagged.count, 1);
+        // 样本是原始串，含因果链 —— 这才看得出模板盖住了什么
+        assert!(tagged.samples.iter().any(|s| s.contains("<- ")));
+    }
+
+    /// 同一句消息落到多个 error_type 时必须暴露出来：那说明分类逻辑与消息内容
+    /// 存在歧义（同样的上游回复被判成了不同类别），是分类规则的 bug 线索。
+    #[test]
+    fn fingerprint_exposes_ambiguous_error_types() {
+        let store = mem_store_with_traces();
+        insert_trace_with_message(&store, "a0", 60, "transient", MSG_HIGH_LOAD);
+        insert_trace_with_message(&store, "a1", 60, "upstream_error", MSG_HIGH_LOAD);
+
+        let rows = store.error_fingerprints(24, 50);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].error_types, vec!["transient", "upstream_error"]);
+    }
+
+    /// limit 生效且不影响归并（先归并再截断，不是先截断再归并）。
+    #[test]
+    fn fingerprint_limit_truncates_after_aggregation() {
+        let store = mem_store_with_traces();
+        insert_trace_with_message(&store, "x0", 60, "transient", MSG_HIGH_LOAD);
+        insert_trace_with_message(&store, "x1", 60, "transient", MSG_UNEXPECTED);
+        insert_trace_with_message(&store, "x2", 60, "bad_request", MSG_BAD_MODEL);
+
+        let rows = store.error_fingerprints(24, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 1);
+    }
+
+    /// 空消息与全空窗口不得 panic，返回空集
+    #[test]
+    fn fingerprints_empty_window() {
+        let store = mem_store_with_traces();
+        assert!(store.error_fingerprints(24, 50).is_empty());
+        assert_eq!(normalize_error_message(""), (None, String::new()));
     }
 }
