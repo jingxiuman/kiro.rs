@@ -1,0 +1,25 @@
+src/http_client.rs
+  s_bc8ad78a329158::t_172258160bbd9d 20-22
+  s_bc8ad78a329158::t_810576bda7eedc 107-108
+  s_bc8ad78a329158::t_954fae14e2d018 27,29-30
+  s_bc8ad78a329158::t_a1ce06e28575b6 11-19,23-24
+  s_bc8ad78a329158::t_c6513da3db8420 104-106
+  s_bc8ad78a329158::t_0f19c7290866ee 109
+  s_bc8ad78a329158::t_1db0ea55c1bd91 103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "e25ecff07b6bad2071ad5f85b9ce0f2a2a3af3d7",
+  "prompts": {},
+  "sessions": {
+    "s_bc8ad78a329158": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "70621769-080d-4f19-839e-8d260418aba7",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
