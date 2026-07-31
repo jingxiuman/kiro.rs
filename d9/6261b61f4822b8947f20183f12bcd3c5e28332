@@ -1,0 +1,25 @@
+src/admin/ops.rs
+  s_9a6f841432c23b::t_537dc708b6c46a 44-64,572-650,1262-1464,1753-1800,2298-2489
+  s_9a6f841432c23b::t_65e586b1b32d6a 2490
+src/admin/handlers.rs
+  s_9a6f841432c23b::t_537dc708b6c46a 1981-1992
+src/admin/router.rs
+  s_9a6f841432c23b::t_6ad16b6ffd2893 23-24
+  s_9a6f841432c23b::t_55a97e51069e60 187
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "d96261b61f4822b8947f20183f12bcd3c5e28332",
+  "prompts": {},
+  "sessions": {
+    "s_9a6f841432c23b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3288a3ad-dcfe-4a5a-9ece-c573fec8d0ee",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
