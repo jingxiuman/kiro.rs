@@ -1,0 +1,19 @@
+admin-ui/src/components/overview-page.tsx
+  s_bf49cd38d44a6f::t_ff34ab52bdfd9b 714
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "9c9bf1268941d071af746e9a61b74c6fe82f26f9",
+  "prompts": {},
+  "sessions": {
+    "s_bf49cd38d44a6f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45c8c472-c1df-44e8-a007-bd8c0bb56b50",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
