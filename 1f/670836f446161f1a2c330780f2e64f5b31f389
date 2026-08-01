@@ -1,0 +1,23 @@
+src/admin/usage_store.rs
+  s_76b817ce0732fe::t_9750b78c1cb586 22
+  s_76b817ce0732fe::t_0205c7557de73b 473
+  s_76b817ce0732fe::t_54e2379fd245d1 1-21,23-472,474-782
+src/admin/mod.rs
+  s_76b817ce0732fe::t_55cb13453ead2e 31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "1f670836f446161f1a2c330780f2e64f5b31f389",
+  "prompts": {},
+  "sessions": {
+    "s_76b817ce0732fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8aad5c8-70ec-4c41-a43f-97434e44adf2",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
