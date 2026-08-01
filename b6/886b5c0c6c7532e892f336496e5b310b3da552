@@ -1,0 +1,40 @@
+src/main.rs
+  s_76b817ce0732fe::t_f5a9e3b6a5cc27 435
+  s_76b817ce0732fe::t_8b8e757867743b 175-179,181-182,184,186,192,200
+src/admin/ops.rs
+  s_76b817ce0732fe::t_f4e0819ffc2a1b 1290
+  s_76b817ce0732fe::t_7438a8d881f289 18,662,672,686,1694,1732,1753,1774,1792,2513
+  s_76b817ce0732fe::t_c325f201cdbaa9 1284
+  s_76b817ce0732fe::t_59e544fd199a1a 4-6
+  s_76b817ce0732fe::t_bd629fedd9dfcd 651,653-654,660-661,663,669-671,674
+  s_76b817ce0732fe::t_346f4e7bc1e6bb 1057
+src/admin/duck.rs
+  s_76b817ce0732fe::t_96c9e69605ba5c 32-33
+  s_76b817ce0732fe::t_c0af7e1e13d508 52-119
+src/admin/trace_db.rs
+  s_76b817ce0732fe::t_03d4c426d51aea 266
+  s_76b817ce0732fe::t_6e96ce5c143571 360
+  s_76b817ce0732fe::t_1a7d3149c1248e 16,117,121,280,297,312,325,409,417,446,464,509,511,571,573,620,642,662,679,719
+  s_76b817ce0732fe::t_185ad9891225fa 276-279,282,286
+  s_76b817ce0732fe::t_a43c65443ebd39 7-9
+  s_76b817ce0732fe::t_0e882f074f5228 837
+  s_76b817ce0732fe::t_0e908ff1e57e87 295-296,299
+  s_76b817ce0732fe::t_64cfeffc2a8128 323,327-330,332-339
+  s_76b817ce0732fe::t_09c760285d1955 725,730,734
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "b6886b5c0c6c7532e892f336496e5b310b3da552",
+  "prompts": {},
+  "sessions": {
+    "s_76b817ce0732fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8aad5c8-70ec-4c41-a43f-97434e44adf2",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
