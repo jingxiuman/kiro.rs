@@ -161,7 +161,7 @@ impl UsageRecorder {
     }
 }
 
-fn parse_usage_log_filename(name: &str) -> Option<NaiveDate> {
+pub(crate) fn parse_usage_log_filename(name: &str) -> Option<NaiveDate> {
     // 形如 usage_log.2026-05-22.jsonl
     let body = name.strip_prefix("usage_log.")?.strip_suffix(".jsonl")?;
     NaiveDate::parse_from_str(body, "%Y-%m-%d").ok()

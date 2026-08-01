@@ -420,6 +420,69 @@ impl UsageStore {
         }
     }
 
+    /// 启动时调用：把目录下未导入的 usage_log.*.jsonl 灌进 usage_records。
+    /// 幂等——已导入文件登记在 imported_files 表并被跳过；导入成功的文件
+    /// 改名加 `.imported` 后缀归档。单文件失败仅 warn 并跳过，不影响启动。
+    pub fn import_legacy_jsonl(&self, dir: &Path) -> u64 {
+        let mut total = 0u64;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let conn = self.conn.lock();
+        let mut names: Vec<(String, std::path::PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                super::usage_stats::parse_usage_log_filename(&name)?;
+                Some((name, e.path()))
+            })
+            .collect();
+        names.sort(); // 按日期顺序导入，失败时日志可读
+        for (name, path) in names {
+            let done: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM imported_files WHERE file_name = ?",
+                    [&name],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if done > 0 {
+                continue;
+            }
+            let path_str = path.to_string_lossy().to_string();
+            // columns 显式声明：老格式缺键（如 cache*/credits/durationMs）时该列为
+            // NULL 而非直接不存在，coalesce 兜底——对齐旧 serde #[serde(default)] 语义
+            let inserted = conn.execute(
+                "INSERT INTO usage_records \
+                 SELECT ts, keyId, credentialId, model, inputTokens, outputTokens, \
+                        coalesce(cacheCreationTokens, 0), coalesce(cacheReadTokens, 0), \
+                        coalesce(credits, 0), coalesce(durationMs, 0), status \
+                 FROM read_json(?, format='newline_delimited', columns={ \
+                     ts: 'TIMESTAMPTZ', keyId: 'BIGINT', credentialId: 'BIGINT', \
+                     model: 'VARCHAR', inputTokens: 'BIGINT', outputTokens: 'BIGINT', \
+                     cacheCreationTokens: 'BIGINT', cacheReadTokens: 'BIGINT', \
+                     credits: 'DOUBLE', durationMs: 'BIGINT', status: 'VARCHAR'})",
+                [&path_str],
+            );
+            match inserted {
+                Ok(n) => {
+                    let _ = conn.execute(
+                        "INSERT INTO imported_files (file_name, rows) VALUES (?, ?)",
+                        duckdb::params![name, n as i64],
+                    );
+                    let archived = path.with_extension("jsonl.imported");
+                    if let Err(e) = std::fs::rename(&path, &archived) {
+                        tracing::warn!("归档 {} 失败（已导入，不影响数据）: {}", name, e);
+                    }
+                    tracing::info!("已导入 {}: {} 行", name, n);
+                    total += n as u64;
+                }
+                Err(e) => tracing::warn!("导入 {} 失败: {}", name, e),
+            }
+        }
+        total
+    }
+
     /// 概览（今日 + 最近 7 天）。today = 本地 0 点起；week = 滚动 7*24h
     /// （按小时桶起始过滤，沿用旧语义）。
     pub fn overview(&self) -> OverviewStats {
@@ -760,6 +823,45 @@ mod tests {
         assert_eq!(rows[0].credential_id, 7);
         assert_eq!(rows[0].calls, 2);
         assert_eq!(rows[0].errors, 1);
+    }
+
+    #[test]
+    fn import_legacy_jsonl_idempotent_and_archives() {
+        let dir = std::env::temp_dir().join(format!(
+            "ujsonl-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("usage_log.2026-07-30.jsonl");
+        std::fs::write(&f, concat!(
+            r#"{"ts":"2026-07-30T01:00:00+00:00","keyId":1,"credentialId":2,"model":"m","inputTokens":10,"outputTokens":1,"cacheCreationTokens":0,"cacheReadTokens":0,"credits":0.1,"durationMs":5,"status":"success"}"#, "\n",
+            r#"{"ts":"2026-07-30T02:00:00+00:00","keyId":1,"credentialId":2,"model":"m","inputTokens":20,"outputTokens":2,"cacheCreationTokens":0,"cacheReadTokens":0,"credits":0.2,"durationMs":5,"status":"error"}"#, "\n",
+        )).unwrap();
+        // 老格式缺省字段（无 credits/durationMs/cache*）也要能导入
+        let f_old = dir.join("usage_log.2026-07-29.jsonl");
+        std::fs::write(&f_old, concat!(
+            r#"{"ts":"2026-07-29T01:00:00+00:00","keyId":0,"credentialId":1,"model":"m","inputTokens":5,"outputTokens":1,"status":"success"}"#, "\n",
+        )).unwrap();
+        let s = UsageStore::open(&dir.join("kiro.duckdb"), 31).unwrap();
+        assert_eq!(s.import_legacy_jsonl(&dir), 3);
+        assert!(!f.exists(), "原名文件应已归档");
+        assert!(dir.join("usage_log.2026-07-30.jsonl.imported").exists());
+        assert_eq!(s.import_legacy_jsonl(&dir), 0, "重复导入必须为 0（幂等）");
+        // 数据核对：3 行都进了表
+        let w = StatsQueryWindow {
+            start_ts: 0,
+            end_ts: i64::MAX,
+            granularity: StatsGranularity::Day,
+        };
+        assert_eq!(
+            s.query_timeseries(w, None, None)
+                .iter()
+                .map(|p| p.calls)
+                .sum::<u64>(),
+            3
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
