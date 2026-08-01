@@ -242,12 +242,18 @@ async fn main() {
             admin::ClientKeyManager::new()
         }),
     );
-    let usage_recorder = std::sync::Arc::new(admin::UsageRecorder::with_retention(
-        cache_dir.clone(),
-        config.usage_log_retention_days as i64,
-    ));
-    let usage_aggregator = std::sync::Arc::new(admin::UsageAggregator::new());
-    usage_aggregator.rebuild_from_logs(&cache_dir);
+    // 用量存储（kiro.duckdb）。与 trace/ops 共用同一 DuckDB 文件；起不来 fail-fast——
+    // 它同时承载写入与统计端点，静默降级会让「服务在跑但统计悄悄丢失」。
+    let duckdb_path = cache_dir.join("kiro.duckdb");
+    let usage_store = std::sync::Arc::new(
+        admin::UsageStore::open(&duckdb_path, config.usage_log_retention_days as i64)
+            .unwrap_or_else(|e| panic!("打开 {} 失败: {}", duckdb_path.display(), e)),
+    );
+    // 旧版 usage_log.*.jsonl 一次性导入（幂等，导入后原文件改名 .imported 归档）
+    let imported = usage_store.import_legacy_jsonl(&cache_dir);
+    if imported > 0 {
+        tracing::info!("历史 usage_log JSONL 导入完成: {} 行", imported);
+    }
 
     // 账号分组注册表（持久化到 groups.json）。
     // 启动时若文件不存在则首次创建，并把现有凭据 / 客户端 Key 的 groups 字段反向迁移进去，
@@ -270,7 +276,7 @@ async fn main() {
 
     // 启动后定期清理过期 usage_log 与 trace / ops 事件记录
     {
-        let recorder = usage_recorder.clone();
+        let recorder = usage_store.clone();
         let trace_store = trace_store.clone();
         let ops_store = ops_store.clone();
         tokio::spawn(async move {
@@ -417,8 +423,7 @@ async fn main() {
         config.extract_thinking,
         config.tool_compatibility_mode,
         Some(client_key_manager.clone()),
-        Some(usage_recorder.clone()),
-        Some(usage_aggregator.clone()),
+        Some(usage_store.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
     );
@@ -442,7 +447,7 @@ async fn main() {
                     .with_ops(ops_runtime.clone())
                     .with_log_governance(
                         Some(admin_trace_store.clone()),
-                        Some(usage_recorder.clone()),
+                        Some(usage_store.clone()),
                     )
                     // /models* 全部 7 组端点依赖这两个注入；不注入则返回「未初始化」。
                     .with_model_registry(
@@ -457,7 +462,7 @@ async fn main() {
                 admin_key,
                 admin_service,
                 client_key_manager.clone(),
-                usage_aggregator.clone(),
+                usage_store.clone(),
                 admin_trace_store,
                 group_manager.clone(),
             );

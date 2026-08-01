@@ -16,7 +16,7 @@ use super::client_keys::SharedClientKeyManager;
 use super::groups::SharedGroupManager;
 use super::service::AdminService;
 use super::types::AdminErrorResponse;
-use super::usage_stats::SharedAggregator;
+use super::usage_store::SharedUsageStore;
 use super::trace_db::SharedTraceStore;
 use crate::common::auth;
 
@@ -30,7 +30,7 @@ pub struct AdminState {
     /// 客户端 Key 管理器（与 anthropic 路由共享）
     pub client_keys: SharedClientKeyManager,
     /// 用量聚合器（与 anthropic 路由共享）
-    pub usage_aggregator: SharedAggregator,
+    pub usage_store: SharedUsageStore,
     /// 请求链路追踪存储（与 anthropic 路由共享）
     pub trace_store: SharedTraceStore,
     /// 账号分组注册表（持久化到 groups.json）
@@ -42,7 +42,7 @@ impl AdminState {
         admin_api_key: impl Into<String>,
         service: AdminService,
         client_keys: SharedClientKeyManager,
-        usage_aggregator: SharedAggregator,
+        usage_store: SharedUsageStore,
         trace_store: SharedTraceStore,
         groups: SharedGroupManager,
     ) -> Self {
@@ -50,7 +50,7 @@ impl AdminState {
             admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
             service: Arc::new(service),
             client_keys,
-            usage_aggregator,
+            usage_store,
             trace_store,
             groups,
         }

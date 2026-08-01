@@ -4,7 +4,8 @@ use std::convert::Infallible;
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
-use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
+use crate::admin::usage_stats::UsageRecord;
+use crate::admin::usage_store::SharedUsageStore;
 use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TracePhase, TraceRecord, TraceSink, outcome,
     phase,
@@ -43,13 +44,11 @@ use super::websearch;
 ///
 /// 在 handler 入口构造，调用 [`Self::record`] 时把当次请求的 input/output token、
 /// 命中的上游凭据 ID、状态写入：
-/// - `usage_log.YYYY-MM-DD.jsonl`（持久化历史）
-/// - 内存聚合器（仪表盘趋势）
+/// - `kiro.duckdb` 的 usage_records 表（持久化 + 仪表盘统计同源）
 /// - 客户端 Key 计数（按 Key 累计）
 #[derive(Clone)]
 pub(crate) struct UsageRecordHook {
-    pub recorder: Option<SharedRecorder>,
-    pub aggregator: Option<SharedAggregator>,
+    pub usage: Option<SharedUsageStore>,
     pub client_keys: Option<SharedClientKeyManager>,
     pub key_id: u64,
     pub model: String,
@@ -59,8 +58,7 @@ pub(crate) struct UsageRecordHook {
 impl UsageRecordHook {
     pub fn from_state(state: &AppState, key_id: u64, model: String) -> Self {
         Self {
-            recorder: state.usage_recorder.clone(),
-            aggregator: state.usage_aggregator.clone(),
+            usage: state.usage_store.clone(),
             client_keys: state.client_keys.clone(),
             key_id,
             model,
@@ -95,11 +93,8 @@ impl UsageRecordHook {
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             status: status.to_string(),
         };
-        if let Some(r) = &self.recorder {
-            r.record(&rec);
-        }
-        if let Some(a) = &self.aggregator {
-            a.ingest(&rec);
+        if let Some(u) = &self.usage {
+            u.record(&rec);
         }
         if status == "success" && self.key_id != 0
             && let Some(m) = &self.client_keys {
