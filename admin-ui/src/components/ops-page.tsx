@@ -111,7 +111,7 @@ function StatCard({
 }) {
   return (
     <Card>
-      <CardContent className="flex items-center gap-3 p-4">
+      <CardContent className="flex items-start gap-3 p-4">
         <div
           className={cn(
             'flex h-9 w-9 shrink-0 items-center justify-center rounded-lg',
@@ -126,8 +126,14 @@ function StatCard({
         </div>
         <div className="min-w-0">
           <div className="text-xs text-muted-foreground">{label}</div>
-          <div className="truncate text-lg font-semibold leading-tight">{value}</div>
-          {sub ? <div className="truncate text-[11px] text-muted-foreground">{sub}</div> : null}
+          <div className="truncate text-lg font-semibold leading-tight" title={value}>
+            {value}
+          </div>
+          {sub ? (
+            <div className="text-[11px] leading-snug text-muted-foreground" title={sub}>
+              {sub}
+            </div>
+          ) : null}
         </div>
       </CardContent>
     </Card>
@@ -1080,7 +1086,12 @@ export function OpsPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+      {/*
+        6 张卡不强行挤一行：xl(1280) 下每卡仅 ~210px，扣掉 36px 图标与间距后
+        文本只剩 ~150px，「错误 N / 中断 M」这类 sub 必被截断。改为按可用宽度
+        逐档升列，只有到 2xl(1536)+ 才铺满一行——此时每卡 ~280px 才放得下。
+      */}
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-3 2xl:grid-cols-6">
         <StatCard icon={<Activity className="h-4 w-4" />} label="总请求" value={formatNumber(total)} />
         <StatCard
           icon={<ShieldAlert className="h-4 w-4" />}

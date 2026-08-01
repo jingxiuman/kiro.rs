@@ -221,7 +221,7 @@ function AppHeader({
 }: AppHeaderProps) {
   return (
     <header className="sticky top-0 z-50 w-full glass">
-      <div className="mx-auto flex h-14 max-w-[1400px] min-w-0 items-center gap-2 px-3 sm:h-16 sm:px-4 xl:px-8">
+      <div className="mx-auto flex h-14 max-w-[1760px] min-w-0 items-center gap-2 px-3 sm:h-16 sm:px-4 xl:px-8">
         <HeaderBrand tab={tab} onSwitchTab={onSwitchTab} />
         <HeaderActions
           darkMode={darkMode}
@@ -336,7 +336,7 @@ function MobileTabs({
   tab: Tab;
 }) {
   return (
-    <div className="mx-auto flex max-w-[1400px] items-center gap-1 overflow-x-auto px-3 pb-2 xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+    <div className="mx-auto flex max-w-[1760px] items-center gap-1 overflow-x-auto px-3 pb-2 xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
       {TABS.map((t) => (
         <TabButton
           key={t.key}
@@ -383,7 +383,7 @@ function TabButton({
 
 function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
   return (
-    <main className="mx-auto max-w-[1400px] px-4 md:px-8 py-8">
+    <main className="mx-auto max-w-[1760px] px-4 md:px-8 py-8">
       <Suspense fallback={<div className="text-sm text-muted-foreground">加载中…</div>}>
         {tab === "overview" && <OverviewPage />}
         {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}

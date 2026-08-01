@@ -1110,7 +1110,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       {/* 顶部毛玻璃导航条（仅独立模式渲染；嵌入模式由外层 App 提供顶栏） */}
       {!embedded && (
         <header className="sticky top-0 z-40 w-full glass">
-          <div className="mx-auto max-w-[1400px] flex h-16 items-center justify-between px-4 md:px-8">
+          <div className="mx-auto max-w-[1760px] flex h-16 items-center justify-between px-4 md:px-8">
             <div className="flex items-center gap-2.5">
               <img
                 src="/admin/kirors.png"
@@ -1220,7 +1220,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       {/* 主内容 */}
       <main
         ref={gridRef}
-        className={embedded ? "" : "mx-auto max-w-[1400px] px-4 md:px-8 py-8"}
+        className={embedded ? "" : "mx-auto max-w-[1760px] px-4 md:px-8 py-8"}
       >
         {/* 大标题 */}
         <div className="mb-5 flex items-end justify-between gap-4 sm:mb-6">
