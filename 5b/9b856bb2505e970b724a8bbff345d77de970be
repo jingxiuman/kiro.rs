@@ -1,0 +1,19 @@
+Dockerfile
+  s_76b817ce0732fe::t_9a994babb74cd8 11-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "5b9b856bb2505e970b724a8bbff345d77de970be",
+  "prompts": {},
+  "sessions": {
+    "s_76b817ce0732fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8aad5c8-70ec-4c41-a43f-97434e44adf2",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
