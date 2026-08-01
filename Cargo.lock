@@ -1367,7 +1367,6 @@ dependencies = [
  "hex",
  "http",
  "httpdate",
- "iana-time-zone",
  "image",
  "mime_guess",
  "parking_lot",

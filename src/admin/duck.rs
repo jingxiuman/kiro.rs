@@ -8,12 +8,11 @@ use std::path::Path;
 
 use duckdb::Connection;
 
-/// 进程本地 IANA 时区名；取不到时退到 UTC（桶边界退化为 UTC 语义，不崩）
-pub fn local_tz_name() -> String {
-    iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string())
-}
-
-/// 打开（或复用进程内已打开的）kiro.duckdb，设置会话时区并确保全部表存在。
+/// 打开（或复用进程内已打开的）kiro.duckdb 并确保全部表存在。
+///
+/// 刻意只用 DuckDB 核心功能，不触发任何扩展（icu/json 等）：musl 静态二进制
+/// 不支持动态加载，离线容器也无法运行时下载扩展。时区相关计算全部在 Rust 侧
+/// 完成（见 usage_store 的 hour_ts/day_ts 预计算列）。
 pub fn open_shared(path: &Path) -> duckdb::Result<Connection> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -22,8 +21,6 @@ pub fn open_shared(path: &Path) -> duckdb::Result<Connection> {
         let _ = std::fs::create_dir_all(parent);
     }
     let conn = Connection::open(path)?;
-    // 会话级设置：桶边界按本地时区切（date_trunc 依赖它）
-    conn.execute_batch(&format!("SET TimeZone='{}';", local_tz_name()))?;
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
 }
@@ -32,7 +29,10 @@ pub fn open_shared(path: &Path) -> duckdb::Result<Connection> {
 /// traces / trace_attempts / trace_phases 归 TraceStore；ops_events 归 OpsStore。
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS usage_records (
-    ts                    TIMESTAMPTZ NOT NULL,
+    ts                    VARCHAR NOT NULL,
+    ts_epoch              BIGINT NOT NULL,
+    hour_ts               BIGINT NOT NULL,
+    day_ts                BIGINT NOT NULL,
     key_id                BIGINT NOT NULL,
     credential_id         BIGINT NOT NULL,
     model                 VARCHAR NOT NULL,
@@ -46,9 +46,11 @@ CREATE TABLE IF NOT EXISTS usage_records (
 );
 CREATE TABLE IF NOT EXISTS imported_files (
     file_name   VARCHAR PRIMARY KEY,
-    imported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    imported_at VARCHAR NOT NULL,
     rows        BIGINT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_usage_hour ON usage_records(hour_ts);
+CREATE INDEX IF NOT EXISTS idx_usage_day ON usage_records(day_ts);
 
 CREATE TABLE IF NOT EXISTS traces (
     trace_id          VARCHAR PRIMARY KEY,
@@ -124,7 +126,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn open_shared_idempotent_and_tz_set() {
+    fn open_shared_idempotent() {
         let dir = std::env::temp_dir().join(format!(
             "ducktest-{}-{}",
             std::process::id(),
@@ -135,14 +137,14 @@ mod tests {
         let c1 = open_shared(&path).unwrap();
         // 幂等：二次 open + 二次建 schema 不报错
         let c2 = open_shared(&path).unwrap();
-        let tz: String = c1
-            .query_row("select current_setting('TimeZone')", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(tz, local_tz_name());
-        let n: i64 = c2
+        let n: i64 = c1
             .query_row("select count(*) from usage_records", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
+        let n2: i64 = c2
+            .query_row("select count(*) from usage_records", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n2, 0);
         drop((c1, c2));
         std::fs::remove_dir_all(&dir).ok();
     }

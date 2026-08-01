@@ -46,5 +46,8 @@ mime_guess = "2"      # MIME 类型推断
 flate2 = "1"        # tar.gz 解压（在线更新）
 tar = "0.4"         # tar 解析（在线更新）
 zip = { version = "2", default-features = false, features = ["deflate"] }  # zip 解压（Windows 在线更新）
+# 只用无扩展的核心功能：musl 静态二进制不支持动态加载扩展，离线容器也无法
+# 运行时下载；icu（SET TimeZone）与 json（read_json）扩展的静态内联又依赖
+# crates.io 不发布的 cmake 源码。因此本地时区切桶在 Rust 侧预计算（hour_ts/day_ts
+# 列），历史 JSONL 导入走 serde 逐行解析。
 duckdb = { version = "1", features = ["bundled"] }  # usage/trace/ops 统一存储（kiro.duckdb，自带源码）
-iana-time-zone = "0.1"  # 取 IANA 时区名喂给 DuckDB SET TimeZone（桶按本地时区切）

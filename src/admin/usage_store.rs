@@ -1,7 +1,7 @@
 //! 请求用量存储（DuckDB 版）
 //!
 //! 替代旧的「JSONL 落盘 + 内存小时/天桶聚合」双组件：写入 = 一行 INSERT 进
-//! `usage_records` 表；统计端点的 5 类查询直接 GROUP BY `date_trunc`。
+//! `usage_records` 表；统计端点的 5 类查询直接 GROUP BY 预计算的桶列。
 //! 桶边界沿用旧语义：按进程本地时区切小时/天（连接打开时 SET TimeZone，
 //! 见 [`crate::admin::duck::open_shared`]）。
 //!
@@ -32,12 +32,41 @@ pub struct UsageStore {
 
 pub type SharedUsageStore = Arc<UsageStore>;
 
-/// 粒度对应的「桶起始 Unix 秒」SQL 表达式（date_trunc 按会话时区切）
+/// 粒度对应的桶列名。桶起始时间（本地时区小时整点/0 点的 Unix 秒）在写入时
+/// 由 Rust 侧 chrono 预计算（见 [`bucket_ts_of`]）——DuckDB 的时区运算依赖 icu
+/// 扩展，musl 静态二进制/离线容器加载不了，故不在 SQL 侧做。
 fn bucket_expr(granularity: StatsGranularity) -> &'static str {
     match granularity {
-        StatsGranularity::Hour => "epoch(date_trunc('hour', ts))::BIGINT",
-        StatsGranularity::Day => "epoch(date_trunc('day', ts))::BIGINT",
+        StatsGranularity::Hour => "hour_ts",
+        StatsGranularity::Day => "day_ts",
     }
+}
+
+/// 从 RFC3339 时间串算 (unix 秒, 本地小时桶起始, 本地天桶起始)。
+/// 解析失败回退当前时刻——与旧聚合器 ingest 的容错语义一致。
+fn bucket_ts_of(ts: &str) -> (i64, i64, i64) {
+    let dt: DateTime<Utc> = DateTime::parse_from_rfc3339(ts)
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+    let local = dt.with_timezone(&Local);
+    let hour_ts = Local
+        .with_ymd_and_hms(
+            local.year(),
+            local.month(),
+            local.day(),
+            chrono::Timelike::hour(&local),
+            0,
+            0,
+        )
+        .single()
+        .map(|d| d.timestamp())
+        .unwrap_or(0);
+    let day_ts = Local
+        .with_ymd_and_hms(local.year(), local.month(), local.day(), 0, 0, 0)
+        .single()
+        .map(|d| d.timestamp())
+        .unwrap_or(0);
+    (dt.timestamp(), hour_ts, day_ts)
 }
 
 /// cred 白名单转 SQL IN 列表（全 u64，无注入面；排序保证 SQL 文本稳定）
@@ -69,10 +98,19 @@ impl UsageStore {
     /// 同步写入一条记录。失败仅 warn，不阻塞请求（与旧 JSONL writer 语义一致）。
     pub fn record(&self, rec: &UsageRecord) {
         let conn = self.conn.lock();
+        Self::insert_with(&conn, rec);
+    }
+
+    /// 用给定连接写入一条记录（record 与 import 共用同一条 INSERT 语句）
+    fn insert_with(conn: &duckdb::Connection, rec: &UsageRecord) {
+        let (ts_epoch, hour_ts, day_ts) = bucket_ts_of(&rec.ts);
         let r = conn.execute(
-            "INSERT INTO usage_records VALUES (CAST(? AS TIMESTAMPTZ), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO usage_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             duckdb::params![
                 rec.ts,
+                ts_epoch,
+                hour_ts,
+                day_ts,
                 rec.key_id as i64,
                 rec.credential_id as i64,
                 rec.model,
@@ -123,7 +161,7 @@ impl UsageStore {
         };
         let conn = self.conn.lock();
         match conn.execute(
-            "DELETE FROM usage_records WHERE epoch(ts) < ?",
+            "DELETE FROM usage_records WHERE ts_epoch < ?",
             [cutoff_ts],
         ) {
             Ok(n) if n > 0 => tracing::info!("已清理过期 usage_records: {} 行", n),
@@ -449,27 +487,36 @@ impl UsageStore {
             if done > 0 {
                 continue;
             }
-            let path_str = path.to_string_lossy().to_string();
-            // columns 显式声明：老格式缺键（如 cache*/credits/durationMs）时该列为
-            // NULL 而非直接不存在，coalesce 兜底——对齐旧 serde #[serde(default)] 语义
-            let inserted = conn.execute(
-                "INSERT INTO usage_records \
-                 SELECT ts, keyId, credentialId, model, inputTokens, outputTokens, \
-                        coalesce(cacheCreationTokens, 0), coalesce(cacheReadTokens, 0), \
-                        coalesce(credits, 0), coalesce(durationMs, 0), status \
-                 FROM read_json(?, format='newline_delimited', columns={ \
-                     ts: 'TIMESTAMPTZ', keyId: 'BIGINT', credentialId: 'BIGINT', \
-                     model: 'VARCHAR', inputTokens: 'BIGINT', outputTokens: 'BIGINT', \
-                     cacheCreationTokens: 'BIGINT', cacheReadTokens: 'BIGINT', \
-                     credits: 'DOUBLE', durationMs: 'BIGINT', status: 'VARCHAR'})",
-                [&path_str],
-            );
+            // serde 逐行解析（缺省字段由 #[serde(default)] 兜底，与当年写入方同构），
+            // 不用 read_json：json 扩展在 musl 静态二进制/离线容器里加载不了。
+            // 每文件一个事务：要么整文件入库，要么整文件下次重来，不留半截。
+            let inserted = (|| -> Result<i64, String> {
+                let content =
+                    std::fs::read_to_string(&path).map_err(|e| format!("读取失败: {}", e))?;
+                conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+                let mut n = 0i64;
+                for line in content.lines() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<UsageRecord>(line) {
+                        Ok(rec) => {
+                            Self::insert_with(&conn, &rec);
+                            n += 1;
+                        }
+                        Err(e) => tracing::warn!("{} 跳过无法解析的行: {}", name, e),
+                    }
+                }
+                conn.execute(
+                    "INSERT INTO imported_files (file_name, imported_at, rows) VALUES (?, ?, ?)",
+                    duckdb::params![name, chrono::Utc::now().to_rfc3339(), n],
+                )
+                .map_err(|e| e.to_string())?;
+                conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+                Ok(n)
+            })();
             match inserted {
                 Ok(n) => {
-                    let _ = conn.execute(
-                        "INSERT INTO imported_files (file_name, rows) VALUES (?, ?)",
-                        duckdb::params![name, n as i64],
-                    );
                     let archived = path.with_extension("jsonl.imported");
                     if let Err(e) = std::fs::rename(&path, &archived) {
                         tracing::warn!("归档 {} 失败（已导入，不影响数据）: {}", name, e);
@@ -477,7 +524,10 @@ impl UsageStore {
                     tracing::info!("已导入 {}: {} 行", name, n);
                     total += n as u64;
                 }
-                Err(e) => tracing::warn!("导入 {} 失败: {}", name, e),
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    tracing::warn!("导入 {} 失败: {}", name, e);
+                }
             }
         }
         total
@@ -488,19 +538,26 @@ impl UsageStore {
     pub fn overview(&self) -> OverviewStats {
         let conn = self.conn.lock();
         let week_cutoff = Utc::now().timestamp() - 7 * 24 * 3600;
+        // 本地今天 0 点（Rust 侧算，避免 SQL 时区运算依赖 icu 扩展）
+        let now_local = Local::now();
+        let today_start = Local
+            .with_ymd_and_hms(now_local.year(), now_local.month(), now_local.day(), 0, 0, 0)
+            .single()
+            .map(|d| d.timestamp())
+            .unwrap_or(0);
         let sql = "SELECT \
-             COALESCE(sum(input_tokens)  FILTER (WHERE ts >= date_trunc('day', now())), 0)::BIGINT, \
-             COALESCE(sum(output_tokens) FILTER (WHERE ts >= date_trunc('day', now())), 0)::BIGINT, \
-             (count(*)                   FILTER (WHERE ts >= date_trunc('day', now())))::BIGINT, \
-             (count(*) FILTER (WHERE ts >= date_trunc('day', now()) AND status <> 'success'))::BIGINT, \
-             COALESCE(sum(credits)       FILTER (WHERE ts >= date_trunc('day', now())), 0), \
+             COALESCE(sum(input_tokens)  FILTER (WHERE day_ts >= ?1), 0)::BIGINT, \
+             COALESCE(sum(output_tokens) FILTER (WHERE day_ts >= ?1), 0)::BIGINT, \
+             (count(*)                   FILTER (WHERE day_ts >= ?1))::BIGINT, \
+             (count(*) FILTER (WHERE day_ts >= ?1 AND status <> 'success'))::BIGINT, \
+             COALESCE(sum(credits)       FILTER (WHERE day_ts >= ?1), 0), \
              COALESCE(sum(input_tokens), 0)::BIGINT, \
              COALESCE(sum(output_tokens), 0)::BIGINT, \
              count(*)::BIGINT, \
              COALESCE(sum(credits), 0) \
              FROM usage_records \
-             WHERE epoch(date_trunc('hour', ts)) >= ?";
-        conn.query_row(sql, [week_cutoff], |r| {
+             WHERE hour_ts >= ?2";
+        conn.query_row(sql, [today_start, week_cutoff], |r| {
             Ok(OverviewStats {
                 today_input_tokens: r.get::<_, i64>(0)? as u64,
                 today_output_tokens: r.get::<_, i64>(1)? as u64,
