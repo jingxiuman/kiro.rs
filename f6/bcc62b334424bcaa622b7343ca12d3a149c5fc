@@ -1,0 +1,28 @@
+Cargo.toml
+  s_76b817ce0732fe::t_65adc872025f06 50-51
+  s_76b817ce0732fe::t_113478eb4eb199 3
+src/admin/duck.rs
+  s_76b817ce0732fe::t_94de4c07d319e1 1-81
+docs/superpowers/plans/2026-08-01-duckdb-storage.md
+  s_76b817ce0732fe::t_7e444c54689eac 1-621
+src/admin/mod.rs
+  s_76b817ce0732fe::t_e67ac7fea2fbb1 30
+Cargo.lock
+  s_76b817ce0732fe::t_b74e6243c00c66 18-19,108-279,398-403,411-412,494-524,590-617,660-676,753,762-767,913,918-928,958-969,979-987,994-999,1009-1017,1350-1359,1372,1381,1388,1407,1416-1472,1479-1501,1513-1518,1646-1673,1681,1919-1924,1963-1974,2063,2108-2120,2130,2140,2383-2403,2482,2535-2543,2762-2773,2780-2807,2826-2831,3015-3030,3040-3045,3291,3414-3433
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "f6bcc62b334424bcaa622b7343ca12d3a149c5fc",
+  "prompts": {},
+  "sessions": {
+    "s_76b817ce0732fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8aad5c8-70ec-4c41-a43f-97434e44adf2",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
