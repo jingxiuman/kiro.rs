@@ -1,0 +1,31 @@
+tools/verify_cache_split.py
+  s_83a8050a242a84::t_301ac5348e8a29 8-53,57
+  s_83a8050a242a84::t_cfb25f0740642c 5-7
+  s_83a8050a242a84::t_d17b5eb23d4944 54-56
+  s_83a8050a242a84::t_5caf54866050a3 58-60
+  s_2f8f94ac3a1e9a::t_f670e72238fd01 1-4,61-126
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "331e9a78159f605fa9c0fd91371c66aa524fe6d5",
+  "prompts": {},
+  "sessions": {
+    "s_2f8f94ac3a1e9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad8103f2dd9deb12c",
+        "model": "unknown"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    },
+    "s_83a8050a242a84": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "324cba1e-d65c-4f95-b8a2-fb426cf8c247",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
