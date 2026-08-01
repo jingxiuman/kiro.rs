@@ -1,0 +1,27 @@
+admin-ui/src/types/api.ts
+  s_9a6f841432c23b::t_77cc4f11a60f2b 681-732,740-749
+admin-ui/src/api/ops.ts
+  s_9a6f841432c23b::t_77cc4f11a60f2b 7,13,63-78
+  s_9a6f841432c23b::t_6623c9253f08b8 79
+admin-ui/src/components/ops-page.tsx
+  s_9a6f841432c23b::t_77cc4f11a60f2b 26,30,39,44-45,137-169,171,173-185,188-200,202-204,208-234,236-266,499-731,1129-1130
+admin-ui/src/hooks/use-ops.ts
+  s_9a6f841432c23b::t_77cc4f11a60f2b 5,9,39-53
+  s_9a6f841432c23b::t_5a7052f69d4f55 54
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "a6455c4de82ed1e69a2d9807bebc7f836ede82a1",
+  "prompts": {},
+  "sessions": {
+    "s_9a6f841432c23b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3288a3ad-dcfe-4a5a-9ece-c573fec8d0ee",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
