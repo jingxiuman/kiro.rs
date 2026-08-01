@@ -678,6 +678,58 @@ export interface OpsErrorCrosstab {
   rows: CrosstabRow[]
 }
 
+/** 错误指纹：归一化后的一类错误 */
+export interface ErrorFingerprint {
+  /** 归一化模板，可变部分已被 <status> / <id> / N 替换 */
+  fingerprint: string
+  /** 从消息里提取出的 HTTP 状态码；null = 该消息不含状态码 */
+  httpStatus?: number | null
+  count: number
+  /**
+   * 原始未归一化消息（1~2 条）。
+   * 必须展示：这是发现「两个不同根因被误并成一个指纹」的唯一途径。
+   */
+  samples: string[]
+  firstSeen: string
+  lastSeen: string
+  /** 映射到该指纹的 error_type。长度 > 1 说明分类与消息内容有歧义 */
+  errorTypes: string[]
+}
+
+export interface OpsErrorFingerprints {
+  windowHours: number
+  rows: ErrorFingerprint[]
+}
+
+/** 重试阶梯的一级 */
+export interface RetryLadderStep {
+  attempt: number
+  /** 到达这一跳的请求数，**累积量**：跑了 4 跳的也算到达过第 1 跳 */
+  reached: number
+  /** 在这一跳成功的数量 */
+  rescued: number
+  /** 该跳独有贡献 ÷ 到达该跳数。塌到很低说明这一跳在白等 */
+  marginalYield: number
+  /** 进入该跳前的 backoff 中位数；null = 无可用样本（见 backoffCoverage） */
+  backoffP50Ms?: number | null
+}
+
+export interface RetryEffectiveness {
+  windowHours: number
+  steps: RetryLadderStep[]
+  /** 首跳失败但最终成功的总数 */
+  totalRescued: number
+  /** 跑完全部重试仍失败的数量 */
+  totalExhausted: number
+  /** 边际收益塌掉的跳数；null = 未塌 */
+  yieldCollapseAt?: number | null
+  /**
+   * backoff 计算覆盖率 = 两端 started_ms 都非空的相邻跳对 ÷ 全部相邻跳对。
+   * 0 表示 backoff 完全无数据 —— 必须展示，否则 null 的 p50 会被当成 0ms。
+   */
+  backoffCoverage: number
+}
+
 /** 按小时趋势点 */
 export interface OpsTrendPoint {
   bucketEpoch: number
@@ -685,6 +737,16 @@ export interface OpsTrendPoint {
   success: number
   error: number
   interrupted: number
+  /**
+   * 该桶内 error_type → 计数，稀疏（无错误的桶整个字段缺失）。
+   *
+   * **口径警告：各值之和 ≠ error 字段。** error 是 total-success-interrupted
+   * （即 final_status='error'），而本字段按 traces.error_type 分组，该列同时
+   * 存在于 error 与 interrupted 两种状态上（stream_interrupted 与
+   * client_disconnected 属后者）。所以之和 ≈ error + interrupted。
+   * 拿两者对账必然对不上，这不是 bug。
+   */
+  byErrorType?: Record<string, number>
 }
 
 /** 按凭据统计行 */

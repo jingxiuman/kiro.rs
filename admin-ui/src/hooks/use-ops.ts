@@ -2,9 +2,11 @@ import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import {
   getOpsCredentials,
   getOpsErrorCrosstab,
+  getOpsErrorFingerprints,
   getOpsEvents,
   getOpsOverview,
   getOpsProxies,
+  getOpsRetryEffectiveness,
   getOpsTrend,
   getPhaseBaseline,
 } from '@/api/ops'
@@ -30,6 +32,22 @@ export function useOpsErrorCrosstab(hours: number, dim: CrosstabDimension) {
   return useQuery({
     queryKey: ['ops', 'error-crosstab', hours, dim],
     queryFn: () => getOpsErrorCrosstab(hours, dim),
+    ...COMMON,
+  })
+}
+
+export function useOpsErrorFingerprints(hours: number, limit = 50) {
+  return useQuery({
+    queryKey: ['ops', 'error-fingerprints', hours, limit],
+    queryFn: () => getOpsErrorFingerprints(hours, limit),
+    ...COMMON,
+  })
+}
+
+export function useOpsRetryEffectiveness(hours: number) {
+  return useQuery({
+    queryKey: ['ops', 'retry-effectiveness', hours],
+    queryFn: () => getOpsRetryEffectiveness(hours),
     ...COMMON,
   })
 }

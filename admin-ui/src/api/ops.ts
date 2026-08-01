@@ -4,11 +4,13 @@ import type {
   CrosstabDimension,
   OpsCredentialRow,
   OpsErrorCrosstab,
+  OpsErrorFingerprints,
   OpsEvent,
   OpsOverview,
   OpsProxiesResponse,
   OpsTrendPoint,
   PhaseBaselineRow,
+  RetryEffectiveness,
 } from '@/types/api'
 
 const api = axios.create({
@@ -54,6 +56,23 @@ export async function getOpsErrorCrosstab(
 ): Promise<OpsErrorCrosstab> {
   const { data } = await api.get<OpsErrorCrosstab>('/ops/error-crosstab', {
     params: { hours, dim },
+  })
+  return data
+}
+
+export async function getOpsErrorFingerprints(
+  hours: number,
+  limit = 50,
+): Promise<OpsErrorFingerprints> {
+  const { data } = await api.get<OpsErrorFingerprints>('/ops/error-fingerprints', {
+    params: { hours, limit },
+  })
+  return data
+}
+
+export async function getOpsRetryEffectiveness(hours: number): Promise<RetryEffectiveness> {
+  const { data } = await api.get<RetryEffectiveness>('/ops/retry-effectiveness', {
+    params: { hours },
   })
   return data
 }
