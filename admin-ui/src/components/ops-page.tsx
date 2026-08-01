@@ -23,9 +23,11 @@ import {
 import {
   useOpsCredentials,
   useOpsErrorCrosstab,
+  useOpsErrorFingerprints,
   useOpsEvents,
   useOpsOverview,
   useOpsProxies,
+  useOpsRetryEffectiveness,
   useOpsTrend,
 } from '@/hooks/use-ops'
 import { useTraces } from '@/hooks/use-traces'
@@ -34,10 +36,13 @@ import type {
   CrosstabDimension,
   CrosstabRow,
   DurationPercentiles,
+  ErrorFingerprint,
   OpsCredentialRow,
   OpsEvent,
   OpsProxyRow,
   ProxyPoolEntry,
+  RetryEffectiveness,
+  RetryLadderStep,
   TraceRecord,
 } from '@/types/api'
 import { cn, formatNumber } from '@/lib/utils'
@@ -129,47 +134,136 @@ function StatCard({
   )
 }
 
-/** 按小时趋势（成功 / 错误 / 中断堆叠柱） */
+/** 错误类型的固定配色。未列出的类型回落到灰色，不至于因为新增类型而无色 */
+const ERROR_TYPE_COLORS: Record<string, string> = {
+  transient: '#f59e0b',
+  network_error: '#ef4444',
+  stream_interrupted: '#a855f7',
+  upstream_truncated: '#ec4899',
+  bad_request: '#3b82f6',
+  client_disconnected: '#64748b',
+  unknown: '#94a3b8',
+}
+const ERROR_TYPE_FALLBACK = '#94a3b8'
+
+function formatBucketTime(epoch: number): string {
+  return new Date(epoch * 1000).toLocaleString('zh-CN', {
+    month: 'numeric',
+    day: 'numeric',
+    hour: 'numeric',
+  })
+}
+
+const TREND_TOOLTIP_STYLE = {
+  background: 'hsl(var(--card))',
+  border: '1px solid hsl(var(--border))',
+  borderRadius: 8,
+  fontSize: 12,
+} as const
+
+/**
+ * 按小时趋势。两种视角：
+ * - 按状态：成功/错误/中断，回答「总量与失败量」
+ * - 按错误类型：只堆叠错误，回答「涨的是哪一类」——这是 8e7cd59 加 byErrorType
+ *   的目的，突发事件与基线噪声在「按状态」视图里混在一根柱子里分不开
+ */
 function TrendChart({ hours }: { hours: number }) {
+  const [mode, setMode] = useState<'status' | 'errorType'>('status')
   const { data } = useOpsTrend(hours)
+  const points = useMemo(() => data ?? [], [data])
+
+  // 窗口内出现过的错误类型（决定要画几个 Bar），按总量降序让主要类型在底部
+  const errorTypes = useMemo(() => {
+    const totals = new Map<string, number>()
+    for (const p of points) {
+      for (const [k, v] of Object.entries(p.byErrorType ?? {})) {
+        totals.set(k, (totals.get(k) ?? 0) + v)
+      }
+    }
+    return [...totals.entries()].sort((a, b) => b[1] - a[1]).map(([k]) => k)
+  }, [points])
+
   const chartData = useMemo(
     () =>
-      (data ?? []).map((p) => ({
-        time: new Date(p.bucketEpoch * 1000).toLocaleString('zh-CN', {
-          month: 'numeric',
-          day: 'numeric',
-          hour: 'numeric',
-        }),
-        成功: p.success,
-        错误: p.error,
-        中断: p.interrupted,
-      })),
-    [data],
+      points.map((p) => {
+        const row: Record<string, string | number> = { time: formatBucketTime(p.bucketEpoch) }
+        if (mode === 'status') {
+          row['成功'] = p.success
+          row['错误'] = p.error
+          row['中断'] = p.interrupted
+        } else {
+          // 缺失的类型补 0：Bar 的 dataKey 固定，缺键会让该段断开
+          for (const t of errorTypes) row[t] = p.byErrorType?.[t] ?? 0
+        }
+        return row
+      }),
+    [points, mode, errorTypes],
   )
+
+  const noErrors = mode === 'errorType' && errorTypes.length === 0
+
   return (
     <Card>
       <CardContent className="p-4">
-        <div className="mb-3 text-sm font-medium">请求趋势（按小时）</div>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <div className="text-sm font-medium">请求趋势（按小时）</div>
+          <div className="flex items-center gap-1 rounded-full border border-border/60 p-0.5">
+            {(
+              [
+                { k: 'status', label: '按状态' },
+                { k: 'errorType', label: '按错误类型' },
+              ] as const
+            ).map((m) => (
+              <Button
+                key={m.k}
+                size="sm"
+                variant={mode === m.k ? 'default' : 'ghost'}
+                className="h-7 rounded-full px-3 text-xs"
+                onClick={() => setMode(m.k)}
+              >
+                {m.label}
+              </Button>
+            ))}
+          </div>
+        </div>
+        {mode === 'errorType' && !noErrors && (
+          <p className="mb-2 text-[11px] text-muted-foreground">
+            仅堆叠错误请求（含中断类）。各段之和为「错误+中断」，与「按状态」视图的
+            错误段不等 —— 两者口径不同。
+          </p>
+        )}
         <div className="h-56">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={chartData} margin={{ top: 4, right: 8, left: -16, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" strokeOpacity={0.25} />
-              <XAxis dataKey="time" tick={{ fontSize: 11 }} />
-              <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
-              <Tooltip
-                contentStyle={{
-                  background: 'hsl(var(--card))',
-                  border: '1px solid hsl(var(--border))',
-                  borderRadius: 8,
-                  fontSize: 12,
-                }}
-              />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
-              <Bar dataKey="成功" stackId="a" fill="#22c55e" />
-              <Bar dataKey="错误" stackId="a" fill="#ef4444" />
-              <Bar dataKey="中断" stackId="a" fill="#f59e0b" />
-            </BarChart>
-          </ResponsiveContainer>
+          {noErrors ? (
+            <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+              窗口内没有错误
+            </div>
+          ) : (
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={chartData} margin={{ top: 4, right: 8, left: -16, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" strokeOpacity={0.25} />
+                <XAxis dataKey="time" tick={{ fontSize: 11 }} />
+                <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
+                <Tooltip contentStyle={TREND_TOOLTIP_STYLE} />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                {mode === 'status' ? (
+                  [
+                    <Bar key="s" dataKey="成功" stackId="a" fill="#22c55e" />,
+                    <Bar key="e" dataKey="错误" stackId="a" fill="#ef4444" />,
+                    <Bar key="i" dataKey="中断" stackId="a" fill="#f59e0b" />,
+                  ]
+                ) : (
+                  errorTypes.map((t) => (
+                    <Bar
+                      key={t}
+                      dataKey={t}
+                      stackId="a"
+                      fill={ERROR_TYPE_COLORS[t] ?? ERROR_TYPE_FALLBACK}
+                    />
+                  ))
+                )}
+              </BarChart>
+            </ResponsiveContainer>
+          )}
         </div>
       </CardContent>
     </Card>
@@ -398,6 +492,239 @@ function CrosstabBucketRow({
           </span>
         )}
       </span>
+    </div>
+  )
+}
+
+function relTime(iso: string): string {
+  const d = new Date(iso).getTime()
+  if (Number.isNaN(d)) return iso
+  const mins = Math.floor((Date.now() - d) / 60000)
+  if (mins < 1) return '刚刚'
+  if (mins < 60) return `${mins} 分钟前`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return `${hrs} 小时前`
+  return `${Math.floor(hrs / 24)} 天前`
+}
+
+/**
+ * 错误指纹面板。
+ *
+ * 面板存在的理由：error_type 只有十几种取值，看不出「一个上游错误刷了几百次」
+ * 与「几百个互不相同的错误」的区别，而两者处置动作相反。
+ *
+ * 原始样本默认折叠但必须可展开：归一化规则可能把不同根因误并成一个指纹，
+ * 样本是唯一能发现这件事的途径。
+ */
+function ErrorFingerprintPanel({ hours }: { hours: number }) {
+  const { data } = useOpsErrorFingerprints(hours, 50)
+  const rows = data?.rows ?? []
+  const [expanded, setExpanded] = useState<string | null>(null)
+
+  return (
+    <Card>
+      <CardContent className="p-4 sm:p-5">
+        <div className="mb-3">
+          <h2 className="text-base font-semibold tracking-tight">错误指纹</h2>
+          <p className="text-[12px] text-muted-foreground">
+            消息归一化后归并。点开可看原始消息 —— 若同一指纹下的样本根因不同，
+            说明归一化过度，需要收紧规则
+          </p>
+        </div>
+        {rows.length === 0 ? (
+          <div className="py-8 text-center text-sm text-muted-foreground">窗口内无错误消息</div>
+        ) : (
+          <div className="space-y-2">
+            {rows.map((r) => (
+              <FingerprintRow
+                key={r.fingerprint}
+                row={r}
+                open={expanded === r.fingerprint}
+                onToggle={() =>
+                  setExpanded(expanded === r.fingerprint ? null : r.fingerprint)
+                }
+              />
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function FingerprintRow({
+  row,
+  open,
+  onToggle,
+}: {
+  row: ErrorFingerprint
+  open: boolean
+  onToggle: () => void
+}) {
+  return (
+    <div className="rounded-lg border border-border/50">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-start gap-2 p-3 text-left hover:bg-muted/40"
+      >
+        <Badge variant="secondary" className="mt-0.5 shrink-0 tabular-nums">
+          {formatNumber(row.count)}
+        </Badge>
+        {row.httpStatus != null && (
+          <Badge
+            variant={row.httpStatus >= 500 ? 'destructive' : 'outline'}
+            className="mt-0.5 shrink-0 tabular-nums"
+          >
+            {row.httpStatus}
+          </Badge>
+        )}
+        <span className="min-w-0 flex-1 break-all text-[12px] leading-relaxed">
+          {row.fingerprint}
+        </span>
+      </button>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 pb-2 text-[11px] text-muted-foreground">
+        <span>最近 {relTime(row.lastSeen)}</span>
+        <span>首次 {relTime(row.firstSeen)}</span>
+        <span>
+          类型 {row.errorTypes.join(' / ')}
+          {row.errorTypes.length > 1 && (
+            <span className="ml-1 text-amber-600" title="同一指纹映射到多个 error_type，说明分类与消息内容有歧义">
+              ⚠
+            </span>
+          )}
+        </span>
+        <span className="text-muted-foreground/70">{open ? '收起' : `${row.samples.length} 条原始样本`}</span>
+      </div>
+      {open && (
+        <div className="space-y-1.5 border-t border-border/40 px-3 py-2">
+          {row.samples.map((s, i) => (
+            <pre
+              key={i}
+              className="overflow-x-auto whitespace-pre-wrap break-all rounded bg-muted/50 p-2 text-[11px] leading-relaxed"
+            >
+              {s}
+            </pre>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * 重试有效性阶梯。
+ *
+ * 面板直接给结论而不是只摆数字：运维要的是「第几跳开始白等」，
+ * 自己从 reached/rescued 两列心算边际收益不现实。
+ */
+function RetryLadderPanel({ hours }: { hours: number }) {
+  const { data } = useOpsRetryEffectiveness(hours)
+  const steps = data?.steps ?? []
+  const maxReached = steps[0]?.reached ?? 0
+
+  return (
+    <Card>
+      <CardContent className="p-4 sm:p-5">
+        <div className="mb-3">
+          <h2 className="text-base font-semibold tracking-tight">重试有效性</h2>
+          <p className="text-[12px] text-muted-foreground">
+            边际收益 = 只有跑到这一跳才成功的比例。塌到很低说明该跳在白等，
+            代价是用户多等一轮 backoff
+          </p>
+        </div>
+        {steps.length === 0 ? (
+          <div className="py-8 text-center text-sm text-muted-foreground">窗口内无请求</div>
+        ) : (
+          <>
+            <div className="space-y-2">
+              {steps.map((s) => (
+                <RetryStepRow
+                  key={s.attempt}
+                  step={s}
+                  maxReached={maxReached}
+                  collapsed={data?.yieldCollapseAt != null && s.attempt >= data.yieldCollapseAt}
+                />
+              ))}
+            </div>
+            <RetrySummary data={data} />
+          </>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function RetryStepRow({
+  step,
+  maxReached,
+  collapsed,
+}: {
+  step: RetryLadderStep
+  maxReached: number
+  collapsed: boolean
+}) {
+  // 条宽按到达数占首跳的比例，直观体现「越往后越少人走到」
+  const widthPct = maxReached > 0 ? Math.max(1, (step.reached / maxReached) * 100) : 0
+  const yieldPct = (step.marginalYield * 100).toFixed(1)
+  return (
+    <div className="flex items-center gap-3 text-[12px]">
+      <span className="w-12 shrink-0 text-muted-foreground">第 {step.attempt} 跳</span>
+      <div className="relative h-6 min-w-0 flex-1 overflow-hidden rounded bg-muted/40">
+        <div
+          className={cn(
+            'h-full rounded transition-all',
+            collapsed ? 'bg-red-500/25' : 'bg-emerald-500/25',
+          )}
+          style={{ width: `${widthPct}%` }}
+        />
+        <span className="absolute inset-y-0 left-2 flex items-center tabular-nums text-muted-foreground">
+          到达 {formatNumber(step.reached)} · 救回 {formatNumber(step.rescued)}
+        </span>
+      </div>
+      <span
+        className={cn(
+          'w-24 shrink-0 text-right tabular-nums',
+          collapsed ? 'font-semibold text-red-600 dark:text-red-400' : 'text-muted-foreground',
+        )}
+      >
+        收益 {yieldPct}%
+      </span>
+    </div>
+  )
+}
+
+function RetrySummary({ data }: { data?: RetryEffectiveness }) {
+  if (!data) return null
+  const collapse = data.yieldCollapseAt
+  return (
+    <div className="mt-3 space-y-1.5 border-t border-border/40 pt-3 text-[12px]">
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground">
+        <span>
+          重试救回 <strong className="tabular-nums text-foreground">{formatNumber(data.totalRescued)}</strong> 个请求
+        </span>
+        <span>
+          跑满仍失败 <strong className="tabular-nums text-foreground">{formatNumber(data.totalExhausted)}</strong> 个
+        </span>
+      </div>
+      {collapse != null && (
+        <p className="rounded-md bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-600">
+          第 <strong className="mx-0.5">{collapse}</strong> 跳起边际收益已塌。下调重试上限可省掉这些等待，
+          代价是放弃该跳救回的那部分请求 —— 取舍取决于你更在意延迟还是成功率。
+        </p>
+      )}
+      {data.backoffCoverage <= 0 ? (
+        <p className="text-[11px] text-muted-foreground">
+          backoff 时长无数据（覆盖率 0）：started_ms 是新增列，多跳记录尚未积累。
+          攒够后此处会显示各跳的等待中位数。
+        </p>
+      ) : (
+        data.backoffCoverage < 0.8 && (
+          <p className="text-[11px] text-amber-600">
+            backoff 覆盖率仅 {(data.backoffCoverage * 100).toFixed(0)}%，时长数据不完整
+          </p>
+        )
+      )}
     </div>
   )
 }
@@ -799,6 +1126,8 @@ export function OpsPage() {
       </div>
 
       <ErrorCrosstabPanel hours={hours} />
+      <ErrorFingerprintPanel hours={hours} />
+      <RetryLadderPanel hours={hours} />
       <CredentialTable rows={credentials ?? []} />
       <ProxyTable stats={proxies?.stats ?? []} pool={proxies?.pool.proxies ?? []} />
       <RecentErrorList />
