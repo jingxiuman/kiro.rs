@@ -1,0 +1,24 @@
+src/anthropic/cache_metering.rs
+  s_83a8050a242a84::t_244ecfe13865a4 666,1548-1550
+  s_83a8050a242a84::t_4ff2efafdda881 1520-1527,1529,1532-1538,1541-1542,1544-1547
+  s_83a8050a242a84::t_4c670f0b1016a4 643-665
+  s_83a8050a242a84::t_d05ddfa229f507 508-518
+  s_83a8050a242a84::t_d0b712a7d72c73 1413-1519,1528,1530-1531,1539-1540,1543
+  s_83a8050a242a84::t_8380010005ce5f 667-668
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "d42f8bf5fe7413161dc2d7aff599a9f45a2a73f2",
+  "prompts": {},
+  "sessions": {
+    "s_83a8050a242a84": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "324cba1e-d65c-4f95-b8a2-fb426cf8c247",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
