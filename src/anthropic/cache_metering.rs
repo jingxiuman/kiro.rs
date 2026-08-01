@@ -505,6 +505,17 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
                         hasher.update(data.as_bytes());
                         let img_tokens = crate::image_resize::estimate_image_tokens(media_type, data);
                         cum_tokens = cum_tokens.saturating_add(img_tokens);
+                    } else if let Some(payload) = block_big_payload(v) {
+                        // tool_result / tool_use：载荷同时进指纹和 token 估算。
+                        // 与 image 分支同构——大字段必须进哈希才能区分内容，
+                        // 必须进 token 才能让「新增尾部」的估算量与实际相称。
+                        feed(
+                            &mut hasher,
+                            &block_signature_value(v),
+                            "",
+                            &mut cum_tokens,
+                        );
+                        feed(&mut hasher, &payload, &payload, &mut cum_tokens);
                     } else {
                         feed(
                             &mut hasher,
@@ -626,6 +637,32 @@ fn block_token_text(v: &serde_json::Value) -> String {
         thinking.to_string()
     } else {
         format!("{text} {thinking}")
+    }
+}
+
+/// `tool_result` / `tool_use` 的大字段载荷（分别是 `content` 与 `input`）。
+///
+/// 这两类 block 的实际内容既不在 `text` 也不在 `thinking` 里，因此 [`block_signature_value`]
+/// 和 [`block_token_text`] 都看不见它们。在 agent 流量里这恰恰是 prompt 的主体
+/// （文件读取结果、命令输出、写入文件的正文），漏掉会同时造成两个后果：
+///
+/// 1. **指纹碰撞**：所有 `tool_result` 的签名都退化成 `block:tool_result||`，
+///    内容不同的两条历史哈希相同 → 误判缓存命中。
+/// 2. **token 漏计**：该 block 贡献 0 token，使「新增尾部」被估成近乎空，
+///    分摊时把本轮真正的新内容错记成 cache_read。
+///
+/// 返回 `None` 表示该 block 不是这两类、走原有路径。图片类 block 由调用方
+/// 单独处理（已有专门分支），不进这里。
+fn block_big_payload(v: &serde_json::Value) -> Option<String> {
+    let key = match v.get("type").and_then(|t| t.as_str())? {
+        "tool_result" => "content",
+        "tool_use" => "input",
+        _ => return None,
+    };
+    match v.get(key)? {
+        // content 常见形态就是纯字符串，避开 to_string 的引号转义开销
+        serde_json::Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
     }
 }
 
@@ -1370,6 +1407,144 @@ mod tests {
         assert!(
             u2.cache_read >= img_tokens,
             "含图历史应跨轮命中且 read({}) 含图片 token({})", u2.cache_read, img_tokens
+        );
+    }
+
+    /// `tool_result` 的正文必须计入 token 估算。
+    ///
+    /// 回归的是：agent 流量里 prompt 主体是工具输出（文件读取、命令回显），
+    /// 漏计会让「本轮新增尾部」被估成近乎空，分摊时把真正的新内容错记成 cache_read。
+    #[test]
+    fn tool_result_content_contributes_tokens() {
+        use super::super::types::{Message, MessagesRequest};
+
+        let big = "fn helper() { let x = 1; }\n".repeat(400);
+        let big_tokens = estimate_tokens(&big);
+        assert!(big_tokens > 500, "前提：测试正文应有可观 token，实测 {big_tokens}");
+
+        let make = |body: &str| MessagesRequest {
+            model: "m".to_string(),
+            max_tokens: 8,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("read it"),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type":"tool_use","id":"t1","name":"read","input":{"path":"/a.rs"}}
+                    ]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type":"tool_result","tool_use_id":"t1","content": body}
+                    ]),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("done"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("next"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let cache = CacheMeter::new(None);
+        let u = compute_cache_usage(&cache, &make(&big), 1);
+        assert!(
+            u.cache_covered_est >= big_tokens,
+            "被缓存前缀的估算({}) 必须包含 tool_result 正文的 token({})",
+            u.cache_covered_est,
+            big_tokens
+        );
+    }
+
+    /// 内容不同的 `tool_result` 必须产生不同的前缀指纹。
+    ///
+    /// 回归的是指纹碰撞：签名只取 type/text/thinking 时，所有 tool_result 都退化成
+    /// `block:tool_result||`，两条内容不同的历史哈希相同 → 误判缓存命中，
+    /// 把从未发送过的内容记成 cache_read。
+    #[test]
+    fn different_tool_result_content_does_not_false_hit() {
+        use super::super::types::{Message, MessagesRequest};
+
+        let make = |body: &str| MessagesRequest {
+            model: "m".to_string(),
+            max_tokens: 8,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("read it"),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type":"tool_use","id":"t1","name":"read","input":{"path":"/a.rs"}}
+                    ]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type":"tool_result","tool_use_id":"t1","content": body}
+                    ]),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("done"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("next"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        // 正文取得足够大，使「深段命中」与「仅浅段命中」在数值上无从混淆。
+        // 浅段（[tools+system]、[+msg0]）在 A/B 之间本就逐字节相同，命中它们是正确行为；
+        // 需要断言的是含 tool_result 的深段不得命中。
+        let body_a = "AAAA content of file a\n".repeat(200);
+        let body_b = "BBBB totally different\n".repeat(200);
+        let body_tokens = estimate_tokens(&body_a);
+        assert!(body_tokens > 500, "前提：正文应有可观 token，实测 {body_tokens}");
+
+        let cache = CacheMeter::new(None);
+        let u1 = compute_cache_usage(&cache, &make(&body_a), 1);
+        assert_eq!(u1.cache_read, 0, "首次必然 miss");
+
+        // 换成内容完全不同的 B：深段不得命中，故 cache_read 必须远小于正文 token
+        let u2 = compute_cache_usage(&cache, &make(&body_b), 1);
+        assert!(
+            u2.cache_read < body_tokens,
+            "tool_result 正文不同却命中了含它的深段（cache_read={}，正文={} token），说明指纹碰撞",
+            u2.cache_read,
+            body_tokens
+        );
+
+        // 同一份 A 重放必须命中深段，确认修复没把正常命中一起打掉
+        let u3 = compute_cache_usage(&cache, &make(&body_a), 1);
+        assert!(
+            u3.cache_read >= body_tokens,
+            "同内容重放应命中含正文的深段，实测 cache_read={}，正文={} token",
+            u3.cache_read,
+            body_tokens
         );
     }
 
