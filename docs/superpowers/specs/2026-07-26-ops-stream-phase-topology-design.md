@@ -2,7 +2,8 @@
 
 - 日期：2026-07-26
 - 分支：`feat/ops-module`
-- 状态：设计已确认，待实现计划
+- 状态：已实现；其中「非流式不记 phases」一节已于 2026-07-31 被取代
+  （见 [`2026-07-31-nonstream-timing-breakdown-design.md`](./2026-07-31-nonstream-timing-breakdown-design.md)）
 
 ## 背景
 
@@ -82,6 +83,7 @@ CREATE TABLE IF NOT EXISTS trace_phases (
     trace_id    TEXT NOT NULL,
     seq         INTEGER NOT NULL,      -- 段序号，保证渲染顺序
     phase       TEXT NOT NULL,         -- first_token | streaming | finish
+                                       -- （2026-07-31 起非流式另有 body_read | decode | assemble）
     started_ms  INTEGER NOT NULL,      -- 相对请求起点的偏移
     duration_ms INTEGER NOT NULL,
     outcome     TEXT NOT NULL,         -- 复用 outcome 常量
@@ -132,6 +134,15 @@ NULL    → 仅保留给该列存在前的历史行 = 未知
 | 非流式 | `handlers.rs:985` 一次性 `feed` | 否，仅 attempts |
 
 非流式无流生命周期，不造空壳段；前端对其只渲染 attempts 层。
+
+> **⚠️ 此判断已于 2026-07-31 被取代。** 非流式现在记四段
+> （`first_token` / `body_read` / `decode` / `assemble`），前端与流式共用同一套渲染。
+>
+> 当初的前提是「非流式只有一次性 `bytes()` 读取，整段生成塌在一个 await 里，拆不开」——
+> 前提本身没错，但它是可以改的：改成逐 chunk 读之后，「等上游吐第一口」与「收完剩余
+> body」就成了两段可分的时间。当时把「当前实现拆不开」当成了「本质上无可分段」。
+>
+> 见 [`2026-07-31-nonstream-timing-breakdown-design.md`](./2026-07-31-nonstream-timing-breakdown-design.md)。
 
 实时流三个标记点均落在现有分支内，不新增控制流：
 
