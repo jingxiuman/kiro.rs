@@ -4,16 +4,17 @@
 //! - 一个外部请求 = 1 条 [`TraceRecord`] 汇总 + N 条 [`TraceAttempt`] 子记录
 //! - 每跳记录命中凭据、HTTP 状态码、失败分类、上游错误体片段、耗时
 //!
-//! 存储：SQLite（`traces.db`），WAL 模式。前端查询直接走 SQL（索引 + WHERE + LIMIT），
-//! 不维护内存缓冲。后台任务定期清理超过保留天数的记录（保留天数与启用开关运行时可改）。
+//! 存储：DuckDB（`kiro.duckdb`，与 usage / ops 共库，schema 见 [`super::duck`]）。
+//! 前端查询直接走 SQL（索引 + WHERE + LIMIT），不维护内存缓冲。
+//! 后台任务定期清理超过保留天数的记录（保留天数与启用开关运行时可改）。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use chrono::Utc;
+use duckdb::{Connection, types::Type};
 use parking_lot::Mutex;
-use rusqlite::{Connection, types::Type};
 use serde::{Deserialize, Serialize};
 
 /// trace 记录默认保留天数
@@ -113,11 +114,11 @@ impl TraceKeySource {
         }
     }
 
-    fn from_db(value: &str, column: usize) -> rusqlite::Result<Self> {
+    fn from_db(value: &str, column: usize) -> duckdb::Result<Self> {
         match value {
             "masterApiKey" => Ok(Self::MasterApiKey),
             "clientKey" => Ok(Self::ClientKey),
-            other => Err(rusqlite::Error::FromSqlConversionFailure(
+            other => Err(duckdb::Error::FromSqlConversionFailure(
                 column,
                 Type::Text,
                 Box::new(std::io::Error::new(
@@ -262,7 +263,7 @@ pub struct TraceQuery {
     pub offset: usize,
 }
 
-/// SQLite 持久化存储
+/// DuckDB 持久化存储
 pub struct TraceStore {
     conn: Mutex<Connection>,
     /// 是否启用 trace 写入（运行时可改）。false 时 insert 直接短路。
@@ -272,25 +273,17 @@ pub struct TraceStore {
 }
 
 impl TraceStore {
-    /// 打开（或创建）数据库并建表。空路径归一为当前目录下的 traces.db。
-    pub fn open(path: PathBuf, enabled: bool, retention_days: u32) -> rusqlite::Result<Self> {
+    /// 打开（或创建）数据库并建表。空路径归一为当前目录下的 kiro.duckdb。
+    /// path 指向共享的 kiro.duckdb；建表由 [`super::duck::open_shared`] 完成，
+    /// 同文件的 OpsStore / UsageStore 各持同一 DuckDB 实例上的独立连接（进程内
+    /// MVCC，append 不冲突），不再需要 SQLite 的 WAL / busy_timeout。
+    pub fn open(path: PathBuf, enabled: bool, retention_days: u32) -> duckdb::Result<Self> {
         let path = if path.as_os_str().is_empty() {
-            PathBuf::from("traces.db")
+            PathBuf::from("kiro.duckdb")
         } else {
             path
         };
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty() && !parent.exists()
-                && let Err(e) = std::fs::create_dir_all(parent) {
-                    tracing::warn!("创建 traces.db 目录失败 {}: {}", parent.display(), e);
-                }
-        let conn = Connection::open(&path)?;
-        // WAL：并发读不阻塞写；synchronous=NORMAL：写吞吐与崩溃安全的平衡
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        // 同一文件还有 OpsStore（ops_events）这个独立写入方，写锁瞬时冲突时等待而非报错
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.execute_batch(SCHEMA)?;
+        let conn = crate::admin::duck::open_shared(&path)?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -299,10 +292,11 @@ impl TraceStore {
         })
     }
 
-    /// 内存数据库（traces.db 打开失败时的兜底；进程退出即丢，但保证 Admin 查询不崩）
-    pub fn open_in_memory() -> rusqlite::Result<Self> {
+    /// 内存数据库（kiro.duckdb 打开失败时的兜底；进程退出即丢，但保证 Admin 查询不崩）。
+    /// 内存库不经过 [`super::duck::open_shared`]，需自行执行建表。
+    pub fn open_in_memory() -> duckdb::Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(crate::admin::duck::SCHEMA)?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -315,7 +309,7 @@ impl TraceStore {
     fn table_columns(
         conn: &Connection,
         table: &str,
-    ) -> rusqlite::Result<std::collections::HashSet<String>> {
+    ) -> duckdb::Result<std::collections::HashSet<String>> {
         let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -326,22 +320,23 @@ impl TraceStore {
     }
 
     /// 旧库迁移：为 traces / trace_attempts 表补齐新增列（幂等，缺哪列加哪列）。
-    /// 老版本的 traces.db 只有基础列，新增的 token/credits/first_token_ms/key_source
+    /// 老版本的库只有基础列，新增的 token/credits/first_token_ms/key_source
     /// 以及 attempt 级 proxy_url 需在此 ALTER。
-    fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    fn migrate(conn: &Connection) -> duckdb::Result<()> {
         let existing = Self::table_columns(conn, "traces")?;
-        // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
-        // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
-        // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
+        // (列名, 定义) —— 与 duck.rs SCHEMA 中新增列保持一致。
+        // 注意全部不带 NOT NULL：DuckDB 的 ALTER ADD COLUMN 不支持附加约束
+        // （"Adding columns with constraints not yet supported"）；带 DEFAULT 的列
+        // 老行会被填成默认值，key_source 以 NULL 添加后在下方回填。新插入永远写入合法值。
         let columns: [(&str, &str); 8] = [
-            ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
-            ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
-            ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
-            ("cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
-            ("credits", "REAL NOT NULL DEFAULT 0"),
-            ("first_token_ms", "INTEGER"),
-            ("key_source", "TEXT"),
-            ("session_id", "TEXT"),
+            ("input_tokens", "BIGINT DEFAULT 0"),
+            ("output_tokens", "BIGINT DEFAULT 0"),
+            ("cache_creation_tokens", "BIGINT DEFAULT 0"),
+            ("cache_read_tokens", "BIGINT DEFAULT 0"),
+            ("credits", "DOUBLE DEFAULT 0"),
+            ("first_token_ms", "BIGINT"),
+            ("key_source", "VARCHAR"),
+            ("session_id", "VARCHAR"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -362,7 +357,7 @@ impl TraceStore {
         // trace_attempts 补列：历史行保持 NULL = 未知
         // （proxy_url：未知出口/直连；started_ms：起点不可知，前端退化为顺序堆叠）
         let attempt_cols = Self::table_columns(conn, "trace_attempts")?;
-        for (name, def) in [("proxy_url", "TEXT"), ("started_ms", "INTEGER")] {
+        for (name, def) in [("proxy_url", "VARCHAR"), ("started_ms", "BIGINT")] {
             if !attempt_cols.contains(name) {
                 conn.execute_batch(&format!(
                     "ALTER TABLE trace_attempts ADD COLUMN {} {};",
@@ -411,7 +406,7 @@ impl TraceStore {
         let ts_epoch = chrono::DateTime::parse_from_rfc3339(&rec.ts)
             .map(|d| d.timestamp())
             .unwrap_or_else(|_| Utc::now().timestamp());
-        let res = (|| -> rusqlite::Result<()> {
+        let res = (|| -> duckdb::Result<()> {
             tx.execute(
                 "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, \
                  is_stream, final_status, final_credential_id, error_type, error_message, \
@@ -419,7 +414,7 @@ impl TraceStore {
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
                  credits, first_token_ms, session_id) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
-                rusqlite::params![
+                duckdb::params![
                     rec.trace_id,
                     rec.ts,
                     ts_epoch,
@@ -448,7 +443,7 @@ impl TraceStore {
                     "INSERT OR REPLACE INTO trace_attempts (trace_id, attempt, credential_id, \
                      endpoint, http_status, outcome, error_snippet, duration_ms, started_ms, proxy_url) \
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                    rusqlite::params![
+                    duckdb::params![
                         rec.trace_id,
                         a.attempt as i64,
                         a.credential_id as i64,
@@ -466,7 +461,7 @@ impl TraceStore {
                 tx.execute(
                     "INSERT OR REPLACE INTO trace_phases (trace_id, seq, phase, started_ms, \
                      duration_ms, outcome, bytes, detail) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                    rusqlite::params![
+                    duckdb::params![
                         rec.trace_id,
                         p.seq as i64,
                         p.phase,
@@ -511,9 +506,9 @@ impl TraceStore {
     }
 
     /// 把 [`TraceQuery`] 的过滤条件拼成 WHERE 子句 + 参数（值全部参数化绑定）
-    fn build_where(q: &TraceQuery) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    fn build_where(q: &TraceQuery) -> (String, Vec<Box<dyn duckdb::ToSql>>) {
         let mut clauses: Vec<String> = Vec::new();
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
         if let Some(s) = &q.status {
             clauses.push("final_status = ?".to_string());
             params.push(Box::new(s.clone()));
@@ -573,9 +568,9 @@ impl TraceStore {
     fn query_inner(
         conn: &Connection,
         q: &TraceQuery,
-    ) -> rusqlite::Result<(Vec<TraceRecord>, usize)> {
+    ) -> duckdb::Result<(Vec<TraceRecord>, usize)> {
         let (where_sql, params) = Self::build_where(q);
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(|b| b.as_ref()).collect();
 
         // 总数（用于前端分页）
         let count_sql = format!("SELECT COUNT(*) FROM traces {}", where_sql);
@@ -622,7 +617,7 @@ impl TraceStore {
                 phases: Vec::new(),
             })
         })?;
-        let mut records: Vec<TraceRecord> = rows.collect::<rusqlite::Result<_>>()?;
+        let mut records: Vec<TraceRecord> = rows.collect::<duckdb::Result<_>>()?;
 
         // 批量取每条 trace 的 attempts
         let mut attempt_stmt = conn.prepare(
@@ -644,7 +639,7 @@ impl TraceStore {
                     proxy_url: row.get(8)?,
                 })
             })?;
-            rec.attempts = attempts.collect::<rusqlite::Result<_>>()?;
+            rec.attempts = attempts.collect::<duckdb::Result<_>>()?;
         }
 
         // 批量取每条 trace 的 phases
@@ -664,7 +659,7 @@ impl TraceStore {
                     detail: row.get(6)?,
                 })
             })?;
-            rec.phases = phases.collect::<rusqlite::Result<_>>()?;
+            rec.phases = phases.collect::<duckdb::Result<_>>()?;
         }
         Ok((records, total as usize))
     }
@@ -681,7 +676,7 @@ impl TraceStore {
                 return;
             }
         };
-        let res = (|| -> rusqlite::Result<usize> {
+        let res = (|| -> duckdb::Result<usize> {
             tx.execute(
                 "DELETE FROM trace_phases WHERE trace_id IN \
                  (SELECT trace_id FROM traces WHERE ts_epoch < ?1)",
@@ -721,22 +716,22 @@ impl TraceStore {
                 return;
             }
         };
-        let res = (|| -> rusqlite::Result<usize> {
+        let res = (|| -> duckdb::Result<usize> {
             // trace_phases 无 credential_id 列，只能走 trace_id 子查询这半支
             // （trace_attempts 那条语句里 "credential_id = ?1 OR" 这半支对 trace_phases 不适用）
             tx.execute(
                 "DELETE FROM trace_phases WHERE trace_id IN \
                  (SELECT trace_id FROM traces WHERE final_credential_id = ?1)",
-                [credential_id],
+                [credential_id as i64],
             )?;
             tx.execute(
                 "DELETE FROM trace_attempts WHERE credential_id = ?1 \
                  OR trace_id IN (SELECT trace_id FROM traces WHERE final_credential_id = ?1)",
-                [credential_id],
+                [credential_id as i64],
             )?;
             let n = tx.execute(
                 "DELETE FROM traces WHERE final_credential_id = ?1",
-                [credential_id],
+                [credential_id as i64],
             )?;
             Ok(n)
         })();
@@ -836,67 +831,10 @@ pub struct FailureStats {
 /// 共享存储句柄
 pub type SharedTraceStore = Arc<TraceStore>;
 
-pub(crate) const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS traces (
-    trace_id          TEXT PRIMARY KEY,
-    ts                TEXT NOT NULL,
-    ts_epoch          INTEGER NOT NULL,
-    key_id            INTEGER NOT NULL,
-    key_source        TEXT,
-    model             TEXT NOT NULL,
-    is_stream         INTEGER NOT NULL,
-    final_status      TEXT NOT NULL,
-    final_credential_id INTEGER NOT NULL,
-    error_type        TEXT,
-    error_message     TEXT,
-    total_attempts    INTEGER NOT NULL,
-    duration_ms       INTEGER NOT NULL,
-    interrupted_after_bytes INTEGER,
-    input_tokens      INTEGER NOT NULL DEFAULT 0,
-    output_tokens     INTEGER NOT NULL DEFAULT 0,
-    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-    credits           REAL NOT NULL DEFAULT 0,
-    first_token_ms    INTEGER,
-    session_id        TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
-CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
-CREATE INDEX IF NOT EXISTS idx_traces_cred ON traces(final_credential_id);
-
-CREATE TABLE IF NOT EXISTS trace_attempts (
-    trace_id      TEXT NOT NULL,
-    attempt       INTEGER NOT NULL,
-    credential_id INTEGER NOT NULL,
-    endpoint      TEXT NOT NULL,
-    http_status   INTEGER,
-    outcome       TEXT NOT NULL,
-    error_snippet TEXT,
-    duration_ms   INTEGER NOT NULL,
-    started_ms    INTEGER,
-    proxy_url     TEXT,
-    PRIMARY KEY (trace_id, attempt)
-);
-CREATE INDEX IF NOT EXISTS idx_attempts_trace ON trace_attempts(trace_id);
-
-CREATE TABLE IF NOT EXISTS trace_phases (
-    trace_id    TEXT NOT NULL,
-    seq         INTEGER NOT NULL,
-    phase       TEXT NOT NULL,
-    started_ms  INTEGER NOT NULL,
-    duration_ms INTEGER NOT NULL,
-    outcome     TEXT NOT NULL,
-    bytes       INTEGER,
-    detail      TEXT,
-    PRIMARY KEY (trace_id, seq)
-);
-CREATE INDEX IF NOT EXISTS idx_phases_trace ON trace_phases(trace_id);
-CREATE INDEX IF NOT EXISTS idx_phases_phase_outcome ON trace_phases(phase, outcome);
-";
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::duck::SCHEMA;
 
     struct TraceSample<'a> {
         trace_id: &'a str,

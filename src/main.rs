@@ -172,23 +172,24 @@ async fn main() {
         config.tls_backend,
     ));
 
-    // traces.db 路径。trace 与 ops 两个存储共用此文件（各持独立连接，WAL 并发安全），
-    // 且必须共享同一「持久化 / 内存兜底」决策：否则会出现「运维页有历史统计、
-    // 请求日志页却为空」的错位。因此先定 trace_store，再据其结果建 ops_store。
-    let traces_db_path = token_manager
+    // kiro.duckdb 路径。usage / trace / ops 三个存储共用此文件（同一进程内 DuckDB
+    // 实例上的独立连接），其中 trace 与 ops 必须共享同一「持久化 / 内存兜底」决策：
+    // 否则会出现「运维页有历史统计、请求日志页却为空」的错位。
+    // 因此先定 trace_store，再据其结果建 ops_store。
+    let cache_dir = token_manager
         .cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("traces.db");
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let duckdb_path = cache_dir.join("kiro.duckdb");
 
-    // 请求链路追踪存储（SQLite，traces.db）。失败不致命：trace 不可用但服务正常。
+    // 请求链路追踪存储（DuckDB，kiro.duckdb）。失败不致命：trace 不可用但服务正常。
     let trace_store: Option<admin::SharedTraceStore> = match admin::TraceStore::open(
-        traces_db_path.clone(),
+        duckdb_path.clone(),
         config.trace_enabled,
         config.trace_retention_days,
     ) {
         Ok(s) => Some(std::sync::Arc::new(s)),
         Err(e) => {
-            tracing::warn!("打开 traces.db 失败，请求链路追踪不可用: {}", e);
+            tracing::warn!("打开 kiro.duckdb 失败，请求链路追踪不可用: {}", e);
             None
         }
     };
@@ -196,7 +197,7 @@ async fn main() {
     // Ops 事件存储：trace 主库成功时用同一持久化文件；trace 降级到内存时 ops 也用内存，
     // 保证两者查询落在同一数据库视图。
     let ops_store = Arc::new(if trace_store.is_some() {
-        admin::OpsStore::open(traces_db_path.clone()).unwrap_or_else(|e| {
+        admin::OpsStore::open(duckdb_path.clone()).unwrap_or_else(|e| {
             tracing::warn!("打开 ops 存储失败，处置事件仅进程内可见: {}", e);
             admin::OpsStore::open_in_memory().expect("内存 ops 存储初始化失败")
         })
@@ -232,9 +233,6 @@ async fn main() {
     });
 
     // 客户端 Key 管理器 + 用量记录器 + 聚合器（与凭据文件同目录）
-    let cache_dir = token_manager
-        .cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
     let client_keys_path = admin::client_keys::default_path_in(&cache_dir);
     let client_key_manager = std::sync::Arc::new(
         admin::ClientKeyManager::load(&client_keys_path).unwrap_or_else(|e| {
@@ -244,7 +242,6 @@ async fn main() {
     );
     // 用量存储（kiro.duckdb）。与 trace/ops 共用同一 DuckDB 文件；起不来 fail-fast——
     // 它同时承载写入与统计端点，静默降级会让「服务在跑但统计悄悄丢失」。
-    let duckdb_path = cache_dir.join("kiro.duckdb");
     let usage_store = std::sync::Arc::new(
         admin::UsageStore::open(&duckdb_path, config.usage_log_retention_days as i64)
             .unwrap_or_else(|e| panic!("打开 {} 失败: {}", duckdb_path.display(), e)),
@@ -435,7 +432,7 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            // Admin 查询需要一个确定的 store；traces.db 打开失败时用内存兜底（仅本进程有效）
+            // Admin 查询需要一个确定的 store；kiro.duckdb 打开失败时用内存兜底（仅本进程有效）
             let admin_trace_store = trace_store.clone().unwrap_or_else(|| {
                 std::sync::Arc::new(
                     admin::TraceStore::open_in_memory()

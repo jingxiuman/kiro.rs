@@ -29,8 +29,8 @@ pub fn open_shared(path: &Path) -> duckdb::Result<Connection> {
 }
 
 /// 全部表定义（幂等）。usage_records / imported_files 归 UsageStore；
-/// traces 系列与 ops_events 在 trace/ops 迁移时并入。
-const SCHEMA: &str = "
+/// traces / trace_attempts / trace_phases 归 TraceStore；ops_events 归 OpsStore。
+pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS usage_records (
     ts                    TIMESTAMPTZ NOT NULL,
     key_id                BIGINT NOT NULL,
@@ -49,6 +49,74 @@ CREATE TABLE IF NOT EXISTS imported_files (
     imported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     rows        BIGINT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS traces (
+    trace_id          VARCHAR PRIMARY KEY,
+    ts                VARCHAR NOT NULL,
+    ts_epoch          BIGINT NOT NULL,
+    key_id            BIGINT NOT NULL,
+    key_source        VARCHAR,
+    model             VARCHAR NOT NULL,
+    is_stream         BIGINT NOT NULL,
+    final_status      VARCHAR NOT NULL,
+    final_credential_id BIGINT NOT NULL,
+    error_type        VARCHAR,
+    error_message     VARCHAR,
+    total_attempts    BIGINT NOT NULL,
+    duration_ms       BIGINT NOT NULL,
+    interrupted_after_bytes BIGINT,
+    input_tokens      BIGINT NOT NULL DEFAULT 0,
+    output_tokens     BIGINT NOT NULL DEFAULT 0,
+    cache_creation_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+    credits           DOUBLE NOT NULL DEFAULT 0,
+    first_token_ms    BIGINT,
+    session_id        VARCHAR
+);
+CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
+CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
+CREATE INDEX IF NOT EXISTS idx_traces_cred ON traces(final_credential_id);
+
+CREATE TABLE IF NOT EXISTS trace_attempts (
+    trace_id      VARCHAR NOT NULL,
+    attempt       BIGINT NOT NULL,
+    credential_id BIGINT NOT NULL,
+    endpoint      VARCHAR NOT NULL,
+    http_status   BIGINT,
+    outcome       VARCHAR NOT NULL,
+    error_snippet VARCHAR,
+    duration_ms   BIGINT NOT NULL,
+    started_ms    BIGINT,
+    proxy_url     VARCHAR,
+    PRIMARY KEY (trace_id, attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_attempts_trace ON trace_attempts(trace_id);
+
+CREATE TABLE IF NOT EXISTS trace_phases (
+    trace_id    VARCHAR NOT NULL,
+    seq         BIGINT NOT NULL,
+    phase       VARCHAR NOT NULL,
+    started_ms  BIGINT NOT NULL,
+    duration_ms BIGINT NOT NULL,
+    outcome     VARCHAR NOT NULL,
+    bytes       BIGINT,
+    detail      VARCHAR,
+    PRIMARY KEY (trace_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_phases_trace ON trace_phases(trace_id);
+CREATE INDEX IF NOT EXISTS idx_phases_phase_outcome ON trace_phases(phase, outcome);
+
+CREATE SEQUENCE IF NOT EXISTS ops_events_id_seq;
+CREATE TABLE IF NOT EXISTS ops_events (
+    id       BIGINT PRIMARY KEY DEFAULT nextval('ops_events_id_seq'),
+    ts       VARCHAR NOT NULL,
+    ts_epoch BIGINT NOT NULL,
+    category VARCHAR NOT NULL,
+    severity VARCHAR NOT NULL,
+    subject  VARCHAR NOT NULL,
+    message  VARCHAR NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ops_events_ts ON ops_events(ts_epoch DESC);
 ";
 
 #[cfg(test)]
