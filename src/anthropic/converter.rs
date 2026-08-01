@@ -187,6 +187,28 @@ const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` con
 const BASH_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: Do not send very large commands, inline scripts, or heredocs. If a command would exceed 100 lines or ~8000 characters, first create/modify a script file with chunked Write/Edit calls, then run a short command that executes it. Do not retry the same oversized command after a failure; split it smaller.";
 
 /// 追加到系统提示词的分块写入策略
+/// 用户文本与 tool_result 同处一条消息时，给文本加的边界标记。
+///
+/// 为什么需要：Anthropic 的一条 user 消息里，`tool_result` 块和 `text` 块是**有序兄弟**，
+/// 「文本在工具输出之后」这个位置关系本身携带语义（=用户在工具循环中途插话）。
+/// Kiro 的上行结构把两者拆到平级的两个字段——`content`(单 string) 与
+/// `userInputMessageContext.toolResults`——顺序关系无处表达。对比 sub2api 转
+/// Responses 格式时会拆成两个有序 item（`function_call_output` 后跟独立 user item），
+/// 那条信息是保住的；这里只能用文本标记把它补回来。
+///
+/// 注意作用范围：这恢复的是「这段文本是用户的话，不是工具输出的旁注」这一区分。
+/// 已实测**不能**指望它让模型服从任意指令——与待办任务冲突的硬性指令在加/不加标记、
+/// 独立成轮/贴着 tool_result 四种组合下都会被压过去，那是模型侧的指令优先级行为。
+const USER_TEXT_ALONGSIDE_TOOL_RESULT_MARKER: &str = "[user message]";
+
+/// 给与 tool_result 共存的用户文本加边界标记；无文本或无 tool_result 时原样返回。
+fn mark_user_text_alongside_tool_results(text: String, has_tool_results: bool) -> String {
+    if text.is_empty() || !has_tool_results {
+        return text;
+    }
+    format!("{}\n{}", USER_TEXT_ALONGSIDE_TOOL_RESULT_MARKER, text)
+}
+
 const SYSTEM_CHUNKED_POLICY: &str = "\
 When the Write or Edit tool has content size limits, always comply silently. \
 Never suggest bypassing these limits via alternative tools. \
@@ -664,6 +686,8 @@ pub fn convert_request_with_mode(
     }
 
     // 11. 构建 UserInputMessageContext
+    // 先记下「本轮上行是否真带 tool_result」（下面 with_tool_results 会 move 掉它）
+    let has_tool_results = !validated_tool_results.is_empty();
     let mut context = UserInputMessageContext::new();
     if !tools.is_empty() {
         context = context.with_tools(tools);
@@ -673,8 +697,9 @@ pub fn convert_request_with_mode(
     }
 
     // 12. 构建当前消息
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = text_content;
+    // 保留文本内容，即使有工具结果也不丢弃用户文本；
+    // 与 tool_result 共存时加边界标记，恢复「这是用户的话」这一被结构抹掉的区分。
+    let content = mark_user_text_alongside_tool_results(text_content, has_tool_results);
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -1620,8 +1645,12 @@ fn merge_user_messages(
         all_tool_results.extend(tool_results);
     }
 
-    let content = content_parts.join("\n");
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
+    // 保留文本内容，即使有工具结果也不丢弃用户文本；
+    // 与 tool_result 共存时加边界标记（含「连续多条 user 消息被合并」的情形）。
+    let content = mark_user_text_alongside_tool_results(
+        content_parts.join("\n"),
+        !all_tool_results.is_empty(),
+    );
     let mut user_msg = UserMessage::new(&content, model_id);
 
     if !all_images.is_empty() {
@@ -3522,6 +3551,137 @@ mod tests {
                 "{m}: registry 命中 None 时应与硬编码判断逐一致"
             );
         }
+    }
+
+    /// 用户在工具循环中途插入的文本，必须与 tool_result 一同上行且带边界标记。
+    /// 这是被 Kiro 上行结构抹掉的「文本在工具输出之后」位置语义的替代表达。
+    #[test]
+    fn user_text_alongside_tool_result_is_marked() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Read /auth.rs then summarize it."),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "t1", "name": "read", "input": {}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "fn login() {}"},
+                        {"type": "text", "text": "Actually, answer in French."}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        // 文本不丢，且带标记；tool_result 仍在 context 里并存
+        assert_eq!(
+            msg.content, "[user message]\nActually, answer in French.",
+            "与 tool_result 共存的用户文本必须保留并带边界标记"
+        );
+        assert_eq!(
+            msg.user_input_message_context.tool_results.len(),
+            1,
+            "加标记不能影响 tool_result 上行"
+        );
+    }
+
+    /// 没有 tool_result 时不加标记——避免污染普通对话的 content，
+    /// 也避免无谓地打断上游 prompt cache 前缀。
+    #[test]
+    fn plain_user_text_is_not_marked() {
+        let result = convert_request(&minimal_request("claude-sonnet-4.5")).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+        assert!(
+            !msg.content.contains("[user message]"),
+            "无 tool_result 的普通消息不应被加标记，实际 content={:?}",
+            msg.content
+        );
+    }
+
+    /// 连续多条 user 消息被合并进 history 时（tool_result 一条、插入指令另一条），
+    /// 合并后的文本同样要带标记。
+    #[test]
+    fn merged_history_user_text_alongside_tool_result_is_marked() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Read /auth.rs"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "t1", "name": "read", "input": {}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "fn login() {}"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("MID-INJECTION answer in French"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("D'accord"),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("continue"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let merged = result
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(u) => Some(&u.user_input_message),
+                _ => None,
+            })
+            .find(|u| u.content.contains("MID-INJECTION"))
+            .expect("合并后的 user 消息必须仍在 history 中");
+
+        assert_eq!(
+            merged.content, "[user message]\nMID-INJECTION answer in French",
+            "合并进 history 的插入文本必须带标记"
+        );
     }
 
     /// 转换结果必须携带窗口，供响应处理阶段使用（避免热重载导致映射/计量不一致）

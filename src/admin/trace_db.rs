@@ -41,15 +41,21 @@ pub struct TraceAttempt {
     pub error_snippet: Option<String>,
     /// 本跳耗时（毫秒）
     pub duration_ms: u64,
+    /// 本跳相对请求起点的偏移（毫秒）。`None` = 未知（该列存在前的历史行）。
+    ///
+    /// 由 `RequestTracer::on_attempt` 换算填入——provider 不持有请求起点，算不出。
+    /// 有了它，相邻两跳之间的空隙才能被识别为重试 backoff（否则色块条只能顺序堆）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ms: Option<u64>,
     /// 本跳出口：`"direct"` = 直连；`None` = 未知（该列存在前的历史行）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
 }
 
-/// 流生命周期的一段。仅流式请求产生；非流式请求无此记录。
+/// 响应处理的一段。流式与非流式都产生，段名不同（见 [`phase`]）。
 ///
 /// 与 [`TraceAttempt`] 的分工：attempt 覆盖 connect→headers（N 跳，含重试），
-/// phase 覆盖 headers 之后的流生命周期（1 条流）。两者基数不同，不合表。
+/// phase 覆盖 headers 之后的响应处理（1 条响应）。两者基数不同，不合表。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TracePhase {
@@ -69,14 +75,24 @@ pub struct TracePhase {
     pub detail: Option<String>,
 }
 
-/// 流生命周期段名
+/// 响应处理段名
+///
+/// [`FIRST_TOKEN`] 两条路径共用（语义同为「等上游吐第一口」），故 `phase_baseline`
+/// 与前端标签自动通用；其后的段名按路径分开，因为工作内容不同：流式是边收边发，
+/// 非流式是收全 → 解码 → 组装。
 pub mod phase {
-    /// 建连成功到首个上游 chunk 到达
+    /// 建连成功到首个上游 chunk 到达（流式 / 非流式共用）
     pub const FIRST_TOKEN: &str = "first_token";
-    /// 首 chunk 之后的持续传输
+    /// 首 chunk 之后的持续传输（流式）
     pub const STREAMING: &str = "streaming";
-    /// 流结束时的收尾判定（含 tool_use 累积器 finish 结果）
+    /// 流结束时的收尾判定（含 tool_use 累积器 finish 结果）（流式）
     pub const FINISH: &str = "finish";
+    /// 首 chunk 之后收完剩余响应体（非流式）
+    pub const BODY_READ: &str = "body_read";
+    /// EventStream 解码 + 事件累积（非流式）
+    pub const DECODE: &str = "decode";
+    /// 响应内容组装 + 输出 token 估算（非流式）
+    pub const ASSEMBLE: &str = "assemble";
 }
 
 /// 调用方使用的入口 Key 类型。
@@ -141,7 +157,10 @@ pub struct TraceRecord {
     pub total_attempts: u32,
     /// 端到端耗时（毫秒）
     pub duration_ms: u64,
-    /// 流式中断时已发送的字节数（区分完整失败 vs 半截中断）
+    /// 中断时的字节数（区分完整失败 vs 半截中断）。
+    ///
+    /// 两条路径语义不同：流式 = 已下发给客户端的字节；非流式 = 从上游收到多少就断了
+    /// （非流式在响应组装完成前不向客户端写任何字节）。前端按 `is_stream` 分文案。
     pub interrupted_after_bytes: Option<u64>,
     /// 输入 token（Anthropic 口径）
     #[serde(default)]
@@ -158,7 +177,8 @@ pub struct TraceRecord {
     /// 费用（上游 meteringEvent 累计的 credits）
     #[serde(default)]
     pub credits: f64,
-    /// 首 Token 延迟（毫秒，仅流式有值；非流式为 None）
+    /// 首 Token 延迟（毫秒）。两条路径都有值；None = 未收到任何 chunk（早期失败）
+    /// 或该列存在前的历史行。
     #[serde(default)]
     pub first_token_ms: Option<u64>,
     /// Claude Code 会话 id（取自 metadata.user_id 的 `_session_<uuid>`）。
@@ -167,7 +187,7 @@ pub struct TraceRecord {
     pub session_id: Option<String>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
-    /// 流生命周期分段；非流式请求为空
+    /// 响应处理分段；早期失败（未到达上游）为空
     #[serde(default)]
     pub phases: Vec<TracePhase>,
 }
@@ -339,10 +359,16 @@ impl TraceStore {
                  THEN 'masterApiKey' ELSE 'clientKey' END WHERE key_source IS NULL;",
             )?;
         }
-        // trace_attempts 补列：proxy_url（老库无此列，历史行保持 NULL = 未知/直连）
+        // trace_attempts 补列：历史行保持 NULL = 未知
+        // （proxy_url：未知出口/直连；started_ms：起点不可知，前端退化为顺序堆叠）
         let attempt_cols = Self::table_columns(conn, "trace_attempts")?;
-        if !attempt_cols.contains("proxy_url") {
-            conn.execute_batch("ALTER TABLE trace_attempts ADD COLUMN proxy_url TEXT;")?;
+        for (name, def) in [("proxy_url", "TEXT"), ("started_ms", "INTEGER")] {
+            if !attempt_cols.contains(name) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE trace_attempts ADD COLUMN {} {};",
+                    name, def
+                ))?;
+            }
         }
         Ok(())
     }
@@ -420,8 +446,8 @@ impl TraceStore {
             for a in &rec.attempts {
                 tx.execute(
                     "INSERT OR REPLACE INTO trace_attempts (trace_id, attempt, credential_id, \
-                     endpoint, http_status, outcome, error_snippet, duration_ms, proxy_url) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                     endpoint, http_status, outcome, error_snippet, duration_ms, started_ms, proxy_url) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                     rusqlite::params![
                         rec.trace_id,
                         a.attempt as i64,
@@ -431,6 +457,7 @@ impl TraceStore {
                         a.outcome,
                         a.error_snippet,
                         a.duration_ms as i64,
+                        a.started_ms.map(|v| v as i64),
                         a.proxy_url,
                     ],
                 )?;
@@ -600,7 +627,8 @@ impl TraceStore {
         // 批量取每条 trace 的 attempts
         let mut attempt_stmt = conn.prepare(
             "SELECT attempt, credential_id, endpoint, http_status, outcome, error_snippet, \
-             duration_ms, proxy_url FROM trace_attempts WHERE trace_id = ? ORDER BY attempt ASC",
+             duration_ms, started_ms, proxy_url FROM trace_attempts WHERE trace_id = ? \
+             ORDER BY attempt ASC",
         )?;
         for rec in &mut records {
             let attempts = attempt_stmt.query_map([&rec.trace_id], |row| {
@@ -612,7 +640,8 @@ impl TraceStore {
                     outcome: row.get(4)?,
                     error_snippet: row.get(5)?,
                     duration_ms: row.get::<_, i64>(6)? as u64,
-                    proxy_url: row.get(7)?,
+                    started_ms: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                    proxy_url: row.get(8)?,
                 })
             })?;
             rec.attempts = attempts.collect::<rusqlite::Result<_>>()?;
@@ -844,6 +873,7 @@ CREATE TABLE IF NOT EXISTS trace_attempts (
     outcome       TEXT NOT NULL,
     error_snippet TEXT,
     duration_ms   INTEGER NOT NULL,
+    started_ms    INTEGER,
     proxy_url     TEXT,
     PRIMARY KEY (trace_id, attempt)
 );
@@ -914,6 +944,7 @@ mod tests {
                     outcome: outcome::ACCOUNT_THROTTLED.to_string(),
                     error_snippet: Some("suspicious activity".to_string()),
                     duration_ms: 400,
+                    started_ms: Some(0),
                     proxy_url: Some("socks5://p1:1080".to_string()),
                 },
                 TraceAttempt {
@@ -928,6 +959,8 @@ mod tests {
                     outcome: input.status.to_string(),
                     error_snippet: None,
                     duration_ms: 800,
+                    // 与第 0 跳留出 400→900 的空隙，代表一次重试 backoff
+                    started_ms: Some(900),
                     proxy_url: None,
                 },
             ],
@@ -1002,6 +1035,91 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn attempt_started_ms_round_trips() {
+        let store = mem_store();
+        store.insert(&sample(TraceSample {
+            trace_id: "t-off",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        }));
+        let out = store.query(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        let attempts = &out[0].attempts;
+        assert_eq!(attempts[0].started_ms, Some(0));
+        // 第 1 跳起点 900 > 第 0 跳终点 400 —— 中间 500ms 是重试 backoff，
+        // 前端据此画出空隙段。丢了这一列就只能顺序堆叠，backoff 会被抹掉。
+        assert_eq!(attempts[1].started_ms, Some(900));
+        assert!(
+            attempts[1].started_ms.unwrap()
+                > attempts[0].started_ms.unwrap() + attempts[0].duration_ms,
+            "两跳之间应存在可识别的 backoff 空隙"
+        );
+    }
+
+    /// 老库（无 started_ms 列）迁移后仍可读写，历史行该列为 None。
+    #[test]
+    fn migrate_adds_attempt_started_ms_and_keeps_old_rows_readable() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 复刻该列存在前的 trace_attempts 定义
+        conn.execute_batch(
+            "CREATE TABLE traces (
+                trace_id TEXT PRIMARY KEY, ts TEXT NOT NULL, ts_epoch INTEGER NOT NULL,
+                key_id INTEGER NOT NULL, model TEXT NOT NULL, is_stream INTEGER NOT NULL,
+                final_status TEXT NOT NULL, final_credential_id INTEGER NOT NULL,
+                error_type TEXT, error_message TEXT, total_attempts INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL, interrupted_after_bytes INTEGER);
+             CREATE TABLE trace_attempts (
+                trace_id TEXT NOT NULL, attempt INTEGER NOT NULL, credential_id INTEGER NOT NULL,
+                endpoint TEXT NOT NULL, http_status INTEGER, outcome TEXT NOT NULL,
+                error_snippet TEXT, duration_ms INTEGER NOT NULL,
+                PRIMARY KEY (trace_id, attempt));
+             INSERT INTO traces VALUES
+                ('t-old','2026-07-30T00:00:00Z',1785369600,0,'m1',1,'success',5,NULL,NULL,1,700,NULL);
+             INSERT INTO trace_attempts VALUES ('t-old',0,5,'ide',200,'success',NULL,700);",
+        )
+        .unwrap();
+        TraceStore::migrate(&conn).unwrap();
+        // 幂等：重复迁移不应报 duplicate column
+        TraceStore::migrate(&conn).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+
+        let store = TraceStore {
+            conn: Mutex::new(conn),
+            enabled: AtomicBool::new(true),
+            retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
+        };
+        let out = store.query(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        let old = out
+            .iter()
+            .find(|r| r.trace_id == "t-old")
+            .expect("老行应可读");
+        assert_eq!(
+            old.attempts[0].started_ms, None,
+            "历史行起点不可知，必须是 None 而非伪造的 0"
+        );
+
+        // 迁移后新写入仍带上偏移
+        store.insert(&sample(TraceSample {
+            trace_id: "t-new",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        }));
+        let out = store.query(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        let new = out.iter().find(|r| r.trace_id == "t-new").unwrap();
+        assert_eq!(new.attempts[0].started_ms, Some(0));
     }
 
     #[test]
@@ -1124,6 +1242,7 @@ mod tests {
             outcome: outcome::SUCCESS.to_string(),
             error_snippet: None,
             duration_ms: 800,
+            started_ms: Some(0),
             proxy_url: None,
         }];
         store.insert(&rec);

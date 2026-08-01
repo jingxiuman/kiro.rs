@@ -22,6 +22,7 @@ import {
 } from 'recharts'
 import {
   useOpsCredentials,
+  useOpsErrorCrosstab,
   useOpsEvents,
   useOpsOverview,
   useOpsProxies,
@@ -29,6 +30,10 @@ import {
 } from '@/hooks/use-ops'
 import { useTraces } from '@/hooks/use-traces'
 import type {
+  CrosstabBucket,
+  CrosstabDimension,
+  CrosstabRow,
+  DurationPercentiles,
   OpsCredentialRow,
   OpsEvent,
   OpsProxyRow,
@@ -66,6 +71,18 @@ function formatDuration(ms?: number | null): string {
   if (ms == null) return '—'
   if (ms < 1000) return `${ms}ms`
   return `${(ms / 1000).toFixed(1)}s`
+}
+
+/**
+ * 中断耗时卡的副标题。
+ *
+ * 头条取 p95 而非 p99：实测中断样本 7 天仅约 20 条，n 这么小时 p99 就等于最大值
+ * 本身，拿它当头条会让人以为有分位精度。同时把 p50 与 n 一起显示 —— p50 与 p95
+ * 拉开（如 240s vs 720s）就是"链路上存在多个不同固定超时"的信号。
+ */
+function interruptedDurationSub(d?: DurationPercentiles | null): string {
+  if (!d) return '窗口内无中断'
+  return `p50 ${formatDuration(d.p50)} · p99 ${formatDuration(d.p99)} · n=${d.n}`
 }
 
 function pct(part: number, total: number): string {
@@ -195,6 +212,193 @@ function ErrorTypeList({ hours }: { hours: number }) {
         )}
       </CardContent>
     </Card>
+  )
+}
+
+const CROSSTAB_DIMS: { label: string; value: CrosstabDimension }[] = [
+  { label: '按凭据', value: 'credential' },
+  { label: '按代理', value: 'proxy' },
+  { label: '按模型', value: 'model' },
+  { label: '按端点', value: 'endpoint' },
+]
+
+/** lift 判读阈值。≥2 视为超额，<1.25 视为与流量相称，中间为灰区 */
+const LIFT_HIGH = 2.0
+const LIFT_NORMAL = 1.25
+/**
+ * lift 可信所需的最小流量（分母）。低于此值时倍数由极小的分母算出，不可靠。
+ */
+const LIFT_MIN_TRAFFIC = 30
+/**
+ * lift 可信所需的最小错误数（分子）。
+ *
+ * 分母守卫不够：实测有过「1 个错误 / 1.1K 流量」算出 lift 3.17 被标红的情形，
+ * 流量足够大所以分母守卫放行了，但 1 个错误无论分母多大都不构成模式。
+ * 分子分母任一过小就不着色，只如实显示数值，避免把噪声渲染成告警。
+ */
+const LIFT_MIN_ERRORS = 3
+
+/**
+ * 桶标签。空串在不同维度含义不同，必须按维度分别解释：
+ * proxy 维度的空串 = 出口未知（该列存在前的历史行）；
+ * endpoint 维度的空串 = 请求没走到上游，压根没有端点可记（实测这类行全属凭据 0）。
+ * 一律显示成「直连/未知」会把后者说成一个不存在的事实。
+ */
+function bucketLabel(b: CrosstabBucket, dim: CrosstabDimension): string {
+  if (b.email) return b.email
+  if (b.key === '') {
+    return dim === 'endpoint' ? '(未到达上游)' : '(直连/未知)'
+  }
+  if (b.key === 'direct') return '直连'
+  return b.key
+}
+
+/**
+ * error_type × 维度 交叉表面板。
+ *
+ * 面板的判读重点是 lift 而非集中度：流量分布不均时，占流量最大的对象在每种错误上
+ * 都会显得「集中」。实测 claude-opus-5 占全流量 63%，集中度 0.97 看着像元凶，
+ * 但 lift 仅 1.53 —— 与流量相称。所以 lift 用色彩强调，集中度只作为副信息。
+ */
+function ErrorCrosstabPanel({ hours }: { hours: number }) {
+  const [dim, setDim] = useState<CrosstabDimension>('credential')
+  const { data } = useOpsErrorCrosstab(hours, dim)
+  const rows = data?.rows ?? []
+
+  return (
+    <Card>
+      <CardContent className="p-4 sm:p-5">
+        <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h2 className="text-base font-semibold tracking-tight">错误交叉分析</h2>
+            <p className="text-[12px] text-muted-foreground">
+              看 lift 而非集中度：lift≈1 说明错误份额与流量份额相称（不是问题），
+              明显 &gt;1 才是错得不成比例
+            </p>
+          </div>
+          <div className="flex items-center gap-1 rounded-full border border-border/60 p-0.5">
+            {CROSSTAB_DIMS.map((d) => (
+              <Button
+                key={d.value}
+                size="sm"
+                variant={dim === d.value ? 'default' : 'ghost'}
+                className="h-7 rounded-full px-3 text-xs"
+                onClick={() => setDim(d.value)}
+              >
+                {d.label}
+              </Button>
+            ))}
+          </div>
+        </div>
+        {rows.length === 0 ? (
+          <div className="py-8 text-center text-sm text-muted-foreground">窗口内无错误</div>
+        ) : (
+          <div className="space-y-3">
+            {rows.map((r) => (
+              <CrosstabRowBlock key={r.errorType} row={r} dim={dim} />
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function CrosstabRowBlock({ row, dim }: { row: CrosstabRow; dim: CrosstabDimension }) {
+  return (
+    <div className="rounded-lg border border-border/50 p-3">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <span className="font-medium text-[13px]">{row.errorType}</span>
+        <Badge variant="secondary">{formatNumber(row.total)} 次</Badge>
+        <span className="text-[11px] text-muted-foreground">
+          集中度 {(row.concentration * 100).toFixed(0)}% · 覆盖 {row.distinctKeys} 个对象
+        </span>
+      </div>
+      <div className="space-y-1">
+        {row.buckets.map((b) => (
+          <CrosstabBucketRow key={b.key} bucket={b} dim={dim} />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * 样本量不足的原因。分子（错误数）与分母（流量）任一过小，lift 都不可信，
+ * 但两者的原因不同，提示文案也应不同 —— 否则用户看到「样本过小」会去看流量，
+ * 而真正的问题可能在错误数只有 1。
+ */
+/**
+ * lift 在该桶上是否根本没有意义（区别于「样本不足所以不可信」）。
+ *
+ * endpoint 维度的空串桶 = 请求没走到上游。这类请求按定义 100% 失败，
+ * 错误数恒等于流量数，于是 lift 必然是个巨大的数（实测 380）—— 它是同义反复，
+ * 不是信号，但因为满足「100% 失败率」豁免又不会被样本守卫拦住，
+ * 会以最高 lift 出现在面板上，抢掉真实信号的注意力。
+ */
+function liftIsMeaningless(b: CrosstabBucket, dim: CrosstabDimension): boolean {
+  return dim === 'endpoint' && b.key === ''
+}
+
+function liftSampleWarning(b: CrosstabBucket): string | null {
+  // 分子守卫无豁免：错误数太少，无论分母多大都不成模式
+  if (b.count < LIFT_MIN_ERRORS) {
+    return `仅 ${b.count} 个错误，不足以构成模式（需 ≥${LIFT_MIN_ERRORS}）`
+  }
+  // 分母守卫有一个豁免：失败率 100% 时流量小不影响结论。
+  // 实测代理 10101 是 10 次请求 10 次全失败（已核实为真故障），流量 10 < 30
+  // 会被分母守卫误压成噪声 —— 但连续 10 次全失败不可能是巧合。
+  // 对照组：direct 是 1/1 全失败，被上面的分子守卫正确挡住，不会因本豁免漏出。
+  const allFailed = b.traffic > 0 && b.count >= b.traffic
+  if (!allFailed && b.traffic > 0 && b.traffic < LIFT_MIN_TRAFFIC) {
+    return `流量仅 ${b.traffic}，倍数由过小的分母算出（需 ≥${LIFT_MIN_TRAFFIC}）`
+  }
+  return null
+}
+
+function CrosstabBucketRow({
+  bucket,
+  dim,
+}: {
+  bucket: CrosstabBucket
+  dim: CrosstabDimension
+}) {
+  const meaningless = liftIsMeaningless(bucket, dim)
+  const lift = meaningless ? null : bucket.lift
+  const warning = meaningless ? null : liftSampleWarning(bucket)
+  // 样本不足时一律不着色：着色等于在说"这里有问题"，而噪声不该触发告警观感
+  const tone =
+    lift == null || warning != null
+      ? 'text-muted-foreground'
+      : lift >= LIFT_HIGH
+        ? 'text-red-600 dark:text-red-400 font-semibold'
+        : lift < LIFT_NORMAL
+          ? 'text-muted-foreground'
+          : 'text-amber-600 dark:text-amber-400'
+
+  return (
+    <div className="flex items-center gap-2 text-[12px]">
+      <span className="min-w-0 flex-1 truncate" title={bucket.key}>
+        {bucketLabel(bucket, dim)}
+      </span>
+      <span className="shrink-0 tabular-nums text-muted-foreground">
+        错误 {formatNumber(bucket.count)} / 流量 {formatNumber(bucket.traffic)}
+      </span>
+      <span className={cn('w-[112px] shrink-0 text-right tabular-nums', tone)}>
+        {meaningless ? (
+          <span title="这类请求按定义 100% 失败，lift 无意义">lift —</span>
+        ) : lift == null ? (
+          'lift n/a'
+        ) : (
+          `lift ${lift.toFixed(2)}`
+        )}
+        {warning && (
+          <span className="ml-1 cursor-help text-muted-foreground" title={warning}>
+            ⚠
+          </span>
+        )}
+      </span>
+    </div>
   )
 }
 
@@ -570,10 +774,10 @@ export function OpsPage() {
         />
         <StatCard
           icon={<Timer className="h-4 w-4" />}
-          label="中断平均时长"
-          value={formatDuration(overview?.interruptedAvgDurationMs)}
-          sub="集中在同一时长 → 链路固定超时"
-          tone={overview?.interruptedAvgDurationMs ? 'bad' : undefined}
+          label="中断耗时 p95"
+          value={formatDuration(overview?.interruptedDuration?.p95)}
+          sub={interruptedDurationSub(overview?.interruptedDuration)}
+          tone={overview?.interruptedDuration ? 'bad' : undefined}
         />
         <StatCard
           icon={<Network className="h-4 w-4" />}
@@ -594,6 +798,7 @@ export function OpsPage() {
         <ErrorTypeList hours={hours} />
       </div>
 
+      <ErrorCrosstabPanel hours={hours} />
       <CredentialTable rows={credentials ?? []} />
       <ProxyTable stats={proxies?.stats ?? []} pool={proxies?.pool.proxies ?? []} />
       <RecentErrorList />

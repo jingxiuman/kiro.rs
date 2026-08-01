@@ -1,5 +1,11 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { getByCredential, getByModel, getOverview, getTimeSeries } from '@/api/stats'
+import {
+  getByCredential,
+  getByModel,
+  getCreditsByCredential,
+  getOverview,
+  getTimeSeries,
+} from '@/api/stats'
 import type { StatsFilter, StatsTimeFilter } from '@/types/api'
 
 /**
@@ -54,6 +60,20 @@ export function useByCredential(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
     queryKey: ['stats', 'by-credential', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all'],
     queryFn: () => getByCredential(time, filter),
+    ...COMMON,
+  })
+}
+
+export function useCreditsByCredential(time: StatsTimeFilter, filter?: StatsFilter) {
+  return useQuery({
+    queryKey: [
+      'stats',
+      'credits-by-credential',
+      ...timeKey(time),
+      filter?.keyId ?? 'all',
+      filter?.group ?? 'all',
+    ],
+    queryFn: () => getCreditsByCredential(time, filter),
     ...COMMON,
   })
 }

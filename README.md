@@ -291,11 +291,17 @@ codex
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/v1/models` | 返回本服务声明支持的模型列表 |
+| `GET` | `/v1/models` | 返回调用 Key 所属凭据组可用的模型列表（组内并集，见下） |
 | `POST` | `/v1/messages` | Anthropic Messages API 兼容入口 |
 | `POST` | `/v1/messages/count_tokens` | Anthropic count_tokens 兼容入口 |
 | `POST` | `/cc/v1/messages` | Claude Code 兼容入口，流式事件顺序针对 Claude Code 调整 |
 | `POST` | `/cc/v1/messages/count_tokens` | Claude Code 兼容 count_tokens |
+
+**模型视图按凭据组收窄**：不同 Kiro 账号从上游拉到的可用模型集不同，因此 `/v1/models`
+只返回调用 Key 所属分组内**至少一个凭据**支持的模型（并集语义；`auto` 恒可见）。
+请求分组内无任何凭据支持的模型时，直接返回 `404 not_found_error`，不再路由到上游换取
+`400 INVALID_MODEL_ID`。凭据可用模型集由模型同步逐凭据拉取，落在 `models.json` 的
+`credentialSupport`；**无记录视为未知并放行**（保守，避免新加凭据被误排除）。
 
 ### OpenAI 兼容
 
@@ -363,6 +369,8 @@ Admin API 鉴权同样支持：
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
 | `requireProxy` | `false` | 强制走代理：无可用代理时拒绝出网而非降级直连（见「代理优先级」） |
+| `streamIdleTimeoutSecs` | `90` | 流式上游相邻数据帧的最大空闲秒数；必须大于 HTTP/2 keep-alive 探测窗口（40s） |
+| `streamTotalTimeoutSecs` | `1800` | 流式上游请求的绝对总时限（秒）；必须大于 `streamIdleTimeoutSecs` |
 | `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
 | `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |

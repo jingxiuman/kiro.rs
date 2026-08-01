@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client, build_streaming_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::machine_id;
@@ -34,6 +34,9 @@ const MAX_TOTAL_RETRIES: usize = 4;
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
+
+/// MCP/WebSearch 是一问一答的非流式请求，保留改动前的 720s 总超时语义。
+const MCP_TOTAL_TIMEOUT_SECS: u64 = 720;
 
 /// 带容量上限的 HTTP Client 缓存。
 ///
@@ -104,10 +107,12 @@ pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
     /// 全局代理配置（用于凭据无自定义代理时的回退）
     global_proxy: Option<ProxyConfig>,
-    /// Client 缓存：key = effective proxy config, value = reqwest::Client
+    /// 流式 Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client。
     /// 带容量上限淘汰（全局代理 client 常驻），避免代理数量增长导致内存无界增长。
-    client_cache: Mutex<ClientCache>,
+    streaming_client_cache: Mutex<ClientCache>,
+    /// MCP/WebSearch 使用 total-only 超时，不能复用流式 Client。
+    mcp_client_cache: Mutex<ClientCache>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
@@ -143,11 +148,19 @@ impl KiroProvider {
             "默认端点 {} 未在 endpoints 注册表中",
             default_endpoint
         );
-        let tls_backend = token_manager.config().tls_backend;
+        let config = token_manager.config();
+        let tls_backend = config.tls_backend;
+        let stream_idle_timeout_secs = config.stream_idle_timeout_secs;
+        let stream_total_timeout_secs = config.stream_total_timeout_secs;
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）。
         // 开了 requireProxy 且全局代理为空时预热必然失败——这是合法配置
         // （代理配在各凭据上），跳过预热即可，不能让启动 panic。
-        let initial_client = match build_client(proxy.as_ref(), 720, tls_backend) {
+        let initial_client = match build_streaming_client(
+            proxy.as_ref(),
+            tls_backend,
+            stream_idle_timeout_secs,
+            stream_total_timeout_secs,
+        ) {
             Ok(client) => Some(client),
             Err(e) if proxy.is_none() && crate::http_client::require_proxy() => {
                 tracing::info!("requireProxy 已开启且未配全局代理，跳过直连 client 预热");
@@ -156,12 +169,16 @@ impl KiroProvider {
             }
             Err(e) => panic!("创建 HTTP 客户端失败: {}", e),
         };
-        let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
+        let streaming_client_cache =
+            ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
+        // MCP 流量通常远少于聊天请求，首次使用时再构建，避免为未使用的策略预热连接池。
+        let mcp_client_cache = ClientCache::new(proxy.clone(), None, CLIENT_CACHE_CAP);
 
         Self {
             token_manager,
             global_proxy: proxy,
-            client_cache: Mutex::new(client_cache),
+            streaming_client_cache: Mutex::new(streaming_client_cache),
+            mcp_client_cache: Mutex::new(mcp_client_cache),
             tls_backend,
             endpoints,
             default_endpoint,
@@ -186,14 +203,32 @@ impl KiroProvider {
         &self.token_manager
     }
 
-    /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
-    fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+    /// 根据凭据的代理配置获取（或创建并缓存）对应的流式 reqwest::Client。
+    fn streaming_client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
-        let mut cache = self.client_cache.lock();
+        let mut cache = self.streaming_client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client);
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        let config = self.token_manager.config();
+        let client = build_streaming_client(
+            effective.as_ref(),
+            self.tls_backend,
+            config.stream_idle_timeout_secs,
+            config.stream_total_timeout_secs,
+        )?;
+        cache.insert(effective, client.clone());
+        Ok(client)
+    }
+
+    /// MCP/WebSearch 使用独立的 total-only Client，保持原有 720s 总超时。
+    fn mcp_client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let mut cache = self.mcp_client_cache.lock();
+        if let Some(client) = cache.get(&effective) {
+            return Ok(client);
+        }
+        let client = build_client(effective.as_ref(), MCP_TOTAL_TIMEOUT_SECS, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
     }
@@ -366,7 +401,7 @@ impl KiroProvider {
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
             let base = self
-                .client_for(&ctx.credentials)?
+                .mcp_client_for(&ctx.credentials)?
                 .post(&url)
                 .body(body)
                 .header("content-type", endpoint.content_type())
@@ -587,7 +622,7 @@ impl KiroProvider {
             tracing::debug!("实际发送请求体: {}", body);
 
             let base = self
-                .client_for(&ctx.credentials)?
+                .streaming_client_for(&ctx.credentials)?
                 .post(&url)
                 .body(body)
                 .header("content-type", endpoint.content_type())
@@ -601,7 +636,11 @@ impl KiroProvider {
                     tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
                 }
             }
-            let response = match self.client_for(&ctx.credentials)?.execute(request).await {
+            let response = match self
+                .streaming_client_for(&ctx.credentials)?
+                .execute(request)
+                .await
+            {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -940,6 +979,8 @@ impl KiroProvider {
             outcome: outcome.to_string(),
             error_snippet: error_body.and_then(truncate_snippet),
             duration_ms: started.elapsed().as_millis() as u64,
+            // provider 不持有请求起点，算不出偏移；由 sink 侧（RequestTracer::on_attempt）回推填入。
+            started_ms: None,
             // 直连落库为字面量 direct；NULL 只保留给「该列存在前的历史行」= 未知。
             // 注意：仅在此处映射。上游 proxy_url 的 Option 语义还被 OpsRuntime
             // 的代理健康统计消费，在那里 None 必须继续表示「无代理可罚」。

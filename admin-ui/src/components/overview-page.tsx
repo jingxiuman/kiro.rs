@@ -2,13 +2,20 @@ import { useMemo, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Activity, Calendar, Coins, Cpu, KeyRound, Server } from 'lucide-react'
-import { useByCredential, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
+import { Activity, Calendar, Coins, Cpu, KeyRound, Server, Sigma } from 'lucide-react'
+import {
+  useByCredential,
+  useByModel,
+  useCreditsByCredential,
+  useOverview,
+  useTimeSeries,
+} from '@/hooks/use-stats'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import type {
   ClientKeyItem,
   CredentialDistribution,
+  CreditsByCredential,
   ModelDistribution,
   StatsFilter,
   StatsGranularity,
@@ -19,6 +26,7 @@ import type {
 import { TimeSeriesChart } from '@/components/charts/time-series-chart'
 import { ModelPieChart } from '@/components/charts/model-pie-chart'
 import { CredentialBarChart } from '@/components/charts/credential-bar-chart'
+import { CreditLineChart } from '@/components/charts/credit-line-chart'
 import { cn, formatCredits, formatNumber } from '@/lib/utils'
 import { Input } from '@/components/ui/input'
 import {
@@ -83,6 +91,7 @@ export function OverviewPage() {
   const { data: series } = useTimeSeries(filters.timeFilter, filters.statsFilter)
   const { data: byModel } = useByModel(filters.timeFilter, filters.statsFilter)
   const { data: byCred } = useByCredential(filters.timeFilter, filters.statsFilter)
+  const { data: creditSeries } = useCreditsByCredential(filters.timeFilter, filters.statsFilter)
   const seriesData = useMemo(() => series ?? [], [series])
   const modelData = useMemo(() => byModel ?? [], [byModel])
   const credData = useMemo(() => byCred ?? [], [byCred])
@@ -121,6 +130,12 @@ export function OverviewPage() {
         onCustomStartDateChange={filters.setCustomStartDate}
         onGranularityChange={filters.setDraftGranularity}
         onPresetRangeChange={filters.selectPresetRange}
+      />
+      <CreditTrendCard
+        data={creditSeries}
+        granularity={filters.timeFilter.granularity}
+        keyFilter={filters.keyFilter}
+        timeText={timeLabel(filters.timeFilter)}
       />
       <DistributionPanels
         byCred={credData}
@@ -207,6 +222,8 @@ interface RangeStats {
   errors: number
   inputTokens: number
   outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
 }
 
 function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
@@ -217,9 +234,24 @@ function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
       errors: acc.errors + p.errors,
       inputTokens: acc.inputTokens + p.inputTokens,
       outputTokens: acc.outputTokens + p.outputTokens,
+      cacheCreationTokens: acc.cacheCreationTokens + (p.cacheCreationTokens ?? 0),
+      cacheReadTokens: acc.cacheReadTokens + (p.cacheReadTokens ?? 0),
     }),
-    { calls: 0, credits: 0, errors: 0, inputTokens: 0, outputTokens: 0 },
+    {
+      calls: 0,
+      credits: 0,
+      errors: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+    },
   )
+}
+
+/** 总 Token = 输入 + 输出 + 缓存写 + 缓存读（四项互斥，与「按上游凭据分布」的合计口径一致） */
+function totalTokens(stats: RangeStats): number {
+  return stats.inputTokens + stats.outputTokens + stats.cacheCreationTokens + stats.cacheReadTokens
 }
 
 function StatsCards({
@@ -242,6 +274,16 @@ function StatsCards({
         <Badge variant="destructive">异常 {formatNumber(stats.errors)}</Badge>
       ) : null,
     },
+    {
+      icon: <Sigma className="h-4 w-4" />,
+      label: '总 Token',
+      value: formatNumber(totalTokens(stats)),
+      extra: (
+        <span className="text-[11px] text-muted-foreground">
+          缓存 {formatNumber(stats.cacheCreationTokens + stats.cacheReadTokens)}
+        </span>
+      ),
+    },
     { icon: <Cpu className="h-4 w-4" />, label: '输入 Token', value: formatNumber(stats.inputTokens) },
     { icon: <Cpu className="h-4 w-4" />, label: '输出 Token', value: formatNumber(stats.outputTokens) },
     {
@@ -255,7 +297,6 @@ function StatsCards({
       label: '启用的客户端 Key',
       meta: '当前可用入口',
       value: formatNumber(activeKeys),
-      className: 'col-span-2 max-[360px]:col-span-1 lg:col-span-1',
       extra: (
         <span className="text-[11px] text-muted-foreground">
           上游 {formatNumber(activeCredentials)}
@@ -265,7 +306,7 @@ function StatsCards({
   ]
 
   return (
-    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-5">
+    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-3 xl:grid-cols-6">
       {cards.map((card) => (
         <StatCard key={card.label} meta={card.meta ?? timeText} {...card} />
       ))}
@@ -530,6 +571,51 @@ function DateInput({ onChange, value }: { onChange: (value: string) => void; val
   )
 }
 
+function CreditTrendCard({
+  data,
+  granularity,
+  keyFilter,
+  timeText,
+}: {
+  data?: CreditsByCredential
+  granularity: StatsGranularity
+  keyFilter: string
+  timeText: string
+}) {
+  // 与趋势卡同样的 remount key：切换范围/入口 Key 时重放淡入动画
+  const chartKey = `${timeText}:${keyFilter}`
+  const shown = data?.series.length ?? 0
+  const total = data?.totalCredentials ?? 0
+  const truncated = total > shown
+  return (
+    <Card className="mb-6">
+      <CardContent className="p-4 sm:p-5">
+        <div className="mb-3 flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h2 className="text-base font-semibold tracking-tight">各账号积分消耗</h2>
+            <p className="text-[12px] text-muted-foreground">
+              {granularity === 'day' ? '按天' : '按小时'}聚合 · 上游 meteringEvent 计费量
+            </p>
+          </div>
+          <span className="text-[11px] text-muted-foreground">
+            {timeText}
+            {shown > 0 && ` · ${truncated ? `Top ${shown} / 共 ${total}` : `${shown} 个账号`}`}
+          </span>
+        </div>
+        {truncated && (
+          <p className="mb-3 rounded-md bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-600">
+            窗口内共 <strong className="mx-0.5">{total}</strong> 个账号有消耗，图中只画积分最高的{' '}
+            <strong className="mx-0.5">{shown}</strong> 个。
+          </p>
+        )}
+        <div key={chartKey} className="chart-range-fade">
+          <CreditLineChart data={data} granularity={granularity} />
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
 function DistributionPanels({
   byCred,
   byModel,
@@ -581,13 +667,15 @@ function ModelPanel({
 function ModelTable({ data }: { data: ModelDistribution[] }) {
   return (
     <div className="mt-3 max-h-32 overflow-auto text-[12px]">
-      <table className="min-w-[420px] w-full">
+      <table className="min-w-[560px] w-full">
         <thead className="text-muted-foreground">
           <tr>
             <th className="text-left font-medium pb-1">模型</th>
             <th className="text-right font-medium">调用</th>
             <th className="text-right font-medium">输入</th>
             <th className="text-right font-medium">输出</th>
+            <th className="text-right font-medium">缓存写</th>
+            <th className="text-right font-medium">缓存读</th>
           </tr>
         </thead>
         <tbody>
@@ -597,6 +685,8 @@ function ModelTable({ data }: { data: ModelDistribution[] }) {
               <td className="text-right tabular-nums">{formatNumber(m.calls)}</td>
               <td className="text-right tabular-nums">{formatNumber(m.inputTokens)}</td>
               <td className="text-right tabular-nums">{formatNumber(m.outputTokens)}</td>
+              <td className="text-right tabular-nums">{formatNumber(m.cacheCreationTokens)}</td>
+              <td className="text-right tabular-nums">{formatNumber(m.cacheReadTokens)}</td>
             </tr>
           ))}
         </tbody>
@@ -606,6 +696,12 @@ function ModelTable({ data }: { data: ModelDistribution[] }) {
 }
 
 function CredentialPanel({ data }: { data: CredentialDistribution[] }) {
+  const totalTokens = data
+    .slice(0, 12)
+    .reduce(
+      (sum, d) => sum + d.inputTokens + d.outputTokens + d.cacheCreationTokens + d.cacheReadTokens,
+      0,
+    )
   return (
     <Card>
       <CardContent className="p-4 sm:p-5">
@@ -615,6 +711,11 @@ function CredentialPanel({ data }: { data: CredentialDistribution[] }) {
             <Server className="h-3 w-3" />Top {Math.min(data.length, 12)}
           </span>
         </div>
+        {data.length > 0 && (
+          <p className="mb-3 text-[11px] text-muted-foreground">
+            图中合计 <span className="tabular-nums font-medium text-foreground">{formatNumber(totalTokens)}</span> token
+          </p>
+        )}
         <CredentialBarChart data={data} />
       </CardContent>
     </Card>

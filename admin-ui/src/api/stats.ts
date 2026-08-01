@@ -2,6 +2,7 @@ import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
   CredentialDistribution,
+  CreditsByCredential,
   ModelDistribution,
   OverviewStats,
   StatsFilter,
@@ -50,6 +51,16 @@ export async function getByModel(time: StatsTimeFilter, filter?: StatsFilter): P
 
 export async function getByCredential(time: StatsTimeFilter, filter?: StatsFilter): Promise<CredentialDistribution[]> {
   const { data } = await api.get<CredentialDistribution[]>('/stats/by-credential', {
+    params: statsParams(time, filter),
+  })
+  return data
+}
+
+export async function getCreditsByCredential(
+  time: StatsTimeFilter,
+  filter?: StatsFilter,
+): Promise<CreditsByCredential> {
+  const { data } = await api.get<CreditsByCredential>('/stats/credits-by-credential', {
     params: statsParams(time, filter),
   })
   return data

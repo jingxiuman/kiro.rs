@@ -138,6 +138,14 @@ pub struct Config {
     #[serde(default)]
     pub require_proxy: bool,
 
+    /// 流式上游相邻数据帧之间的最长空闲时间（秒，默认 90）。
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
+
+    /// 流式上游请求从建连到响应体读完的绝对总时限（秒，默认 1800）。
+    #[serde(default = "default_stream_total_timeout_secs")]
+    pub stream_total_timeout_secs: u64,
+
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
@@ -285,6 +293,14 @@ fn default_tls_backend() -> TlsBackend {
     TlsBackend::Rustls
 }
 
+fn default_stream_idle_timeout_secs() -> u64 {
+    crate::http_client::DEFAULT_STREAM_IDLE_TIMEOUT_SECS
+}
+
+fn default_stream_total_timeout_secs() -> u64 {
+    crate::http_client::DEFAULT_STREAM_TOTAL_TIMEOUT_SECS
+}
+
 fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
@@ -350,6 +366,8 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             require_proxy: false,
+            stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+            stream_total_timeout_secs: default_stream_total_timeout_secs(),
             admin_api_key: None,
             update_previous_version: None,
             github_token: None,
@@ -461,5 +479,38 @@ mod model_sync_config_tests {
         assert_eq!(cfg.model_sync_time, "3:5");
         assert_eq!(cfg.model_sync_probe_credential_id, Some(7));
         assert!(cfg.allow_unknown_model_passthrough);
+    }
+}
+
+#[cfg(test)]
+mod streaming_timeout_config_tests {
+    use super::*;
+
+    /// 缺字段的老配置必须仍能解析，并落到代码默认值上（向后兼容）。
+    ///
+    /// 断言跟随 `DEFAULT_STREAM_*` 常量而不写死数值：本测试的意图是「有默认值可用」，
+    /// 具体取值是运维折中、会随实测分布调整（已从 90s 调过一次，因为 90s 实证会误杀
+    /// 健康长生成）。把数值写死会让每次调阈值都要改这里，且失败信息指向"兼容性坏了"
+    /// 这个错误方向。取值本身的合理性由 `http_client` 侧的常量注释与断言把关。
+    #[test]
+    fn streaming_timeouts_have_backward_compatible_defaults() {
+        let cfg: Config = serde_json::from_str(r#"{"apiKey":"sk-x"}"#).unwrap();
+        assert_eq!(
+            cfg.stream_idle_timeout_secs,
+            crate::http_client::DEFAULT_STREAM_IDLE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            cfg.stream_total_timeout_secs,
+            crate::http_client::DEFAULT_STREAM_TOTAL_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn streaming_timeouts_use_camel_case_config_names() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"streamIdleTimeoutSecs":120,"streamTotalTimeoutSecs":2400}"#)
+                .unwrap();
+        assert_eq!(cfg.stream_idle_timeout_secs, 120);
+        assert_eq!(cfg.stream_total_timeout_secs, 2400);
     }
 }

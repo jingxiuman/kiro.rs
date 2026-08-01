@@ -1518,10 +1518,20 @@ impl MultiTokenManager {
                         (new_id, new_creds)
                     } else {
                         let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
+                        // 注意：必须在 bail! 之前就地计算，
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
+                        //
+                        // 分组过滤必须与 total（来自 total_count_in_group）用同一个
+                        // 口径：早先这里统计全部 entries 而 total 只算组内，于是
+                        // 分组筛选生效时会打出 "9/1" 这种可用数大于总数的消息
+                        // （实测日志里出现过），把「该组内的凭据都被禁用」误报成
+                        // 全局状态，掩盖真实原因。
+                        let available = entries
+                            .iter()
+                            .filter(|e| group_matches(&e.credentials.groups, group))
+                            .filter(|e| !e.disabled)
+                            .count();
                         anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     }
                 }
@@ -5056,6 +5066,63 @@ mod tests {
 
         // 不存在的 id 必须是明确错误，而不是悄悄换一张
         assert!(manager.acquire_context_pinned(999).await.is_err());
+    }
+
+    /// 「所有凭据均已禁用（available/total）」的两个数必须同口径。
+    ///
+    /// 这个 bug 在生产日志里表现为 `（9/1）`—— 可用数大于总数，逻辑上不可能：
+    /// total 按分组算，available 却算了全局。它把「该分组内的凭据都被禁用」
+    /// 误报成全局状态，掩盖真实原因。只有分组筛选生效时才暴露，所以必须构造
+    /// 「组内全禁、组外可用」这个特定形态。
+    #[tokio::test]
+    async fn group_scoped_exhaustion_message_uses_consistent_counts() {
+        let cred = |group: &str, disabled: bool| {
+            let mut c = KiroCredentials::default();
+            c.access_token = Some("tok".to_string());
+            c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+            c.groups = vec![group.to_string()];
+            c.disabled = disabled;
+            c
+        };
+        // "solo" 组只有 1 张且被禁用；"other" 组有 3 张全可用。
+        // 修复前：total=1（组内）、available=3（全局）→ 打出不可能的 "3/1"
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                cred("solo", true),
+                cred("other", false),
+                cred("other", false),
+                cred("other", false),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 不用 expect_err：CallContext 没有 Debug，而给它加 Debug 会让 token
+        // 出现在调试输出里，不值得为一个测试放这个口子。
+        let msg = match manager.acquire_context(None, Some("solo")).await {
+            Ok(_) => panic!("solo 组内唯一凭据已禁用，必须失败"),
+            Err(e) => e.to_string(),
+        };
+
+        assert!(
+            msg.contains("所有凭据均已禁用"),
+            "应命中分组耗尽分支，实际: {}",
+            msg
+        );
+        // 关键断言：available 必须 ≤ total。修复前这里是 3/1。
+        assert!(
+            msg.contains("（0/1）"),
+            "available 与 total 必须同为组内口径（期望 0/1），实际: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("（3/1）"),
+            "available 不得统计组外凭据，实际: {}",
+            msg
+        );
     }
 
     #[test]

@@ -1,7 +1,9 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
+  CrosstabDimension,
   OpsCredentialRow,
+  OpsErrorCrosstab,
   OpsEvent,
   OpsOverview,
   OpsProxiesResponse,
@@ -43,6 +45,16 @@ export async function getOpsProxies(hours: number): Promise<OpsProxiesResponse> 
 
 export async function getOpsEvents(limit = 100): Promise<OpsEvent[]> {
   const { data } = await api.get<OpsEvent[]>('/ops/events', { params: { limit } })
+  return data
+}
+
+export async function getOpsErrorCrosstab(
+  hours: number,
+  dim: CrosstabDimension,
+): Promise<OpsErrorCrosstab> {
+  const { data } = await api.get<OpsErrorCrosstab>('/ops/error-crosstab', {
+    params: { hours, dim },
+  })
   return data
 }
 

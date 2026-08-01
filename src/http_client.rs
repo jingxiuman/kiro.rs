@@ -22,6 +22,40 @@ const HTTP2_KEEP_ALIVE_TIMEOUT_SECS: u64 = 15;
 /// 只覆盖到代理这一跳，两层各防一段链路。
 const TCP_KEEPALIVE_SECS: u64 = 30;
 
+/// 流式上游连接的默认超时。
+///
+/// 空闲超时限制两个数据帧之间的最长间隔，每收到一帧即重置；总超时则为建连到 body
+/// 读完的完整请求设置绝对寿命上限。两者叠加，既识别停止推进的流，也避免上游以极低
+/// 速率持续吐帧时无限占用连接。
+///
+/// 默认值来自有限的历史观测，并非正常流与卡死流已被证明互不重叠：已观测到健康流
+/// `max_idle_ms=43546`，所以 90s 只有约 2 倍余量。且本地超时会截断超过阈值的流，
+/// 被截断样本无法进入成功分布，后续必须结合成功与超时样本持续校准。部署方可通过
+/// `streamIdleTimeoutSecs` 调大空闲阈值。
+///
+/// 历史上也观测到若干流在静默约 240s 后被上游清理，但这是外部行为假设，不作为
+/// 代码不变量。
+///
+/// **默认 300s 而非更短，是被生产事故推着定的**：曾默认 90s，上线 100 秒内即误杀一条
+/// 已正常产出 6614 tokens / 380KB、跑了 421s 的健康流（错误串 `[timeout+decode]` 表明
+/// 是本地超时而非上游 RST）。代价是白烧十分钟与全部输入 token，正是本模块要消除的
+/// 失败形态。300s 让上游自己约 240s 的清理先动手（真卡死仍会被 RST，归因更准），
+/// runaway 则交给下面的总超时兜住——空闲超时不必兼任那个角色。
+/// 判断误杀 vs 真卡死看**产出量**：真卡死只产出 1~228 tokens，误杀的已产出数千。
+/// 详见 `docs/streaming-timeouts.md`。
+///
+/// 总超时默认 1800s：约为已观测 712s 长生成的 2.5 倍，能覆盖正常长生成，同时把
+/// 极低速率流的资源占用限制在 30 分钟内。部署方可通过 `streamTotalTimeoutSecs` 调整。
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_STREAM_TOTAL_TIMEOUT_SECS: u64 = 1800;
+
+/// 默认值只断言代码自身依赖的关系；外部上游的清理时限不属于编译期不变量。
+const _: () = assert!(
+    HTTP2_KEEP_ALIVE_INTERVAL_SECS + HTTP2_KEEP_ALIVE_TIMEOUT_SECS
+        < DEFAULT_STREAM_IDLE_TIMEOUT_SECS
+);
+const _: () = assert!(DEFAULT_STREAM_IDLE_TIMEOUT_SECS < DEFAULT_STREAM_TOTAL_TIMEOUT_SECS);
+
 /// 进程级出网策略：开启后，任何「无代理」的出网请求都会被拒绝。
 ///
 /// 用全局状态而非函数参数，是为了让**新增的出网点默认受保护**——本模块是 Kiro 上游
@@ -82,13 +116,75 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    build_client_with_policy(proxy, timeout_secs, tls_backend, require_proxy())
+    build_client_with_policy(
+        proxy,
+        TimeoutPolicy::total(Duration::from_secs(timeout_secs)),
+        tls_backend,
+        require_proxy(),
+    )
+}
+
+/// 构建**流式**上游 Client：同时设置空闲超时与绝对总超时。
+///
+/// 仅供聊天/流式路径使用。认证、token 刷新、版本探测、代理探活等一问一答的调用
+/// 应继续用 [`build_client`]——对它们总超时才是正确语义。
+pub fn build_streaming_client(
+    proxy: Option<&ProxyConfig>,
+    tls_backend: TlsBackend,
+    idle_timeout_secs: u64,
+    total_timeout_secs: u64,
+) -> anyhow::Result<Client> {
+    let timeout = TimeoutPolicy::streaming(
+        Duration::from_secs(idle_timeout_secs),
+        Duration::from_secs(total_timeout_secs),
+    )?;
+    build_client_with_policy(proxy, timeout, tls_backend, require_proxy())
+}
+
+/// Client 的可叠加超时策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimeoutPolicy {
+    /// 总请求超时，覆盖建连到 body 读完的全过程。
+    total: Option<Duration>,
+    /// 空闲读取超时，每次成功读取后重置。
+    read_idle: Option<Duration>,
+}
+
+impl TimeoutPolicy {
+    const fn total(total: Duration) -> Self {
+        Self {
+            total: Some(total),
+            read_idle: None,
+        }
+    }
+
+    fn streaming(read_idle: Duration, total: Duration) -> anyhow::Result<Self> {
+        let keep_alive_window =
+            Duration::from_secs(HTTP2_KEEP_ALIVE_INTERVAL_SECS + HTTP2_KEEP_ALIVE_TIMEOUT_SECS);
+        if read_idle <= keep_alive_window {
+            anyhow::bail!(
+                "streamIdleTimeoutSecs 必须大于 HTTP/2 keep-alive 探测窗口 {}s",
+                keep_alive_window.as_secs()
+            );
+        }
+        if total <= read_idle {
+            anyhow::bail!(
+                "streamTotalTimeoutSecs ({}) 必须大于 streamIdleTimeoutSecs ({})",
+                total.as_secs(),
+                read_idle.as_secs()
+            );
+        }
+        Ok(Self {
+            total: Some(total),
+            read_idle: Some(read_idle),
+        })
+    }
 }
 
 /// [`build_client`] 的策略显式版本。仅用于测试：全局开关会让并发跑的其它用例互相干扰。
 fn build_client_with_policy(
     proxy: Option<&ProxyConfig>,
-    timeout_secs: u64,
+    timeout: TimeoutPolicy,
     tls_backend: TlsBackend,
     require_proxy: bool,
 ) -> anyhow::Result<Client> {
@@ -101,12 +197,18 @@ fn build_client_with_policy(
     }
 
     let mut builder = Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
         .http2_keep_alive_interval(Duration::from_secs(HTTP2_KEEP_ALIVE_INTERVAL_SECS))
         .http2_keep_alive_timeout(Duration::from_secs(HTTP2_KEEP_ALIVE_TIMEOUT_SECS))
         // 不开 http2_keep_alive_while_idle：有活跃流时 PING 本来就发（覆盖流式长静默这个
-        // 目标场景）；池中全空闲连接 90s 就被驱逐，活不到需要保活的时刻，开了只多流量
+        // 目标场景）；池中无请求的连接无需靠 PING 延长寿命。
         .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_SECS));
+
+    if let Some(total) = timeout.total {
+        builder = builder.timeout(total);
+    }
+    if let Some(read_idle) = timeout.read_idle {
+        builder = builder.read_timeout(read_idle);
+    }
 
     match tls_backend {
         TlsBackend::Rustls => {
@@ -238,10 +340,58 @@ mod tests {
         assert!(client.is_ok());
     }
 
+    #[test]
+    fn build_streaming_client_succeeds_with_and_without_proxy() {
+        let timeout =
+            TimeoutPolicy::streaming(Duration::from_secs(90), Duration::from_secs(1800)).unwrap();
+        assert!(build_client_with_policy(None, timeout, TlsBackend::Rustls, false).is_ok());
+        let proxy = ProxyConfig::new("socks5://127.0.0.1:1080");
+        assert!(build_client_with_policy(Some(&proxy), timeout, TlsBackend::Rustls, false).is_ok());
+    }
+
+    #[test]
+    fn streaming_timeout_policy_combines_total_and_idle_limits() {
+        let timeout = TimeoutPolicy::streaming(Duration::from_secs(90), Duration::from_secs(1800))
+            .expect("默认流式超时应有效");
+        assert_eq!(timeout.read_idle, Some(Duration::from_secs(90)));
+        assert_eq!(timeout.total, Some(Duration::from_secs(1800)));
+    }
+
+    #[test]
+    fn streaming_timeout_policy_rejects_invalid_relationships() {
+        let keep_alive_window = HTTP2_KEEP_ALIVE_INTERVAL_SECS + HTTP2_KEEP_ALIVE_TIMEOUT_SECS;
+        assert!(
+            TimeoutPolicy::streaming(
+                Duration::from_secs(keep_alive_window),
+                Duration::from_secs(1800)
+            )
+            .is_err()
+        );
+        assert!(
+            TimeoutPolicy::streaming(Duration::from_secs(90), Duration::from_secs(90)).is_err()
+        );
+    }
+
+    /// 流式 client 同样受 requireProxy 约束：漏掉它就等于给流式路径开了裸连后门，
+    /// 而流式恰好是全部聊天流量的走向。
+    #[test]
+    fn require_proxy_also_guards_streaming_client() {
+        let timeout =
+            TimeoutPolicy::streaming(Duration::from_secs(90), Duration::from_secs(1800)).unwrap();
+        let err = build_client_with_policy(None, timeout, TlsBackend::Rustls, true)
+            .expect_err("无代理时流式 client 也应拒绝");
+        assert!(err.to_string().contains("requireProxy"), "{err}");
+    }
+
     /// 直接测策略版本：全局开关会被并发跑的其它用例观察到，造成假失败
     #[test]
     fn require_proxy_rejects_direct_egress() {
-        let err = build_client_with_policy(None, 30, TlsBackend::Rustls, true)
+        let err = build_client_with_policy(
+            None,
+            TimeoutPolicy::total(Duration::from_secs(30)),
+            TlsBackend::Rustls,
+            true,
+        )
             .expect_err("无代理时应拒绝");
         let msg = err.to_string();
         assert!(msg.contains("requireProxy"), "{msg}");
@@ -251,13 +401,29 @@ mod tests {
     #[test]
     fn require_proxy_allows_egress_through_a_proxy() {
         let proxy = ProxyConfig::new("socks5://127.0.0.1:1080");
-        assert!(build_client_with_policy(Some(&proxy), 30, TlsBackend::Rustls, true).is_ok());
+        assert!(
+            build_client_with_policy(
+                Some(&proxy),
+                TimeoutPolicy::total(Duration::from_secs(30)),
+                TlsBackend::Rustls,
+                true
+            )
+                .is_ok()
+        );
     }
 
     #[test]
     fn direct_egress_still_allowed_when_policy_is_off() {
         // 默认关闭时行为必须与加固前完全一致
-        assert!(build_client_with_policy(None, 30, TlsBackend::Rustls, false).is_ok());
+        assert!(
+            build_client_with_policy(
+                None,
+                TimeoutPolicy::total(Duration::from_secs(30)),
+                TlsBackend::Rustls,
+                false
+            )
+            .is_ok()
+        );
     }
 
     #[test]
