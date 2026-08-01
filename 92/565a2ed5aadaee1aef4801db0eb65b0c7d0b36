@@ -1,0 +1,41 @@
+src/admin/duck.rs
+  s_76b817ce0732fe::t_e8e1250f596a89 49,52-53
+  s_76b817ce0732fe::t_859d78cc264eb9 32-35
+  s_76b817ce0732fe::t_43d71e9557feb1 11-15
+  s_76b817ce0732fe::t_47ff9e0bb6e13a 129,140,144-147
+Cargo.toml
+  s_76b817ce0732fe::t_eef258fc5b54ee 49-52
+src/admin/usage_store.rs
+  s_76b817ce0732fe::t_3597bd88e93dd5 490-509,512-517,527-530
+  s_76b817ce0732fe::t_23d35f3b1a6179 4
+  s_76b817ce0732fe::t_79ee83030cc75d 164
+  s_76b817ce0732fe::t_99a87ce450e5f8 35-37,40-41,45-69
+  s_76b817ce0732fe::t_cabfdd6a1f445f 510-511
+  s_76b817ce0732fe::t_95b12f73107f29 101-106,108,111-113
+  s_76b817ce0732fe::t_14b7f3e1da43f3 541-547,549-553,559-560
+  s_5f1a89a59d60eb::t_f6582cbbae296b 70-71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "92565a2ed5aadaee1aef4801db0eb65b0c7d0b36",
+  "prompts": {},
+  "sessions": {
+    "s_5f1a89a59d60eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "27d516eb-e645-45c6-808c-2dd22f4e1f5d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    },
+    "s_76b817ce0732fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8aad5c8-70ec-4c41-a43f-97434e44adf2",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
