@@ -1329,7 +1329,6 @@ pub async fn stats_balance_history(
     let start_ts = crate::admin::balance_store::window_start(hours);
     let points = store.query_history(start_ts, credential_id);
     let rates = store.burn_rates(start_ts);
-
     // 附加 email，让前端图例不必只显示裸 id
     let snapshot = state.service.get_all_credentials();
     let email_map: std::collections::HashMap<u64, Option<String>> = snapshot

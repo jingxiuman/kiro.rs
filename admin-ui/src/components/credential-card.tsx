@@ -39,7 +39,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import type { CredentialStatusItem, BalanceResponse } from "@/types/api";
+import type { CredentialStatusItem, BalanceResponse, BalanceBurnRate } from "@/types/api";
 import { maskProxyUrl, extractErrorMessage, overageFailureMessage } from "@/lib/utils";
 import {
   useSetDisabled,
@@ -69,6 +69,8 @@ interface CredentialCardProps {
   onRefreshBalance: () => void;
   /** 该凭据的失败分类计数（来自 trace 聚合）；无数据时回退 totalFailureCount */
   failureStats?: { auth: number; throttle: number; other: number; interrupted?: number };
+  /** 近 24h 余额消耗速率与耗尽预测（来自余额快照时序）；无快照时为 undefined */
+  burnRate?: BalanceBurnRate;
   /** 展示形态：卡片（默认）或紧凑列表行 */
   view?: "card" | "list";
 }
@@ -97,6 +99,15 @@ function formatNumber(n: number): string {
 function formatResetDate(ts: number | null): string {
   if (!ts) return "未知";
   return new Date(ts * 1000).toLocaleString("zh-CN");
+}
+
+/** 耗尽预测的时长展示：36.5 → "1 天 12 小时"；卡片空间小，只保留两级 */
+function formatBurnEta(hours: number): string {
+  if (hours < 1) return `${Math.round(hours * 60)} 分钟`;
+  if (hours < 24) return `${hours.toFixed(1)} 小时`;
+  const days = Math.floor(hours / 24);
+  const rest = Math.round(hours % 24);
+  return rest > 0 ? `${days} 天 ${rest} 小时` : `${days} 天`;
 }
 
 /** 把秒数格式化为 `mm:ss` 或 `hh:mm:ss` */
@@ -195,6 +206,7 @@ export function CredentialCard({
   loadingBalance,
   onRefreshBalance,
   failureStats,
+  burnRate,
   view = "card",
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false);
@@ -1053,6 +1065,33 @@ export function CredentialCard({
                     {formatResetDate(balance.nextResetAt)}
                   </span>
                 </div>
+                {burnRate && burnRate.perHour > 0 && (
+                  <div className="break-words text-[11px] text-muted-foreground">
+                    近 24h 均耗：
+                    <span className="font-medium text-foreground">
+                      ${formatNumber(burnRate.perHour)}/h
+                    </span>
+                    {burnRate.hoursToExhaust !== null && (
+                      <>
+                        {" · "}
+                        <span
+                          className={
+                            burnRate.hoursToExhaust < 24
+                              ? "font-medium text-amber-600 dark:text-amber-400"
+                              : "font-medium text-foreground"
+                          }
+                          title={
+                            burnRate.samplePoints < 3
+                              ? `仅 ${burnRate.samplePoints} 个采样点，估算粗略`
+                              : `基于 ${burnRate.samplePoints} 个采样点`
+                          }
+                        >
+                          约 {formatBurnEta(burnRate.hoursToExhaust)}后耗尽
+                        </span>
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
             ) : (
               <div className="flex flex-1 items-center justify-center text-center text-[13px] text-muted-foreground">

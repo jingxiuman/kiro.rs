@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import {
   RefreshCw,
   LogOut,
@@ -97,6 +97,7 @@ import {
 } from "@/hooks/use-credentials";
 import { useUpdateCheck } from "@/hooks/use-update-check";
 import { useFailureStats } from "@/hooks/use-traces";
+import { useBalanceHistory } from "@/hooks/use-stats";
 import { useGroupOptions } from "@/hooks/use-groups";
 import { useRectSelect } from "@/hooks/use-rect-select";
 import {
@@ -243,6 +244,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const setPriority = useSetPriority();
   const { data: updateCheck } = useUpdateCheck();
   const { data: failureStatsMap } = useFailureStats();
+  // 余额消耗速率：一次请求拿全部账号，按 id 分发给各卡片（避免每卡一次请求）
+  const { data: balanceHistory } = useBalanceHistory(24, null);
+  const burnRateMap = useMemo(
+    () =>
+      new Map((balanceHistory?.series ?? []).map((s) => [s.credentialId, s])),
+    [balanceHistory],
+  );
   const groupOptions = useGroupOptions();
 
   // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
@@ -1783,6 +1791,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                         handleRefreshBalance(credential.id)
                       }
                       failureStats={failureStatsMap?.[String(credential.id)]}
+                      burnRate={burnRateMap.get(credential.id)}
                     />
                   ))}
                 </div>

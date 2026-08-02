@@ -1,5 +1,6 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import {
+  getBalanceHistory,
   getByCredential,
   getByModel,
   getCreditsByCredential,
@@ -74,6 +75,28 @@ export function useCreditsByCredential(time: StatsTimeFilter, filter?: StatsFilt
       filter?.group ?? 'all',
     ],
     queryFn: () => getCreditsByCredential(time, filter),
+    ...COMMON,
+  })
+}
+
+/**
+ * 余额历史与消耗速率。
+ *
+ * 刷新间隔用 COMMON 的 30s 即可——后端快照本身 5 分钟才产生一个新点，
+ * 更频繁的拉取不会带来新信息，但保持与其他统计一致的手感。
+ *
+ * `credentialId = null` 表示「全部账号」（返回各账号的速率，points 含所有账号的点），
+ * 这是仪表盘的用法；传具体 id 则只看单账号。用 `enabled` 控制是否发请求。
+ */
+export function useBalanceHistory(
+  hours: number,
+  credentialId: number | null,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ['stats', 'balance-history', hours, credentialId ?? 'all'],
+    queryFn: () => getBalanceHistory(hours, credentialId ?? undefined),
+    enabled,
     ...COMMON,
   })
 }
