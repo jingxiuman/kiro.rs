@@ -1,0 +1,29 @@
+Cargo.toml
+  s_76b817ce0732fe::t_f01344984890a2 3
+Cargo.lock
+  s_af23dc86c9eced::t_3023c2cd0e0f8e 1354
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "06e7edde62db2c0b1f61fce5e1740e2a69f3c047",
+  "prompts": {},
+  "sessions": {
+    "s_76b817ce0732fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8aad5c8-70ec-4c41-a43f-97434e44adf2",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    },
+    "s_af23dc86c9eced": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e29d8ccc-f37a-482b-8525-0464e35c2e9b",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
