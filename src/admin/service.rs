@@ -177,6 +177,8 @@ pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
+    /// 余额快照存储（DuckDB 时序），用于余额趋势与消耗速率。未注入时不记录历史。
+    balance_store: Option<crate::admin::balance_store::SharedBalanceStore>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
     /// 代理 IP 池管理器（与 KiroProvider 的请求级反馈共享同一实例）
@@ -556,6 +558,7 @@ impl AdminService {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
+            balance_store: None,
             known_endpoints: known_endpoints.into_iter().collect(),
             proxy_pool,
             ops: None,
@@ -604,6 +607,22 @@ impl AdminService {
     /// 运维编排句柄（供 handlers 访问 ops 统计）
     pub fn ops(&self) -> Option<&crate::admin::ops::SharedOpsRuntime> {
         self.ops.as_ref()
+    }
+
+    /// 注入余额快照存储（DuckDB）。不注入则只有 JSON 当前值缓存，无历史趋势。
+    pub fn with_balance_store(
+        mut self,
+        store: Option<crate::admin::balance_store::SharedBalanceStore>,
+    ) -> Self {
+        self.balance_store = store;
+        self
+    }
+
+    /// 余额快照存储句柄（供 handlers 查历史/速率）
+    pub fn balance_store(
+        &self,
+    ) -> Option<&crate::admin::balance_store::SharedBalanceStore> {
+        self.balance_store.as_ref()
     }
 
     /// 注入日志治理句柄（trace 存储 + 用量记录器），用于运行时改保留期/开关。
@@ -918,6 +937,8 @@ impl AdminService {
         let snapshot = self.token_manager.snapshot();
         let mut success = 0_usize;
         let mut failure = 0_usize;
+        // 本轮拿到的余额，批量落一次时序库（失败不影响余额刷新本身）
+        let mut history: Vec<crate::admin::balance_store::BalanceSnapshot> = Vec::new();
 
         for entry in snapshot.entries.into_iter() {
             if entry.disabled {
@@ -925,6 +946,18 @@ impl AdminService {
             }
             match self.fetch_balance(entry.id).await {
                 Ok(balance) => {
+                    history.push(crate::admin::balance_store::BalanceSnapshot {
+                        credential_id: entry.id,
+                        subscription_title: balance
+                            .subscription_title
+                            .clone()
+                            .unwrap_or_default(),
+                        current_usage: balance.current_usage,
+                        usage_limit: balance.usage_limit,
+                        remaining: balance.remaining,
+                        usage_percentage: balance.usage_percentage,
+                        next_reset_at: balance.next_reset_at.map(|v| v as i64),
+                    });
                     {
                         let mut cache = self.balance_cache.lock();
                         cache.insert(
@@ -948,6 +981,9 @@ impl AdminService {
 
         if success > 0 {
             self.save_balance_cache();
+            if let Some(store) = &self.balance_store {
+                store.record_batch(&history);
+            }
         }
         (success, failure)
     }

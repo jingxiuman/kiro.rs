@@ -28,6 +28,7 @@ mod binary_update;
 pub mod client_keys;
 pub mod groups;
 pub mod duck;
+pub mod balance_store;
 pub mod usage_store;
 pub mod usage_stats;
 pub mod trace_db;

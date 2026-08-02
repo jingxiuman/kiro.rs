@@ -252,6 +252,20 @@ async fn main() {
         tracing::info!("历史 usage_log JSONL 导入完成: {} 行", imported);
     }
 
+    // 余额快照存储（同一 kiro.duckdb）。失败不致命：余额当前值仍走 JSON 缓存，
+    // 只是没有历史趋势——不该因为观测能力缺失就拒绝启动。
+    let balance_store: Option<admin::balance_store::SharedBalanceStore> =
+        match admin::balance_store::BalanceStore::open(
+            &duckdb_path,
+            admin::balance_store::DEFAULT_BALANCE_RETENTION_DAYS,
+        ) {
+            Ok(s) => Some(std::sync::Arc::new(s)),
+            Err(e) => {
+                tracing::warn!("打开余额快照存储失败，余额趋势不可用: {}", e);
+                None
+            }
+        };
+
     // 账号分组注册表（持久化到 groups.json）。
     // 启动时若文件不存在则首次创建，并把现有凭据 / 客户端 Key 的 groups 字段反向迁移进去，
     // 保证老用户升级后所有已用分组都自动注册，不会因为本次改造而消失。
@@ -276,6 +290,7 @@ async fn main() {
         let recorder = usage_store.clone();
         let trace_store = trace_store.clone();
         let ops_store = ops_store.clone();
+        let balance_cleanup = balance_store.clone();
         tokio::spawn(async move {
             let day = std::time::Duration::from_secs(24 * 3600);
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -284,6 +299,9 @@ async fn main() {
                 if let Some(ts) = &trace_store {
                     ts.cleanup();
                     ops_store.cleanup(ts.retention_days());
+                }
+                if let Some(bs) = &balance_cleanup {
+                    bs.cleanup();
                 }
                 tokio::time::sleep(day).await;
             }
@@ -454,7 +472,9 @@ async fn main() {
                     // 与调度器共用 holder，见上面 model_sync_settings 的注释。
                     .with_model_sync_settings(model_sync_settings.clone())
                     // POST /models/test 发真实请求用，与 /v1/messages 同一实例。
-                    .with_kiro_provider(kiro_provider.clone());
+                    .with_kiro_provider(kiro_provider.clone())
+                    // 余额刷新时把快照落进 DuckDB，支撑余额趋势与消耗速率。
+                    .with_balance_store(balance_store.clone());
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,
