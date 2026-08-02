@@ -1,0 +1,19 @@
+admin-ui/src/components/edit-credential-dialog.tsx
+  s_b90a060258530e::t_5060aa20f6bb76 123,125-127,130,136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "20840907617bab6189f22e8c5d1124d4c1593726",
+  "prompts": {},
+  "sessions": {
+    "s_b90a060258530e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c53dc058-505e-4735-b3c1-b316b4d34ec8",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
