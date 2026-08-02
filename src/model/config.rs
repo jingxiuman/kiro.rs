@@ -207,7 +207,7 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
-    /// 是否启用请求链路追踪（写 traces.db）。默认 true。
+    /// 是否启用请求链路追踪（写 kiro.duckdb 的 traces 表）。默认 true。
     ///
     /// 关闭后：不再写入 trace 记录、不走 TraceSink，但 `GET /api/admin/traces`
     /// 仍可查询历史已存记录。适合隐私敏感或磁盘紧张的场景。
