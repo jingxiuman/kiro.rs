@@ -1,12 +1,20 @@
 //! 唯一 DuckDB 实例（kiro.duckdb）的打开与 schema 初始化。
 //!
-//! usage / trace / ops 三个存储共用此文件。DuckDB 在进程内按路径缓存
-//! database 实例，重复 open 得到的是同一实例上的新连接（已实测），
-//! 因此各存储可独立调用 open_shared，无锁冲突。
+//! usage / trace / ops 三个存储共用此文件，且**必须共享同一个数据库实例**：
+//! 同进程内对同一文件重复 `Connection::open` 会得到两个独立实例（DuckDB 的
+//! 文件锁是 fcntl 型，同进程不互斥），彼此看不到对方 open 之后提交的数据，
+//! 并发写同一 WAL 还有损坏风险（实测：后开连接对先开连接的后续 INSERT 恒读 0）。
+//! 因此这里按规范化路径缓存首个连接，后续 open_shared 返回 `try_clone`
+//! ——同实例上的新连接，写入互相可见（已实测）。
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use duckdb::Connection;
+
+/// 进程级实例注册表：规范化路径 → 首个连接（后续调用 try_clone 出新连接）
+static REGISTRY: Mutex<Option<HashMap<PathBuf, Connection>>> = Mutex::new(None);
 
 /// 打开（或复用进程内已打开的）kiro.duckdb 并确保全部表存在。
 ///
@@ -20,9 +28,26 @@ pub fn open_shared(path: &Path) -> duckdb::Result<Connection> {
     {
         let _ = std::fs::create_dir_all(parent);
     }
-    let conn = Connection::open(path)?;
+    // 规范化到父目录真实路径 + 文件名，防止 ./x 与 x 被当成两个实例
+    let key = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => parent
+            .canonicalize()
+            .map(|p| p.join(name))
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => std::env::current_dir()
+            .map(|d| d.join(path))
+            .unwrap_or_else(|_| path.to_path_buf()),
+    };
+    let mut guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let registry = guard.get_or_insert_with(HashMap::new);
+    if let Some(existing) = registry.get(&key) {
+        return existing.try_clone();
+    }
+    let conn = Connection::open(&key)?;
     conn.execute_batch(SCHEMA)?;
-    Ok(conn)
+    let out = conn.try_clone()?;
+    registry.insert(key, conn);
+    Ok(out)
 }
 
 /// 全部表定义（幂等）。usage_records / imported_files 归 UsageStore；
@@ -145,6 +170,33 @@ mod tests {
             .query_row("select count(*) from usage_records", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n2, 0);
+        drop((c1, c2));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 回归：两次 open_shared 必须是同一实例——后开连接要能看到先开连接
+    /// **在它打开之后**提交的数据。独立实例（旧缺陷）此断言恒败（读 0）。
+    #[test]
+    fn open_shared_cross_connection_visibility() {
+        let dir = std::env::temp_dir().join(format!(
+            "duckvis-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kiro.duckdb");
+        let c1 = open_shared(&path).unwrap();
+        let c2 = open_shared(&path).unwrap(); // 先开 c2，再经 c1 写入
+        c1.execute(
+            "INSERT INTO ops_events (ts, ts_epoch, category, severity, subject, message) \
+             VALUES ('t', 1, 'c', 's', 'sub', 'msg')",
+            [],
+        )
+        .unwrap();
+        let n: i64 = c2
+            .query_row("select count(*) from ops_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "跨连接必须可见，否则是独立实例");
         drop((c1, c2));
         std::fs::remove_dir_all(&dir).ok();
     }
