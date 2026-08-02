@@ -1,0 +1,37 @@
+admin-ui/src/components/dashboard.tsx
+  s_76b817ce0732fe::t_fdfa0d5868747d 1794
+  s_76b817ce0732fe::t_230dcd0c36ea7f 100
+  s_76b817ce0732fe::t_df78605674c437 1
+  s_76b817ce0732fe::t_e984e6d03dda66 247-253
+admin-ui/src/components/credential-card.tsx
+  s_76b817ce0732fe::t_88a5d25f956127 42
+  s_76b817ce0732fe::t_389c785d69ddd9 72-73
+  s_76b817ce0732fe::t_ac6b698394d059 1068-1094
+  s_76b817ce0732fe::t_2dc1e74b2ce0ee 104-112
+  s_76b817ce0732fe::t_9e58670a1f1da9 209
+admin-ui/src/types/api.ts
+  s_76b817ce0732fe::t_cd7bebb2b0d73f 1005-1033
+admin-ui/src/hooks/use-stats.ts
+  s_76b817ce0732fe::t_8ed590bf8e5cc6 81-86,90,96-98,100-102
+  s_76b817ce0732fe::t_86db4015a1e94e 87-89,91-95,99
+  s_76b817ce0732fe::t_f978b6d4938e08 3
+admin-ui/src/api/stats.ts
+  s_76b817ce0732fe::t_7f01912cdbfcde 4
+  s_76b817ce0732fe::t_3860e29fe5a9e9 69-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "c9567449adc67c0059a0b3c4f418673bc85a010d",
+  "prompts": {},
+  "sessions": {
+    "s_76b817ce0732fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8aad5c8-70ec-4c41-a43f-97434e44adf2",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
