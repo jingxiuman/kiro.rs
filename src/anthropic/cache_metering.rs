@@ -560,9 +560,46 @@ fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
         return Some(format!("sess:{session}"));
     }
     if key_id == 0 {
-        return None;
+        // 降级链第二级（借鉴 sub2api）：主 Key 无 session 时，用「跨轮稳定」的
+        // cache_control 内容（system/tools 级）hash 作种子，覆盖不带 metadata 的
+        // 非 Claude Code 客户端。message 级断点每轮漂移，不得参与种子。
+        // 同一客户端配置（相同 system/tools）共享种子；会话间由前缀链的消息
+        // 内容自然区分，只有逐字节相同的历史才会互相命中——与 Anthropic
+        // 真实缓存的组级共享语义一致。无任何稳定断点 → 维持不模拟。
+        return stable_cache_control_hash(req).map(|h| format!("cc:{h:016x}"));
     }
     Some(format!("key:{key_id}"))
+}
+
+/// 对请求里 system/tools 级 cache_control 块的内容取 SHA-256 折叠为 u64。
+/// 返回 `None` 表示不存在跨轮稳定的 cache_control 断点。
+fn stable_cache_control_hash(req: &MessagesRequest) -> Option<u64> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut found = false;
+    if let Some(tools) = req.tools.as_ref() {
+        for t in tools {
+            if t.cache_control.is_some() {
+                hasher.update(tool_signature(t).as_bytes());
+                found = true;
+            }
+        }
+    }
+    if let Some(systems) = req.system.as_ref() {
+        for s in systems {
+            if s.cache_control.is_some() {
+                hasher.update(system_signature(s).as_bytes());
+                found = true;
+            }
+        }
+    }
+    if !found {
+        return None;
+    }
+    let digest = hasher.finalize();
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&digest[..8]);
+    Some(u64::from_be_bytes(buf))
 }
 
 /// 探测请求里出现过的最大 cache_control.ttl（"1h" 优先于 "5m"）；
@@ -617,13 +654,28 @@ fn system_signature(s: &SystemMessage) -> String {
     format!("sys:{}", s.text)
 }
 
-/// 直接从 content block 的 JSON 值算签名，只取 type/text/thinking 三个字段。
+/// 直接从 content block 的 JSON 值算签名，取 type/text/thinking/name/is_error。
 ///
 /// 不反序列化整个 ContentBlock、不 clone：image 的 base64、tool_use 的 input、
-/// tool_result 的 content 等大字段或易变字段都不参与签名，保证前缀指纹稳定且廉价。
+/// tool_result 的 content 等大字段由专门分支处理（见 [`block_big_payload`]）；
+/// 每次调用都变化的 `id`/`tool_use_id` 刻意不参与签名（纳入会打掉合法的跨轮命中）。
+/// `name`（tool_use 的工具名）与 `is_error`（tool_result 的错误标志）跨轮稳定且
+/// 区分语义，必须参与——否则同 input 不同工具、同 content 不同错误态会指纹碰撞。
 fn block_signature_value(v: &serde_json::Value) -> String {
     let s = |key: &str| v.get(key).and_then(|x| x.as_str()).unwrap_or("");
-    format!("block:{}|{}|{}", s("type"), s("text"), s("thinking"))
+    let is_error = match v.get("is_error").and_then(|x| x.as_bool()) {
+        Some(true) => "1",
+        Some(false) => "0",
+        None => "",
+    };
+    format!(
+        "block:{}|{}|{}|{}|{}",
+        s("type"),
+        s("text"),
+        s("thinking"),
+        s("name"),
+        is_error
+    )
 }
 
 /// content block 的 token 估算原文：仅 text + thinking 的纯文本，不含签名结构标记。
@@ -1545,6 +1597,208 @@ mod tests {
             "同内容重放应命中含正文的深段，实测 cache_read={}，正文={} token",
             u3.cache_read,
             body_tokens
+        );
+    }
+
+    /// 主 Key（key_id=0）无 metadata session，但请求带稳定 cache_control 断点
+    /// （system/tools 级）时，应以「稳定 cc 内容 hash」作为隔离种子模拟缓存，
+    /// 而不是完全放弃——覆盖不带 metadata 的非 Claude Code 客户端。
+    ///
+    /// 借鉴 sub2api 的会话识别降级链：metadata session → cache_control 内容 hash。
+    /// 只取 system/tools 级 cache_control（跨轮稳定）；message 级断点每轮漂移，
+    /// 不得参与种子。
+    #[test]
+    fn master_key_with_stable_cache_control_falls_back_to_cc_seed() {
+        use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage};
+        let stable_sys = "You are a helpful assistant for acme. ".repeat(100);
+        let body = "conversation body text ".repeat(20);
+        let make = |messages: Vec<Message>| MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 64,
+            messages,
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: stable_sys.clone(),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let cache = CacheMeter::new(None);
+        // Turn 1：key_id=0、无 session，但 system 带 cache_control → 应模拟缓存。
+        let u1 = compute_cache_usage(
+            &cache,
+            &make(vec![
+                msg_with_cc("user", &body, false),
+                msg_with_cc("assistant", &body, false),
+                msg_with_cc("user", &body, false),
+            ]),
+            0,
+        );
+        assert!(
+            u1.cache_covered_est > 0,
+            "带稳定 cache_control 的主 Key 请求应产生缓存覆盖（cc 种子 fallback）"
+        );
+        assert_eq!(u1.cache_read, 0, "turn1 无历史可命中");
+
+        // Turn 2：追加一对 a/u，历史前缀逐字节不变 → 应跨轮命中。
+        let u2 = compute_cache_usage(
+            &cache,
+            &make(vec![
+                msg_with_cc("user", &body, false),
+                msg_with_cc("assistant", &body, false),
+                msg_with_cc("user", &body, false),
+                msg_with_cc("assistant", &body, false),
+                msg_with_cc("user", &body, false),
+            ]),
+            0,
+        );
+        assert!(
+            u2.cache_read > 0,
+            "cc 种子 fallback 下同一客户端的历史前缀应跨轮命中"
+        );
+    }
+
+    /// `tool_use` 的 `name` 必须进指纹：同 input 不同工具不得互相命中。
+    #[test]
+    fn different_tool_use_name_does_not_false_hit() {
+        use super::super::types::{Message, MessagesRequest};
+        let big_input = "echo line of script\n".repeat(300);
+        let big_tokens = estimate_tokens(&big_input);
+        assert!(big_tokens > 500, "前提：input 应有可观 token，实测 {big_tokens}");
+
+        let make = |tool_name: &str| MessagesRequest {
+            model: "m".to_string(),
+            max_tokens: 8,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("run it"),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type":"tool_use","id":"t1","name": tool_name,"input":{"script": big_input}}
+                    ]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type":"tool_result","tool_use_id":"t1","content":"ok"}
+                    ]),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("done"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("next"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let cache = CacheMeter::new(None);
+        let u1 = compute_cache_usage(&cache, &make("bash"), 1);
+        assert_eq!(u1.cache_read, 0, "首次必然 miss");
+
+        // 换工具名、input 相同：含 tool_use 的深段不得命中。
+        let u2 = compute_cache_usage(&cache, &make("python"), 1);
+        assert!(
+            u2.cache_read < big_tokens,
+            "tool_use 仅 name 不同却命中深段（cache_read={}，input={} token），name 未进指纹",
+            u2.cache_read,
+            big_tokens
+        );
+
+        // 同名重放必须命中深段，确认修复没打掉正常命中。
+        let u3 = compute_cache_usage(&cache, &make("bash"), 1);
+        assert!(
+            u3.cache_read >= big_tokens,
+            "同名同 input 重放应命中深段，实测 cache_read={}",
+            u3.cache_read
+        );
+    }
+
+    /// `tool_result` 的 `is_error` 必须进指纹：同 content 但错误标志不同不得互相命中。
+    #[test]
+    fn tool_result_is_error_flag_enters_fingerprint() {
+        use super::super::types::{Message, MessagesRequest};
+        let big = "stderr or stdout payload line\n".repeat(300);
+        let big_tokens = estimate_tokens(&big);
+        assert!(big_tokens > 500, "前提：正文应有可观 token，实测 {big_tokens}");
+
+        let make = |is_error: bool| {
+            let result_block = if is_error {
+                serde_json::json!([
+                    {"type":"tool_result","tool_use_id":"t1","content": big, "is_error": true}
+                ])
+            } else {
+                serde_json::json!([
+                    {"type":"tool_result","tool_use_id":"t1","content": big}
+                ])
+            };
+            MessagesRequest {
+                model: "m".to_string(),
+                max_tokens: 8,
+                messages: vec![
+                    Message {
+                        role: "user".to_string(),
+                        content: serde_json::json!("read it"),
+                    },
+                    Message {
+                        role: "assistant".to_string(),
+                        content: serde_json::json!([
+                            {"type":"tool_use","id":"t1","name":"read","input":{"path":"/a.rs"}}
+                        ]),
+                    },
+                    Message {
+                        role: "user".to_string(),
+                        content: result_block,
+                    },
+                    Message {
+                        role: "assistant".to_string(),
+                        content: serde_json::json!("done"),
+                    },
+                    Message {
+                        role: "user".to_string(),
+                        content: serde_json::json!("next"),
+                    },
+                ],
+                stream: false,
+                system: None,
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                output_config: None,
+                metadata: None,
+            }
+        };
+
+        let cache = CacheMeter::new(None);
+        let u1 = compute_cache_usage(&cache, &make(false), 1);
+        assert_eq!(u1.cache_read, 0, "首次必然 miss");
+
+        // 同 content 但 is_error=true：含 tool_result 的深段不得命中。
+        let u2 = compute_cache_usage(&cache, &make(true), 1);
+        assert!(
+            u2.cache_read < big_tokens,
+            "tool_result 仅 is_error 不同却命中深段（cache_read={}），is_error 未进指纹",
+            u2.cache_read
         );
     }
 
