@@ -13,6 +13,7 @@ use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
 use crate::http_client::{ProxyConfig, build_client, build_streaming_client};
+use crate::kiro::credential_gate::{CredentialGates, GateOutcome};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::machine_id;
@@ -96,6 +97,11 @@ pub struct KiroCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
     pub proxy_url: Option<String>,
+    /// 并发门禁额度（RAII）：存活期间占用该凭据一个并发位。
+    /// 调用方必须让它活到响应体消费结束（流式：随 SSE 流一起 drop；
+    /// 非流式：在 handler 作用域持有到函数返回），否则门禁形同虚设。
+    /// None = 门禁禁用 / pinned 调用 / 兜底放行。
+    pub permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// Kiro API Provider
@@ -127,6 +133,8 @@ pub struct KiroProvider {
     profile_resolution_attempted: Mutex<HashSet<u64>>,
     /// 运维反馈编排（可选）：网络错误/成功按所用代理反馈到代理池
     ops: Option<crate::admin::ops::SharedOpsRuntime>,
+    /// 按凭证并发门禁：满载排队而非立即切换凭证，平滑单凭证请求速率
+    gates: CredentialGates,
 }
 
 impl KiroProvider {
@@ -152,6 +160,9 @@ impl KiroProvider {
         let tls_backend = config.tls_backend;
         let stream_idle_timeout_secs = config.stream_idle_timeout_secs;
         let stream_total_timeout_secs = config.stream_total_timeout_secs;
+        let credential_max_concurrent = config.credential_max_concurrent;
+        let credential_queue_depth = config.credential_queue_depth;
+        let credential_queue_timeout_secs = config.credential_queue_timeout_secs;
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）。
         // 开了 requireProxy 且全局代理为空时预热必然失败——这是合法配置
         // （代理配在各凭据上），跳过预热即可，不能让启动 panic。
@@ -184,6 +195,11 @@ impl KiroProvider {
             default_endpoint,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
             ops: None,
+            gates: CredentialGates::new(
+                credential_max_concurrent,
+                credential_queue_depth,
+                Duration::from_secs(credential_queue_timeout_secs),
+            ),
         }
     }
 
@@ -562,16 +578,35 @@ impl KiroProvider {
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 
+        // 并发门禁排队失败（队满/超时）的凭据：本次请求内不再选它。
+        // 所有候选都被排除时清空并置 gate_bypass 兜底放行——门禁只平滑速率，不拒绝请求。
+        let mut queue_excluded: HashSet<u64> = HashSet::new();
+        let mut gate_bypass = false;
+
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
             let acquired = match pinned {
                 Some(id) => self.token_manager.acquire_context_pinned(id).await,
-                None => self.token_manager.acquire_context(model.as_deref(), group).await,
+                None => {
+                    self.token_manager
+                        .acquire_context_excluding(model.as_deref(), group, &queue_excluded)
+                        .await
+                }
             };
             let mut ctx = match acquired {
                 Ok(c) => c,
                 Err(e) => {
+                    // 候选耗尽是门禁排除所致 → 清空排除、兜底放行重试（消耗一跳预算防死循环）
+                    if !queue_excluded.is_empty() {
+                        tracing::warn!(
+                            "并发门禁排除 {} 个凭据后无可用候选，兜底放行（本请求不再受门禁约束）",
+                            queue_excluded.len()
+                        );
+                        queue_excluded.clear();
+                        gate_bypass = true;
+                        continue;
+                    }
                     Self::emit_attempt(
                         sink, attempt, 0, "", None, outcome::UNKNOWN,
                         Some(&e.to_string()), attempt_start, None,
@@ -584,6 +619,45 @@ impl KiroProvider {
                     }
                     last_error = Some(e);
                     continue;
+                }
+            };
+
+            // 并发门禁：满载先排队等原凭证，排队失败（队满/超时）才换凭证。
+            // pinned 调用（探针/诊断）与兜底放行不占门禁额度。
+            let gate_permit = if pinned.is_some() || gate_bypass {
+                None
+            } else {
+                match self.gates.acquire(ctx.id).await {
+                    GateOutcome::Disabled => None,
+                    GateOutcome::Acquired { permit, waited } => {
+                        if !waited.is_zero() {
+                            if let Some(s) = sink {
+                                s.on_queue_wait(ctx.id, waited.as_millis() as u64, "acquired");
+                            }
+                            tracing::info!(
+                                "凭据 #{} 并发排队 {}ms 后获得额度",
+                                ctx.id,
+                                waited.as_millis()
+                            );
+                        }
+                        Some(permit)
+                    }
+                    rejected @ (GateOutcome::QueueFull | GateOutcome::Timeout { .. }) => {
+                        let (label, waited_ms) = match rejected {
+                            GateOutcome::Timeout { waited } => {
+                                ("queue_timeout", waited.as_millis() as u64)
+                            }
+                            _ => ("queue_full", 0),
+                        };
+                        if let Some(s) = sink {
+                            s.on_queue_wait(ctx.id, waited_ms, label);
+                        }
+                        tracing::warn!("凭据 #{} 并发门禁 {}，换凭证重试", ctx.id, label);
+                        queue_excluded.insert(ctx.id);
+                        last_error =
+                            Some(anyhow::anyhow!("凭据 #{} 并发已满（{}）", ctx.id, label));
+                        continue;
+                    }
                 }
             };
             let proxy_url = self.proxy_label(&ctx.credentials);
@@ -686,6 +760,7 @@ impl KiroProvider {
                     response,
                     credential_id: ctx.id,
                     proxy_url,
+                    permit: gate_permit,
                 });
             }
 

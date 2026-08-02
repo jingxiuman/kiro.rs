@@ -94,6 +94,8 @@ pub mod phase {
     pub const DECODE: &str = "decode";
     /// 响应内容组装 + 输出 token 估算（非流式）
     pub const ASSEMBLE: &str = "assemble";
+    /// 并发门禁排队等待（凭据并发满时；outcome = acquired / queue_timeout / queue_full）
+    pub const QUEUE: &str = "queue";
 }
 
 /// 调用方使用的入口 Key 类型。
@@ -234,6 +236,12 @@ pub fn truncate_snippet(body: &str) -> Option<String> {
 /// 链路上报接收端：provider 在重试循环里每跳调用 [`Self::on_attempt`]
 pub trait TraceSink: Send + Sync {
     fn on_attempt(&self, attempt: TraceAttempt);
+
+    /// 并发门禁排队观测（默认 no-op）。`outcome`：acquired / queue_timeout / queue_full。
+    /// RequestTracer 把它落成一个 [`phase::QUEUE`] 生命周期段。
+    fn on_queue_wait(&self, credential_id: u64, waited_ms: u64, outcome: &str) {
+        let _ = (credential_id, waited_ms, outcome);
+    }
 }
 
 /// 查询过滤条件
