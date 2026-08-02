@@ -207,7 +207,7 @@ export function EditCredentialDialog({
               {/* 自定义 URL 手动输入框 */}
               {showManualInput && (
                 <Input
-                  placeholder='自定义代理 URL（如 socks5://user:pass@host:port）'
+                  placeholder='自定义代理 URL（如 socks5h://user:pass@host:port）'
                   value={proxyUrl}
                   onChange={(e) => setProxyUrl(e.target.value)}
                   disabled={isPending}

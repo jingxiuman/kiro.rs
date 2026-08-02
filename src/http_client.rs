@@ -77,7 +77,8 @@ pub fn require_proxy() -> bool {
 /// 代理配置
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ProxyConfig {
-    /// 代理地址，支持 http/https/socks5
+    /// 代理地址，支持 http/https/socks4/socks4a/socks5/socks5h
+    /// （socks5h/socks4a 由代理端解析域名，即远程 DNS）
     pub url: String,
     /// 代理认证用户名
     pub username: Option<String>,
@@ -101,6 +102,45 @@ impl ProxyConfig {
         self.password = Some(password.into());
         self
     }
+}
+
+/// 本项目接受的代理 scheme —— **唯一真源**。
+///
+/// 曾经存在两份副本（代理池一份、全局代理设置一份），加 socks5h 时漏改了后者，
+/// 表现为「代理池能加、全局代理设置框拒绝」。新增 scheme 只改这里。
+///
+/// socks5h/socks4a 与 socks5/socks4 的差别在于域名由代理端解析（远程 DNS），
+/// reqwest 的 socks feature 原生支持；带 h/a 的排在前面，使剥前缀不依赖「两者互斥」这一隐含前提。
+const PROXY_SCHEMES: [&str; 6] = [
+    "http://",
+    "https://",
+    "socks5h://",
+    "socks5://",
+    "socks4a://",
+    "socks4://",
+];
+
+/// 校验代理 URL 的 scheme 与 host:port 是否合法
+///
+/// 不接受凭据级的特殊值 "direct" —— 那是凭据层的语义，见
+/// [`crate::kiro::model::credentials::KiroCredentials::validate_proxy_url`]。
+pub fn validate_proxy_url(url: &str) -> anyhow::Result<()> {
+    let Some(scheme) = PROXY_SCHEMES.iter().find(|s| url.starts_with(*s)) else {
+        anyhow::bail!(
+            "代理 URL scheme 无效，支持: http/https/socks4/socks4a/socks5/socks5h（收到: {}）",
+            url
+        );
+    };
+
+    // 剥掉 scheme 后可能是 user:pass@host:port 或 host:port
+    let host_part = {
+        let after_scheme = &url[scheme.len()..];
+        after_scheme.rsplit('@').next().unwrap_or(after_scheme)
+    };
+    if !host_part.contains(':') {
+        anyhow::bail!("代理 URL 缺少端口号: {}", url);
+    }
+    Ok(())
 }
 
 /// 构建 HTTP Client
@@ -310,6 +350,44 @@ fn render_error_chain(err: &(dyn std::error::Error + 'static), tag: Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_proxy_url_accepts_all_supported_schemes() {
+        for url in [
+            "http://127.0.0.1:8080",
+            "https://127.0.0.1:8443",
+            "socks4://127.0.0.1:1080",
+            "socks4a://127.0.0.1:1080",
+            "socks5://127.0.0.1:1080",
+            "socks5h://127.0.0.1:1080",
+            "socks5h://user:pass@127.0.0.1:1080",
+        ] {
+            assert!(validate_proxy_url(url).is_ok(), "应接受 {}", url);
+        }
+    }
+
+    #[test]
+    fn validate_proxy_url_rejects_unknown_scheme() {
+        assert!(validate_proxy_url("socks6://127.0.0.1:1080").is_err());
+        assert!(validate_proxy_url("127.0.0.1:1080").is_err());
+        // "direct" 是凭据层的特殊值，不属于本函数的职责
+        assert!(validate_proxy_url("direct").is_err());
+    }
+
+    #[test]
+    fn validate_proxy_url_still_requires_port_for_new_schemes() {
+        // 剥 scheme 后的 host:port 检查必须对新增 scheme 同样生效。
+        // 断言到具体错误信息，避免「因 scheme 被拒」这种错误原因让测试假绿。
+        for url in ["socks5h://127.0.0.1", "socks4a://user:pass@host"] {
+            let err = validate_proxy_url(url).unwrap_err().to_string();
+            assert!(
+                err.contains("缺少端口号"),
+                "{} 的报错应为端口缺失: {}",
+                url,
+                err
+            );
+        }
+    }
 
     #[test]
     fn test_proxy_config_new() {

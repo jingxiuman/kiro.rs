@@ -111,7 +111,7 @@ pub struct KiroCredentials {
     pub subscription_title: Option<String>,
 
     /// 凭据级代理 URL（可选）
-    /// 支持 http/https/socks5 协议
+    /// 支持 http/https/socks4/socks4a/socks5/socks5h 协议
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
     /// 未配置时回退到全局代理配置
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -363,6 +363,17 @@ impl CredentialsConfig {
 impl KiroCredentials {
     /// 特殊值：显式不使用代理
     pub const PROXY_DIRECT: &'static str = "direct";
+
+    /// 校验凭据级 proxy_url 字段
+    ///
+    /// 与全局代理的区别只有一处：额外放行特殊值 "direct"。判定方式必须与
+    /// [`Self::effective_proxy`] 一致（大小写不敏感），否则会出现「存得进去但语义不生效」。
+    pub fn validate_proxy_url(url: &str) -> anyhow::Result<()> {
+        if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) {
+            return Ok(());
+        }
+        crate::http_client::validate_proxy_url(url)
+    }
 
     /// 获取默认凭证文件路径
     pub fn default_credentials_path() -> &'static str {
@@ -1217,6 +1228,26 @@ mod tests {
 
         let result = creds.effective_proxy(Some(&global));
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn validate_proxy_url_allows_direct_sentinel_case_insensitively() {
+        // 必须与 effective_proxy 的 eq_ignore_ascii_case 判定保持一致，
+        // 否则会出现「存得进去但语义不生效」或「语义生效却存不进去」的错配
+        for url in ["direct", "DIRECT", "Direct"] {
+            assert!(
+                KiroCredentials::validate_proxy_url(url).is_ok(),
+                "应放行 {}",
+                url
+            );
+        }
+    }
+
+    #[test]
+    fn validate_proxy_url_accepts_socks5h_and_rejects_garbage() {
+        assert!(KiroCredentials::validate_proxy_url("socks5h://127.0.0.1:1080").is_ok());
+        assert!(KiroCredentials::validate_proxy_url("socks6://127.0.0.1:1080").is_err());
+        assert!(KiroCredentials::validate_proxy_url("随便填的").is_err());
     }
 
     #[test]

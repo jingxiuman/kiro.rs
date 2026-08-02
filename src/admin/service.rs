@@ -287,6 +287,37 @@ fn normalize_auto_apply_time(value: &str) -> Result<String, AdminServiceError> {
     Ok(format!("{:02}:{:02}", h, m))
 }
 
+/// 校验全局代理 URL
+///
+/// 与凭据级的区别：不放行 "direct" —— 全局代理用 `None` 表达「不走代理」，
+/// 存进 `"direct"` 只会得到一个连不上的代理配置。
+fn validate_global_proxy_url(url: &str) -> Result<(), AdminServiceError> {
+    crate::http_client::validate_proxy_url(url)
+        .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
+}
+
+/// 校验凭据级 proxy_url（放行 "direct"），并映射成 admin 的错误类型
+fn validate_credential_proxy_url(url: &str) -> Result<(), AdminServiceError> {
+    KiroCredentials::validate_proxy_url(url)
+        .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
+}
+
+/// 解析登录流程要用的代理：请求级 > 全局 > 无。
+///
+/// 语义必须与 [`KiroCredentials::effective_proxy`] 一致——尤其是 "direct" 表示
+/// **显式不走代理**（而非回退全局）。此前这里直接 `ProxyConfig::new(url)`，
+/// 传 "direct" 会构造出一个连不上的代理。
+fn resolve_login_proxy(
+    req_proxy_url: Option<&str>,
+    global_proxy: Option<ProxyConfig>,
+) -> Option<ProxyConfig> {
+    match req_proxy_url.filter(|u| !u.is_empty()) {
+        Some(u) if u.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) => None,
+        Some(u) => Some(ProxyConfig::new(u)),
+        None => global_proxy,
+    }
+}
+
 /// GitHub `repos/{owner}/{repo}/releases/tags/{tag}` 返回 JSON 中我们关心
 /// 的字段，用于在「检查更新」结果里附带本次发布的 changelog。
 #[derive(Debug, Deserialize)]
@@ -1080,6 +1111,13 @@ impl AdminService {
         req: AddCredentialRequest,
         fetch_balance: bool,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
+        // 校验凭据级代理 URL（空串等价于未设置，交由后续逻辑处理）
+        if let Some(ref u) = req.proxy_url
+            && !u.is_empty()
+        {
+            validate_credential_proxy_url(u)?;
+        }
+
         // 校验端点名：未指定则默认合法，指定则必须已注册
         if let Some(ref name) = req.endpoint
             && !self.known_endpoints.contains(name) {
@@ -1277,6 +1315,14 @@ impl AdminService {
         id: u64,
         req: UpdateCredentialRequest,
     ) -> Result<(), AdminServiceError> {
+        // 只校验本次实际传入的 proxy_url：不传则不校验，避免改邮箱时被存量非法值挡住；
+        // 空串表示清除，同样跳过。
+        if let Some(ref u) = req.proxy_url
+            && !u.is_empty()
+        {
+            validate_credential_proxy_url(u)?;
+        }
+
         self.token_manager
             .update_credential(
                 id,
@@ -1761,18 +1807,11 @@ impl AdminService {
     }
 
     /// 设置全局代理 URL（None 表示清除）并持久化到配置文件
+    ///
+    /// 校验见 [`validate_global_proxy_url`]。
     pub fn set_global_proxy(&self, url: Option<String>) -> Result<(), AdminServiceError> {
         if let Some(ref u) = url {
-            let valid_prefix = u.starts_with("http://")
-                || u.starts_with("https://")
-                || u.starts_with("socks5://")
-                || u.starts_with("socks4://");
-            if !valid_prefix {
-                return Err(AdminServiceError::InvalidCredential(
-                    "代理 URL 格式无效，需以 http://、https://、socks5:// 或 socks4:// 开头"
-                        .to_string(),
-                ));
-            }
+            validate_global_proxy_url(u)?;
         }
 
         let proxy = url.as_deref().map(ProxyConfig::new);
@@ -3022,12 +3061,14 @@ impl AdminService {
         &self,
         req: StartSocialLoginRequest,
     ) -> Result<StartSocialLoginResponse, AdminServiceError> {
+        if let Some(ref u) = req.proxy_url
+            && !u.is_empty()
+        {
+            validate_credential_proxy_url(u)?;
+        }
+
         let global_proxy = self.token_manager.proxy();
-        let proxy = req
-            .proxy_url
-            .as_deref()
-            .map(ProxyConfig::new)
-            .or(global_proxy);
+        let proxy = resolve_login_proxy(req.proxy_url.as_deref(), global_proxy);
 
         let auth_endpoint = req
             .auth_endpoint
@@ -3283,15 +3324,17 @@ impl AdminService {
         &self,
         req: StartIdcLoginRequest,
     ) -> Result<StartIdcLoginResponse, AdminServiceError> {
+        if let Some(ref u) = req.proxy_url
+            && !u.is_empty()
+        {
+            validate_credential_proxy_url(u)?;
+        }
+
         let config = self.token_manager.config();
         let global_proxy = self.token_manager.proxy();
 
         // 代理：优先用请求级，否则回退全局
-        let proxy = req
-            .proxy_url
-            .as_deref()
-            .map(ProxyConfig::new)
-            .or(global_proxy);
+        let proxy = resolve_login_proxy(req.proxy_url.as_deref(), global_proxy);
 
         let start_url = req.start_url.as_deref().unwrap_or(BUILDER_ID_START_URL);
 
@@ -3481,12 +3524,14 @@ impl AdminService {
             }
         }
 
+        if let Some(ref u) = req.proxy_url
+            && !u.is_empty()
+        {
+            validate_credential_proxy_url(u)?;
+        }
+
         let global_proxy = self.token_manager.proxy();
-        let proxy = req
-            .proxy_url
-            .as_deref()
-            .map(ProxyConfig::new)
-            .or(global_proxy);
+        let proxy = resolve_login_proxy(req.proxy_url.as_deref(), global_proxy);
 
         let auth_endpoint = req
             .auth_endpoint
@@ -3544,14 +3589,16 @@ impl AdminService {
             }
         }
 
+        if let Some(ref u) = req.proxy_url
+            && !u.is_empty()
+        {
+            validate_credential_proxy_url(u)?;
+        }
+
         let config = self.token_manager.config();
         let global_proxy = self.token_manager.proxy();
 
-        let proxy = req
-            .proxy_url
-            .as_deref()
-            .map(ProxyConfig::new)
-            .or(global_proxy);
+        let proxy = resolve_login_proxy(req.proxy_url.as_deref(), global_proxy);
 
         let start_url = req.start_url.as_deref().unwrap_or(BUILDER_ID_START_URL);
 
@@ -4914,6 +4961,47 @@ mod tests {
             }
             other => panic!("预期 RateLimited，实际为 {other:?}"),
         }
+    }
+
+    #[test]
+    fn global_proxy_validation_accepts_every_supported_scheme() {
+        // 防回归：全局代理曾经有一份独立的白名单副本，漏掉了 socks5h。
+        // 现在它必须与代理池共用同一份 scheme 真源。
+        for url in [
+            "http://127.0.0.1:8080",
+            "https://127.0.0.1:8443",
+            "socks4://127.0.0.1:1080",
+            "socks4a://127.0.0.1:1080",
+            "socks5://127.0.0.1:1080",
+            "socks5h://127.0.0.1:1080",
+        ] {
+            assert!(validate_global_proxy_url(url).is_ok(), "应接受 {}", url);
+        }
+    }
+
+    #[test]
+    fn global_proxy_validation_rejects_direct_sentinel() {
+        // "direct" 只在凭据级有意义（覆盖全局代理）；全局代理用 None 表达不走代理，
+        // 存进去会变成一个非法 URL 的代理配置
+        assert!(validate_global_proxy_url("direct").is_err());
+        assert!(validate_global_proxy_url("socks6://127.0.0.1:1080").is_err());
+    }
+
+    #[test]
+    fn login_proxy_honors_direct_instead_of_falling_back_to_global() {
+        let global = Some(ProxyConfig::new("http://global:8080"));
+
+        // "direct" = 显式不走代理，不能回退全局
+        assert_eq!(resolve_login_proxy(Some("direct"), global.clone()), None);
+        assert_eq!(resolve_login_proxy(Some("DIRECT"), global.clone()), None);
+        // 未传 / 空串 = 回退全局
+        assert_eq!(resolve_login_proxy(None, global.clone()), global);
+        assert_eq!(resolve_login_proxy(Some(""), global.clone()), global);
+        // 传了就用传的
+        assert_eq!(
+            resolve_login_proxy(Some("socks5h://p:1080"), global),
+            Some(ProxyConfig::new("socks5h://p:1080"))
+        );
     }
 
     #[test]

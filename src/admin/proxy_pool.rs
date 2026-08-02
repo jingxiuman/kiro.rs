@@ -5,7 +5,7 @@
 //! 除增删改查外，还提供主动健康检查：周期性（或按需）通过每个代理请求一个
 //! 轻量公网探测端点，记录连通性与延迟；连续探测失败达阈值的代理会被自动禁用。
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client, validate_proxy_url};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -200,29 +200,6 @@ pub struct ProxyPoolManager {
     /// 全量健康检查重入保护：后台定时与手动触发可能重叠，若并发探测同一瞬时故障
     /// 会被计成多次连续失败并误达阈值。置位期间的重复调用直接跳过。
     check_in_progress: AtomicBool,
-}
-
-/// 校验代理 URL 的 scheme 是否合法
-fn validate_proxy_url(url: &str) -> anyhow::Result<()> {
-    let valid_schemes = ["http://", "https://", "socks5://", "socks4://"];
-    if !valid_schemes.iter().any(|s| url.starts_with(s)) {
-        anyhow::bail!(
-            "代理 URL scheme 无效，支持: http/https/socks4/socks5（收到: {}）",
-            url
-        );
-    }
-    // 简单检查 host:port 存在
-    let after_scheme = valid_schemes
-        .iter()
-        .find(|s| url.starts_with(*s))
-        .map(|s| &url[s.len()..])
-        .unwrap_or(url);
-    // after_scheme 可能是 user:pass@host:port 或 host:port
-    let host_part = after_scheme.rsplit('@').next().unwrap_or(after_scheme);
-    if !host_part.contains(':') {
-        anyhow::bail!("代理 URL 缺少端口号: {}", url);
-    }
-    Ok(())
 }
 
 impl ProxyPoolManager {
@@ -737,6 +714,20 @@ mod tests {
             last_request_error: None,
             recovery: RecoveryState::default(),
         }
+    }
+
+    #[test]
+    fn add_rejects_invalid_url_and_accepts_socks5h() {
+        // 代理池的写入路径必须真的走 validate_proxy_url（scheme 规则本身在 http_client 有专项测试）
+        let mgr = ProxyPoolManager::new(None, TlsBackend::default());
+        assert!(
+            mgr.add("socks6://127.0.0.1:1080".to_string(), None)
+                .is_err()
+        );
+        assert!(
+            mgr.add("socks5h://127.0.0.1:1080".to_string(), None)
+                .is_ok()
+        );
     }
 
     #[test]

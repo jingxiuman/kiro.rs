@@ -203,7 +203,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
           {!showBatch && (
             <form onSubmit={handleAdd} className="flex gap-2">
               <Input
-                placeholder="代理 URL（如 socks5://user:pass@host:port）"
+                placeholder="代理 URL（如 socks5h://user:pass@host:port）"
                 value={newUrl}
                 onChange={(e) => setNewUrl(e.target.value)}
                 className="flex-1 font-mono text-sm"
@@ -237,7 +237,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                 批量导入（每行一个代理 URL，# 开头为注释）
               </label>
               <textarea
-                placeholder={'# 每行一个代理 URL\nsocks5://user:pass@host1:1080\nsocks5://user:pass@host2:1080\nhttp://user:pass@host3:8080'}
+                placeholder={'# 每行一个代理 URL\n# 支持 http/https/socks4/socks4a/socks5/socks5h\nsocks5h://user:pass@host1:1080\nsocks5://user:pass@host2:1080\nhttp://user:pass@host3:8080'}
                 value={batchText}
                 onChange={(e) => setBatchText(e.target.value)}
                 className="flex min-h-[120px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono placeholder:text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30"
