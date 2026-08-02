@@ -8,7 +8,8 @@ RUN bun run build
 
 FROM rust:1.92-alpine AS builder
 
-RUN apk add --no-cache musl-dev perl make
+# g++：duckdb bundled（C++ 源码 cc 编译）所需
+RUN apk add --no-cache musl-dev perl make g++
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./

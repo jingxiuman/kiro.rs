@@ -12,7 +12,7 @@ use axum::{
 
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
-use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
+use crate::admin::usage_store::SharedUsageStore;
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
@@ -42,10 +42,8 @@ pub struct AppState {
     pub tool_compatibility_mode: crate::model::config::ToolCompatibilityMode,
     /// 客户端 Key 管理器（可选，未启用 Admin 时为 None）
     pub client_keys: Option<SharedClientKeyManager>,
-    /// 用量日志记录器
-    pub usage_recorder: Option<SharedRecorder>,
-    /// 用量聚合器
-    pub usage_aggregator: Option<SharedAggregator>,
+    /// 用量存储（DuckDB：写入 + 统计查询）
+    pub usage_store: Option<SharedUsageStore>,
     /// 中转层缓存计量（基于 cache_control 断点的内存缓存）
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
@@ -64,8 +62,7 @@ impl AppState {
             extract_thinking,
             tool_compatibility_mode,
             client_keys: None,
-            usage_recorder: None,
-            usage_aggregator: None,
+            usage_store: None,
             cache_meter: None,
             trace_store: None,
         }
@@ -85,12 +82,10 @@ impl AppState {
     pub fn with_usage(
         mut self,
         client_keys: Option<SharedClientKeyManager>,
-        recorder: Option<SharedRecorder>,
-        aggregator: Option<SharedAggregator>,
+        usage_store: Option<SharedUsageStore>,
     ) -> Self {
         self.client_keys = client_keys;
-        self.usage_recorder = recorder;
-        self.usage_aggregator = aggregator;
+        self.usage_store = usage_store;
         self
     }
 

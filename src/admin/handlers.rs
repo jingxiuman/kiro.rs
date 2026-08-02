@@ -1135,7 +1135,7 @@ fn stats_bad_request(message: String) -> axum::response::Response {
 
 /// GET /api/admin/stats/overview
 pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoResponse {
-    let overview = state.usage_aggregator.overview();
+    let overview = state.usage_store.overview();
     // 附加：当前活跃 Key / 凭据数
     let active_keys = state.client_keys.active_count() as u64;
     let snapshot = state.service.get_all_credentials();
@@ -1167,7 +1167,7 @@ pub async fn stats_timeseries(
     };
     let group = parse_group_filter(&params);
     let cred_ids = group_to_cred_ids(&state, group.as_deref());
-    let points = state.usage_aggregator.query_timeseries(window, key_id, cred_ids.as_ref());
+    let points = state.usage_store.query_timeseries(window, key_id, cred_ids.as_ref());
     Json(points).into_response()
 }
 
@@ -1180,7 +1180,7 @@ pub async fn stats_by_model(
         Ok(parts) => parts,
         Err(message) => return stats_bad_request(message),
     };
-    let data = state.usage_aggregator.query_by_model(window, key_id);
+    let data = state.usage_store.query_by_model(window, key_id);
     Json(data).into_response()
 }
 
@@ -1210,7 +1210,7 @@ pub async fn stats_by_credential(
             .map(|c| c.id)
             .collect()
     });
-    let data = state.usage_aggregator.query_by_credential(window, key_id, cred_ids.as_ref());
+    let data = state.usage_store.query_by_credential(window, key_id, cred_ids.as_ref());
     let enriched: Vec<serde_json::Value> = data
         .into_iter()
         .map(|d| {
@@ -1277,7 +1277,7 @@ pub async fn stats_credits_by_credential(
     });
     let data =
         state
-            .usage_aggregator
+            .usage_store
             .query_credits_by_credential(window, key_id, cred_ids.as_ref(), limit);
     let series: Vec<serde_json::Value> = data
         .series

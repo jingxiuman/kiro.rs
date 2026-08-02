@@ -27,6 +27,8 @@ pub mod types;
 mod binary_update;
 pub mod client_keys;
 pub mod groups;
+pub mod duck;
+pub mod usage_store;
 pub mod usage_stats;
 pub mod trace_db;
 
@@ -40,5 +42,5 @@ pub use service::AdminService;
 pub use service::ModelSyncSettings;
 pub(crate) use service::parse_auto_apply_time;
 pub use ops::{OpsRuntime, OpsStore};
-pub use usage_stats::{UsageAggregator, UsageRecorder};
+pub use usage_store::UsageStore;
 pub use trace_db::{SharedTraceStore, TraceStore};

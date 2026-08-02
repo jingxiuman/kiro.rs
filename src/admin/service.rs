@@ -193,8 +193,8 @@ pub struct AdminService {
     social_sessions: Arc<Mutex<HashMap<String, SocialAuthSession>>>,
     /// 请求链路追踪存储（用于日志治理：开关 + 保留天数运行时可改）
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
-    /// 用量日志记录器（用于日志治理：保留天数运行时可改）
-    usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// 用量存储（用于日志治理：保留天数运行时可改）
+    usage_recorder: Option<crate::admin::usage_store::SharedUsageStore>,
     /// 模型同步运行时配置（可热改）。
     /// `Arc` 是因为同步调度器创建在 admin 分支之外（spec §6.1），它和这里必须
     /// 读同一份 holder，否则 UI 改了开关调度器看不到，得重启才生效。
@@ -579,7 +579,7 @@ impl AdminService {
     pub fn with_log_governance(
         mut self,
         trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
-        usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+        usage_recorder: Option<crate::admin::usage_store::SharedUsageStore>,
     ) -> Self {
         self.trace_store = trace_store;
         self.usage_recorder = usage_recorder;

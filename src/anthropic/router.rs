@@ -8,7 +8,7 @@ use axum::{
 };
 
 use crate::admin::client_keys::SharedClientKeyManager;
-use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
+use crate::admin::usage_store::SharedUsageStore;
 use crate::admin::trace_db::SharedTraceStore;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::ToolCompatibilityMode;
@@ -53,7 +53,6 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
-        None,
     )
 }
 
@@ -64,8 +63,7 @@ pub fn create_router(
     extract_thinking: bool,
     tool_compatibility_mode: ToolCompatibilityMode,
     client_keys: Option<SharedClientKeyManager>,
-    usage_recorder: Option<SharedRecorder>,
-    usage_aggregator: Option<SharedAggregator>,
+    usage_store: Option<SharedUsageStore>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
 ) -> Router {
@@ -73,7 +71,7 @@ pub fn create_router(
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
-    state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
+    state = state.with_usage(client_keys, usage_store);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
 

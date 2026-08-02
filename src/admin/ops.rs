@@ -1,9 +1,9 @@
 //! 运维（Ops）模块：上游问题与代理池问题的统一统计和自动处置
 //!
 //! 两个组件：
-//! - [`OpsStore`]：SQLite 存储。处置事件写 `ops_events` 表；统计聚合直接对
-//!   traces.db 里既有的 `traces` / `trace_attempts` 表做 SQL 聚合（同一文件、
-//!   独立连接，WAL 模式下并发读写安全），不引入第二份数据。
+//! - [`OpsStore`]：DuckDB 存储。处置事件写 `ops_events` 表；统计聚合直接对
+//!   kiro.duckdb 里既有的 `traces` / `trace_attempts` 表做 SQL 聚合（同一
+//!   DuckDB 实例上的独立连接，进程内 MVCC 并发读写安全），不引入第二份数据。
 //! - [`OpsRuntime`]：请求路径上的反馈编排。provider / 流处理把「网络错误、
 //!   流中断」按所用代理上报到这里；连续失败达阈值的代理被自动禁用后，
 //!   在此完成受影响凭据的解绑/换绑，并记录处置事件。
@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
+use duckdb::Connection;
 use parking_lot::Mutex;
-use rusqlite::Connection;
 use serde::Serialize;
 
 use super::proxy_pool::ProxyPoolManager;
@@ -648,33 +648,30 @@ struct BackoffSamples {
     p50_by_hop: std::collections::BTreeMap<u32, u64>,
 }
 
-/// Ops SQLite 存储。
+/// Ops DuckDB 存储。
 ///
-/// 与 [`super::trace_db::TraceStore`] 共用同一个 traces.db 文件、各持独立连接；
-/// WAL + busy_timeout 保证两个写入方互不阻塞。
+/// 与 [`super::trace_db::TraceStore`] 共用同一个 kiro.duckdb（同一进程内
+/// DuckDB 实例上的独立连接，MVCC 保证两个写入方互不阻塞）。
 pub struct OpsStore {
     conn: Mutex<Connection>,
 }
 
 impl OpsStore {
-    /// 打开（或创建）ops_events 表。path 指向 traces.db。
-    pub fn open(path: PathBuf) -> rusqlite::Result<Self> {
-        let conn = Connection::open(&path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.execute_batch(EVENTS_SCHEMA)?;
+    /// 打开（或复用）共享 kiro.duckdb。建表（含 ops_events）由
+    /// [`super::duck::open_shared`] 完成。
+    pub fn open(path: PathBuf) -> duckdb::Result<Self> {
+        let conn = crate::admin::duck::open_shared(&path)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// 内存兜底（traces.db 打开失败时，事件仅进程内可见，聚合返回空）
-    pub fn open_in_memory() -> rusqlite::Result<Self> {
+    /// 内存兜底（kiro.duckdb 打开失败时，事件仅进程内可见，聚合返回空）。
+    /// 内存库不经过 open_shared，需自行执行建表——duck.rs SCHEMA 同时带出
+    /// 空的 traces 系列表，让聚合查询稳定返回空集而不是报错。
+    pub fn open_in_memory() -> duckdb::Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(EVENTS_SCHEMA)?;
-        // 内存库没有 traces 表，聚合查询会失败：建空表让查询稳定返回空集
-        conn.execute_batch(super::trace_db::SCHEMA)?;
+        conn.execute_batch(crate::admin::duck::SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -686,7 +683,7 @@ impl OpsStore {
         let res = self.conn.lock().execute(
             "INSERT INTO ops_events (ts, ts_epoch, category, severity, subject, message) \
              VALUES (?1,?2,?3,?4,?5,?6)",
-            rusqlite::params![
+            duckdb::params![
                 now.to_rfc3339(),
                 now.timestamp(),
                 category,
@@ -1057,7 +1054,7 @@ impl OpsStore {
         // 按 (桶, error_type) 出计数，同时带上该组的 status 归属。
         // success 行的 error_type 为 NULL，用 '' 占位以免 GROUP BY 丢行。
         let mut stmt = match conn.prepare(
-            "SELECT (ts_epoch / 3600) * 3600 AS bucket, \
+            "SELECT (ts_epoch // 3600) * 3600 AS bucket, \
              COALESCE(error_type, '') AS et, \
              COUNT(*), \
              COALESCE(SUM(final_status = 'success'), 0), \
@@ -1284,13 +1281,13 @@ impl OpsStore {
         };
 
         // (跳数 → 该跳数下的 trace 总数, 其中 success 数)。
-        // MAX(total_attempts, 1)：任何落库的 trace 至少跑过一跳，把异常的 0
+        // GREATEST(total_attempts, 1)：任何落库的 trace 至少跑过一跳，把异常的 0
         // 归到第 1 跳，保证「第 1 跳 reached == 窗口内 trace 总数」这条恒等式
         // 在脏数据下也不破 —— 它是这张表的自检锚点。
         let mut buckets: std::collections::BTreeMap<u32, (u64, u64)> =
             std::collections::BTreeMap::new();
         let mut stmt = match conn.prepare(
-            "SELECT MAX(total_attempts, 1) AS hops, \
+            "SELECT GREATEST(total_attempts, 1) AS hops, \
              COUNT(*), COALESCE(SUM(final_status = 'success'), 0) \
              FROM traces WHERE ts_epoch >= ?1 GROUP BY hops ORDER BY hops",
         ) {
@@ -1514,19 +1511,6 @@ pub struct PhaseBaselineRow {
     pub failed: u64,
 }
 
-const EVENTS_SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS ops_events (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts       TEXT NOT NULL,
-    ts_epoch INTEGER NOT NULL,
-    category TEXT NOT NULL,
-    severity TEXT NOT NULL,
-    subject  TEXT NOT NULL,
-    message  TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_ops_events_ts ON ops_events(ts_epoch DESC);
-";
-
 /// 请求路径上的运维反馈编排。
 ///
 /// 挂在 provider（网络错误/成功）与流处理（中断）上；所有方法都不阻塞、
@@ -1707,7 +1691,7 @@ mod tests {
                 "INSERT INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, is_stream, \
                  final_status, final_credential_id, error_type, total_attempts, duration_ms) \
                  VALUES (?1, '2026', ?2, 1, 'clientKey', 'm', 1, ?3, ?4, ?5, 1, ?6)",
-                rusqlite::params![
+                duckdb::params![
                     trace_id,
                     epoch,
                     final_status,
@@ -1745,7 +1729,7 @@ mod tests {
             .execute(
                 "INSERT INTO trace_attempts (trace_id, attempt, credential_id, endpoint, \
                  outcome, duration_ms, proxy_url) VALUES (?1, 0, ?2, ?3, ?4, 100, ?5)",
-                rusqlite::params![trace_id, credential_id as i64, endpoint, outcome, proxy_url],
+                duckdb::params![trace_id, credential_id as i64, endpoint, outcome, proxy_url],
             )
             .unwrap();
     }
@@ -1766,7 +1750,7 @@ mod tests {
                 "INSERT INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, is_stream, \
                  final_status, final_credential_id, error_type, total_attempts, duration_ms) \
                  VALUES (?1, '2026', ?2, 1, 'clientKey', 'm', 1, ?3, 1, NULL, ?4, 100)",
-                rusqlite::params![trace_id, epoch, final_status, total_attempts as i64],
+                duckdb::params![trace_id, epoch, final_status, total_attempts as i64],
             )
             .unwrap();
     }
@@ -1787,7 +1771,7 @@ mod tests {
                 "INSERT INTO trace_attempts (trace_id, attempt, credential_id, endpoint, \
                  outcome, duration_ms, started_ms, proxy_url) \
                  VALUES (?1, ?2, 1, 'ide', ?3, ?4, ?5, NULL)",
-                rusqlite::params![
+                duckdb::params![
                     trace_id,
                     attempt as i64,
                     outcome,
@@ -1805,7 +1789,7 @@ mod tests {
             .execute(
                 "INSERT INTO trace_phases (trace_id, seq, phase, started_ms, duration_ms, outcome) \
                  VALUES (?1, ?2, ?3, 0, 100, ?4)",
-                rusqlite::params![trace_id, seq as i64, phase, outcome],
+                duckdb::params![trace_id, seq as i64, phase, outcome],
             )
             .unwrap();
     }
@@ -2526,7 +2510,7 @@ mod tests {
                 "INSERT INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, is_stream, \
                  final_status, final_credential_id, error_type, error_message, total_attempts, \
                  duration_ms) VALUES (?1, '2026', ?2, 1, 'clientKey', 'm', 1, 'error', 1, ?3, ?4, 1, 500)",
-                rusqlite::params![trace_id, epoch, error_type, error_message],
+                duckdb::params![trace_id, epoch, error_type, error_message],
             )
             .unwrap();
     }
