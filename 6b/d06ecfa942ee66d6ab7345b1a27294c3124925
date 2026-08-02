@@ -1,0 +1,20 @@
+src/admin/duck.rs
+  s_76b817ce0732fe::t_1a11b902e762bf 3-8,10-12,16-18,31-46,48-50
+  s_76b817ce0732fe::t_7c4d1cee43fa46 176-202
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "6bd06ecfa942ee66d6ab7345b1a27294c3124925",
+  "prompts": {},
+  "sessions": {
+    "s_76b817ce0732fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8aad5c8-70ec-4c41-a43f-97434e44adf2",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
