@@ -77,6 +77,20 @@ CREATE TABLE IF NOT EXISTS imported_files (
 CREATE INDEX IF NOT EXISTS idx_usage_hour ON usage_records(hour_ts);
 CREATE INDEX IF NOT EXISTS idx_usage_day ON usage_records(day_ts);
 
+CREATE TABLE IF NOT EXISTS balance_snapshots (
+    ts_epoch           BIGINT NOT NULL,
+    hour_ts            BIGINT NOT NULL,
+    credential_id      BIGINT NOT NULL,
+    subscription_title VARCHAR NOT NULL,
+    current_usage      DOUBLE NOT NULL,
+    usage_limit        DOUBLE NOT NULL,
+    remaining          DOUBLE NOT NULL,
+    usage_percentage   DOUBLE NOT NULL,
+    next_reset_at      BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_balance_ts ON balance_snapshots(ts_epoch);
+CREATE INDEX IF NOT EXISTS idx_balance_cred ON balance_snapshots(credential_id);
+
 CREATE TABLE IF NOT EXISTS traces (
     trace_id          VARCHAR PRIMARY KEY,
     ts                VARCHAR NOT NULL,

@@ -1298,6 +1298,67 @@ pub async fn stats_credits_by_credential(
     .into_response()
 }
 
+/// GET /api/admin/stats/balance-history?hours=24&credentialId=N
+///
+/// 返回账号余额随时间的变化（按小时桶取均值）与消耗速率预测。
+/// 与 `/credentials/{id}/balance` 的分工：那个是「此刻还剩多少」，
+/// 这个是「怎么烧下去的、还能撑多久」。
+pub async fn stats_balance_history(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let Some(store) = state.service.balance_store() else {
+        return stats_bad_request("余额历史存储未初始化".to_string());
+    };
+    // 窗口：默认 24 小时，上限 90 天（与快照保留期一致，再长也没数据）
+    let hours = match params.get("hours") {
+        Some(s) => match s.parse::<i64>() {
+            Ok(v) if (1..=24 * 90).contains(&v) => v,
+            _ => return stats_bad_request("hours 必须是 1..=2160 的整数".to_string()),
+        },
+        None => 24,
+    };
+    let credential_id = match params.get("credentialId") {
+        Some(s) if !s.trim().is_empty() => match s.parse::<u64>() {
+            Ok(v) => Some(v),
+            Err(_) => return stats_bad_request("credentialId 必须是数字".to_string()),
+        },
+        _ => None,
+    };
+
+    let start_ts = crate::admin::balance_store::window_start(hours);
+    let points = store.query_history(start_ts, credential_id);
+    let rates = store.burn_rates(start_ts);
+    // 附加 email，让前端图例不必只显示裸 id
+    let snapshot = state.service.get_all_credentials();
+    let email_map: std::collections::HashMap<u64, Option<String>> = snapshot
+        .credentials
+        .iter()
+        .map(|c| (c.id, c.email.clone()))
+        .collect();
+    let series: Vec<serde_json::Value> = rates
+        .iter()
+        .filter(|r| credential_id.is_none_or(|id| r.credential_id == id))
+        .map(|r| {
+            serde_json::json!({
+                "credentialId": r.credential_id,
+                "email": email_map.get(&r.credential_id).cloned().flatten(),
+                "perHour": r.per_hour,
+                "remaining": r.remaining,
+                "hoursToExhaust": r.hours_to_exhaust,
+                "samplePoints": r.sample_points,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "windowHours": hours,
+        "series": series,
+        "points": points,
+    }))
+    .into_response()
+}
+
 /// GET /api/admin/traces
 /// 查询请求链路追踪记录（含每跳明细）。
 /// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed / limit / offset

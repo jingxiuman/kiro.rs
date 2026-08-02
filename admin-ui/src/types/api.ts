@@ -1002,3 +1002,32 @@ export interface SetModelSyncSettingsRequest {
   probeCredentialIdSet?: boolean
   allowPassthrough?: boolean
 }
+
+/** 余额历史中的一个时间点（后端按小时桶取均值） */
+export interface BalancePoint {
+  ts: string
+  credentialId: number
+  currentUsage: number
+  remaining: number
+  usagePercentage: number
+  usageLimit: number
+}
+
+/** 某账号的消耗速率与耗尽预测 */
+export interface BalanceBurnRate {
+  credentialId: number
+  email: string | null
+  /** 窗口内每小时平均消耗额度 */
+  perHour: number
+  remaining: number
+  /** 按当前速率预计还能撑多少小时；null = 没在消耗或样本不足 */
+  hoursToExhaust: number | null
+  /** 估算基于多少个快照点，太少时应标注样本不足 */
+  samplePoints: number
+}
+
+export interface BalanceHistory {
+  windowHours: number
+  series: BalanceBurnRate[]
+  points: BalancePoint[]
+}

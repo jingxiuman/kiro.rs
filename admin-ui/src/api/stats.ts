@@ -1,6 +1,7 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
+  BalanceHistory,
   CredentialDistribution,
   CreditsByCredential,
   ModelDistribution,
@@ -62,6 +63,20 @@ export async function getCreditsByCredential(
 ): Promise<CreditsByCredential> {
   const { data } = await api.get<CreditsByCredential>('/stats/credits-by-credential', {
     params: statsParams(time, filter),
+  })
+  return data
+}
+
+/**
+ * 余额历史与消耗速率。
+ * credentialId 省略时返回全部账号（前端按 credentialId 分组画多条线）。
+ */
+export async function getBalanceHistory(
+  hours: number,
+  credentialId?: number,
+): Promise<BalanceHistory> {
+  const { data } = await api.get<BalanceHistory>('/stats/balance-history', {
+    params: { hours, ...(credentialId !== undefined ? { credentialId } : {}) },
   })
   return data
 }

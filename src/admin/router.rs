@@ -30,7 +30,7 @@ use super::{
         set_credential_overage, set_credential_priority, set_global_proxy,
         set_load_balancing_mode, set_log_governance_config, set_proxy_enabled, set_update_config,
         start_idc_login, start_idc_relogin, start_social_login,
-        start_social_relogin, stats_by_credential, stats_by_model,
+        start_social_relogin, stats_balance_history, stats_by_credential, stats_by_model,
         stats_credits_by_credential, stats_overview,
         stats_timeseries, update_admin_key, update_client_key, update_credential, update_group,
         update_refresh_token,
@@ -179,6 +179,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/stats/credits-by-credential",
             get(stats_credits_by_credential),
         )
+        .route("/stats/balance-history", get(stats_balance_history))
         .route("/traces/failure-stats", get(trace_failure_stats))
         .route("/ops/overview", get(ops_overview))
         .route("/ops/trend", get(ops_trend))
