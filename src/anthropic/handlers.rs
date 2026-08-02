@@ -313,6 +313,23 @@ impl RequestTracer {
 }
 
 impl TraceSink for RequestTracer {
+    fn on_queue_wait(&self, credential_id: u64, waited_ms: u64, outcome: &str) {
+        // 门禁排队不走 open/close 单槽（provider 侧无法保证配对），直接补记完整段。
+        // 起点回推：上报即等待结束，now − waited 即入队时刻。
+        let elapsed = self.started_at.elapsed().as_millis() as u64;
+        let mut phases = self.phases.lock();
+        let seq = phases.len() as u32;
+        phases.push(TracePhase {
+            seq,
+            phase: phase::QUEUE.to_string(),
+            started_ms: elapsed.saturating_sub(waited_ms),
+            duration_ms: waited_ms,
+            outcome: outcome.to_string(),
+            bytes: None,
+            detail: Some(format!("credential #{credential_id}")),
+        });
+    }
+
     fn on_attempt(&self, mut attempt: TraceAttempt) {
         // provider 只知道本跳耗时（它不持有请求起点），起点偏移在这里回推：
         // 本跳结束时刻 = 现在（provider 上报即结束），减去本跳耗时即起点。
@@ -1031,9 +1048,14 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
-    // 创建 SSE 流
+    // 创建 SSE 流；并发门禁 permit 挂进流闭包，流结束/断开时才释放凭据并发位
+    let gate_permit = call_result.permit;
     let stream =
-        create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer, ops_feedback);
+        create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer, ops_feedback)
+            .map(move |item| {
+                let _keep = &gate_permit;
+                item
+            });
 
     // 返回 SSE 响应
     Response::builder()
@@ -1416,6 +1438,8 @@ async fn handle_non_stream_request(
     };
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    // 并发门禁 permit：持有到本函数返回（响应体在此函数内读完），显式命名防误删
+    let _gate_permit = call_result.permit;
     let ops_feedback =
         StreamOpsFeedback::from_call(&provider, credential_id, call_result.proxy_url.clone());
 
@@ -2085,9 +2109,13 @@ async fn handle_stream_request_buffered(
     );
     ctx.set_cache_usage(cache_usage);
 
-    // 创建缓冲 SSE 流
-    let stream =
-        create_buffered_sse_stream(response, ctx, hook, credential_id, tracer, ops_feedback);
+    // 创建缓冲 SSE 流；并发门禁 permit 挂进流闭包，流结束/断开时才释放凭据并发位
+    let gate_permit = call_result.permit;
+    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer, ops_feedback)
+        .map(move |item| {
+            let _keep = &gate_permit;
+            item
+        });
 
     // 返回 SSE 响应
     Response::builder()

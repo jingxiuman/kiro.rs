@@ -179,6 +179,23 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 单凭证并发上限（默认 2；0 = 禁用门禁）。
+    ///
+    /// 满载时新请求先排队等原凭证（见下两项），排队失败才切换凭证——
+    /// 平滑单凭证请求速率，降低触发上游 suspicious-activity 风控 429 的概率。
+    /// 429 风控冷却/故障转移语义不受影响。
+    #[serde(default = "default_credential_max_concurrent")]
+    pub credential_max_concurrent: usize,
+
+    /// 单凭证等待队列深度（默认 3）。排队人数达到上限时立即换凭证。
+    #[serde(default = "default_credential_queue_depth")]
+    pub credential_queue_depth: usize,
+
+    /// 排队等待超时（秒，默认 60）。超时后切换凭证；所有候选凭证都
+    /// 排队失败时兜底放行（不阻塞请求）。
+    #[serde(default = "default_credential_queue_timeout_secs")]
+    pub credential_queue_timeout_secs: u64,
+
     /// 账号级 429 风控触发时是否对当前凭据进入冷却并故障转移（默认 true）。
     ///
     /// 关闭后：429 + suspicious activity 仍按普通瞬态错误重试，不切换凭据。
@@ -305,6 +322,18 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_credential_max_concurrent() -> usize {
+    2
+}
+
+fn default_credential_queue_depth() -> usize {
+    3
+}
+
+fn default_credential_queue_timeout_secs() -> u64 {
+    60
+}
+
 fn default_account_throttle_failover() -> bool {
     true
 }
@@ -375,6 +404,9 @@ impl Default for Config {
             update_auto_apply: false,
             update_auto_apply_time: default_update_auto_apply_time(),
             load_balancing_mode: default_load_balancing_mode(),
+            credential_max_concurrent: default_credential_max_concurrent(),
+            credential_queue_depth: default_credential_queue_depth(),
+            credential_queue_timeout_secs: default_credential_queue_timeout_secs(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             extract_thinking: default_extract_thinking(),

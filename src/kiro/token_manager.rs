@@ -1388,7 +1388,20 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// 无排除集的便捷入口（仅测试使用；生产路径统一走 `_excluding` 变体）
+    #[cfg(test)]
     fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
+        self.select_next_credential_excluding(model, group, &std::collections::HashSet::new())
+    }
+
+    /// 同 [`Self::select_next_credential`]，额外跳过 `excluded` 里的凭据。
+    /// 用于并发门禁排队失败后的换凭证重选（见 provider 的 credential_gate 接线）。
+    fn select_next_credential_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded: &std::collections::HashSet<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
         let credential_support = self.credential_support.read();
@@ -1398,6 +1411,9 @@ impl MultiTokenManager {
             .iter()
             .filter(|e| {
                 if e.disabled {
+                    return false;
+                }
+                if excluded.contains(&e.id) {
                     return false;
                 }
                 // 临时冷却中（账号级 429 风控）：跳过
@@ -1448,6 +1464,18 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
+        self.acquire_context_excluding(model, group, &std::collections::HashSet::new())
+            .await
+    }
+
+    /// 同 [`Self::acquire_context`]，额外跳过 `excluded` 里的凭据（含 current_id 命中路径）。
+    /// 用于并发门禁排队失败后的换凭证重选。
+    pub async fn acquire_context_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded: &std::collections::HashSet<u64>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1478,6 +1506,7 @@ impl MultiTokenManager {
                         .find(|e| {
                             e.id == current_id
                                 && !e.disabled
+                                && !excluded.contains(&e.id)
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                                 && credential_matches_request(&e.credentials, e.id, model, group, &credential_support)
                         })
@@ -1488,7 +1517,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, group);
+                    let mut best = self.select_next_credential_excluding(model, group, excluded);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1507,7 +1536,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model, group);
+                            best = self.select_next_credential_excluding(model, group, excluded);
                         }
                     }
 
@@ -4833,6 +4862,33 @@ mod tests {
         assert!(manager.select_next_credential(None, Some("nope")).is_none());
         // 未绑定分组(None) → 可选到账号
         assert!(manager.select_next_credential(None, None).is_some());
+    }
+
+    #[test]
+    fn test_select_next_credential_excluding_skips_excluded() {
+        // 并发门禁排队失败后的换凭证重选：排除集里的凭据不得再被选中。
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &[]),
+                grouped_cred("b", &[]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 默认 priority 模式选到 id=1
+        let first = manager.select_next_credential(None, None);
+        assert_eq!(first.map(|(id, _)| id), Some(1));
+        // 排除 1 → 选到 2
+        let excluded: std::collections::HashSet<u64> = [1u64].into_iter().collect();
+        let second = manager.select_next_credential_excluding(None, None, &excluded);
+        assert_eq!(second.map(|(id, _)| id), Some(2));
+        // 全部排除 → 无候选
+        let all: std::collections::HashSet<u64> = [1u64, 2u64].into_iter().collect();
+        assert!(manager.select_next_credential_excluding(None, None, &all).is_none());
     }
 
     #[tokio::test]
