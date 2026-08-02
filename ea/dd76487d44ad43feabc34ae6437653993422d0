@@ -1,0 +1,64 @@
+src/kiro/mod.rs
+  s_21f2a43ad07bb2::t_883d524c01bba7 4
+src/anthropic/handlers.rs
+  s_21f2a43ad07bb2::t_db77f062b0a784 1441-1442
+  s_21f2a43ad07bb2::t_6b0d882c7497cc 316-332
+  s_21f2a43ad07bb2::t_7a1324178947fa 2112-2118
+  s_21f2a43ad07bb2::t_46c5d6b16f5407 1051-1052,1054-1058
+src/model/config.rs
+  s_21f2a43ad07bb2::t_adecd7ce55ed90 182-198
+  s_21f2a43ad07bb2::t_72029b4ecd2d82 407-409
+  s_21f2a43ad07bb2::t_57fb76203fbe30 325-336
+src/admin/trace_db.rs
+  s_21f2a43ad07bb2::t_c2e7b42ff7aafd 97-98
+  s_21f2a43ad07bb2::t_bba69d7de56886 239-244
+src/kiro/credential_gate.rs
+  s_21f2a43ad07bb2::t_6b56d194504353 30-31
+  s_21f2a43ad07bb2::t_255bb3ed4239af 1-29,32-61,103-182,187-189
+  s_21f2a43ad07bb2::t_21c6488d87f130 183-186
+  s_21f2a43ad07bb2::t_67f99aebe875af 62-98,102
+  s_21f2a43ad07bb2::t_4ee467fd31efc1 99-101
+src/kiro/provider.rs
+  s_21f2a43ad07bb2::t_62e51aaec240c1 100-104
+  s_21f2a43ad07bb2::t_c2cd5f667702b5 136-137
+  s_21f2a43ad07bb2::t_ab2f16a25f8a7c 198,202
+  s_21f2a43ad07bb2::t_71970565f71779 581-585,591-595,600-609,624-661
+  s_21f2a43ad07bb2::t_6871fb072c145d 163-165
+  s_21f2a43ad07bb2::t_068cfe28d26e34 763
+  s_21f2a43ad07bb2::t_4929fabecb2804 199-201
+  s_21f2a43ad07bb2::t_c820152d6f5421 16
+  s_21f2a43ad07bb2::t_460e9c3c3afd74 662
+src/kiro/token_manager.rs
+  s_21f2a43ad07bb2::t_418c51e89a88c0 1394-1404,1416
+  s_21f2a43ad07bb2::t_c53fcb40582d0d 4867-4893
+  s_21f2a43ad07bb2::t_1811be86a2ac33 1391-1392
+  s_21f2a43ad07bb2::t_88675657c993c3 1509
+  s_21f2a43ad07bb2::t_5e75b47ba2a364 1520
+  s_21f2a43ad07bb2::t_c415a1474d5e96 1539
+  s_21f2a43ad07bb2::t_90b6b72a27b545 1467-1478
+  s_76b817ce0732fe::t_0268809a659433 1417-1418
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "eadd76487d44ad43feabc34ae6437653993422d0",
+  "prompts": {},
+  "sessions": {
+    "s_21f2a43ad07bb2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "574f7405-ba63-4a66-9c42-08256b3a3e33",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    },
+    "s_76b817ce0732fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8aad5c8-70ec-4c41-a43f-97434e44adf2",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
