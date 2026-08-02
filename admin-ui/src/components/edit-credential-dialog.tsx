@@ -120,18 +120,20 @@ export function EditCredentialDialog({
             {/* 邮箱 */}
             <div className="space-y-2">
               <label htmlFor="email" className="text-sm font-medium">
-                邮箱（用于显示标识）
+                显示标识（邮箱或任意备注）
               </label>
+              {/* 不用 type="email"：该字段仅作列表显示用的标识，后端不校验格式，
+                  social / idc 登录入口也一直是纯文本。加浏览器级邮箱校验只会
+                  让「编辑时改不了、登录时能随便填」的行为不一致。 */}
               <Input
                 id="email"
-                type="email"
-                placeholder="例: user@example.com"
+                placeholder="例: user@example.com 或 备用号-01"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 disabled={isPending}
               />
               <p className="text-xs text-muted-foreground">
-                留空则显示凭据 ID，清除请提交空值
+                可填任意字符；留空则显示凭据 ID，清除请提交空值
               </p>
             </div>
 
