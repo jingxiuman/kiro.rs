@@ -1361,7 +1361,7 @@ pub async fn stats_balance_history(
 
 /// GET /api/admin/traces
 /// 查询请求链路追踪记录（含每跳明细）。
-/// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed / limit / offset
+/// query 参数：operation / status / errorType / credentialId / keyId / group / model / onlyFailed / limit / offset
 /// 返回：{ records: [...], total: N }
 pub async fn list_traces(
     State(state): State<AdminState>,
@@ -1477,6 +1477,7 @@ pub async fn list_traces(
                 "ts": r.ts,
                 "keyId": r.key_id,
                 "keySource": r.key_source,
+                "operation": r.operation,
                 "keyName": key_name,
                 "model": r.model,
                 "isStream": r.is_stream,
