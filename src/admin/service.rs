@@ -15,7 +15,9 @@ use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::credentials::{normalize_import_auth_method, validate_external_idp_endpoint};
-use crate::kiro::token_manager::{CredentialUpdate, MultiTokenManager};
+use crate::kiro::token_manager::{
+    CredentialUpdate, MultiTokenManager, RefreshTokenInvalidError,
+};
 use crate::model::config::Config;
 
 use super::error::AdminServiceError;
@@ -3004,6 +3006,11 @@ impl AdminService {
         if let Some(error) = classify_rate_limit(&e) {
             return error;
         }
+        if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+            return AdminServiceError::InvalidCredential(
+                "refreshToken 已失效，请重新登录或更新凭据".to_string(),
+            );
+        }
         let msg = e.to_string();
 
         // 1. 凭据不存在
@@ -4996,6 +5003,37 @@ mod tests {
                 assert_eq!(retry_after.as_deref(), Some("120"));
             }
             other => panic!("预期 RateLimited，实际为 {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_is_a_sanitized_bad_request_instead_of_gateway_error() {
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap(),
+        );
+        let service = AdminService::new(
+            manager,
+            Vec::<String>::new(),
+            Arc::new(ProxyPoolManager::new(
+                None,
+                crate::model::config::TlsBackend::Rustls,
+            )),
+        );
+        let raw = "invalid_grant: upstream-private-detail";
+        let classified = service.classify_balance_error(
+            anyhow::Error::new(RefreshTokenInvalidError {
+                message: raw.to_string(),
+            }),
+            1,
+        );
+
+        assert_eq!(classified.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        match classified {
+            AdminServiceError::InvalidCredential(message) => {
+                assert!(!message.contains("upstream-private-detail"));
+                assert!(message.contains("refreshToken 已失效"));
+            }
+            other => panic!("预期 InvalidCredential，实际为 {other:?}"),
         }
     }
 

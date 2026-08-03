@@ -539,8 +539,10 @@ export interface TraceRecord {
   traceId: string
   ts: string
   keyId: number
-  /** masterApiKey = 历史 master 调用（已下线）；clientKey = 客户端 Key */
-  keySource: 'masterApiKey' | 'clientKey'
+  /** masterApiKey = 历史 master 调用；clientKey = 客户端 Key；internal = 系统内部任务 */
+  keySource: 'masterApiKey' | 'clientKey' | 'internal'
+  /** inference / balance_refresh / token_refresh */
+  operation: string
   /** 发起请求的客户端 Key 名称（master 表示主 apiKey；管理员业务 Key 可为 null） */
   keyName?: string | null
   model: string
@@ -578,6 +580,7 @@ export interface TraceRecord {
 
 /** 链路查询参数 */
 export interface TraceQuery {
+  operation?: string
   status?: string
   errorType?: string
   credentialId?: number

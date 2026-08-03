@@ -16,6 +16,7 @@ api.interceptors.request.use((config) => {
 
 export async function getTraces(query: TraceQuery): Promise<TracePage> {
   const params: Record<string, string> = {}
+  if (query.operation) params.operation = query.operation
   if (query.status) params.status = query.status
   if (query.errorType) params.errorType = query.errorType
   if (query.credentialId != null) params.credentialId = String(query.credentialId)

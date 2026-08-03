@@ -763,7 +763,7 @@ impl OpsStore {
              COALESCE(SUM(final_status = 'interrupted'), 0), \
              COALESCE(CAST(AVG(duration_ms) AS INTEGER), 0), \
              CAST(AVG(CASE WHEN is_stream = 1 THEN first_token_ms END) AS INTEGER) \
-             FROM traces WHERE ts_epoch >= ?1",
+             FROM traces WHERE ts_epoch >= ?1 AND operation = 'inference'",
             [cutoff],
             |row| {
                 Ok((
@@ -792,7 +792,7 @@ impl OpsStore {
         // 错误类型分布
         let mut stmt = match conn.prepare(
             "SELECT error_type, COUNT(*) FROM traces \
-             WHERE ts_epoch >= ?1 AND error_type IS NOT NULL \
+             WHERE ts_epoch >= ?1 AND operation = 'inference' AND error_type IS NOT NULL \
              GROUP BY error_type ORDER BY COUNT(*) DESC",
         ) {
             Ok(s) => s,
@@ -815,7 +815,7 @@ impl OpsStore {
         out.interrupted_duration = conn
             .prepare(
                 "SELECT duration_ms FROM traces \
-                 WHERE ts_epoch >= ?1 \
+                 WHERE ts_epoch >= ?1 AND operation = 'inference' \
                  AND error_type IN ('stream_interrupted', 'upstream_truncated')",
             )
             .and_then(|mut stmt| {
@@ -855,7 +855,7 @@ impl OpsStore {
         let sql = format!(
             "SELECT t.error_type, {key} AS k, COUNT(*) AS c \
              FROM traces t{join} \
-             WHERE t.ts_epoch >= ?1 AND t.error_type IS NOT NULL \
+             WHERE t.ts_epoch >= ?1 AND t.operation = 'inference' AND t.error_type IS NOT NULL \
              GROUP BY t.error_type, k ORDER BY t.error_type ASC, c DESC",
             key = key_expr,
             join = join,
@@ -865,7 +865,7 @@ impl OpsStore {
         // 没有它就无法区分"这个对象错得不成比例"与"这个对象承载得最多"。
         let baseline_sql = format!(
             "SELECT {key} AS k, COUNT(*) FROM traces t{join} \
-             WHERE t.ts_epoch >= ?1 GROUP BY k",
+             WHERE t.ts_epoch >= ?1 AND t.operation = 'inference' GROUP BY k",
             key = key_expr,
             join = join,
         );
@@ -969,7 +969,8 @@ impl OpsStore {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
             "SELECT error_message, COALESCE(error_type, ''), ts_epoch FROM traces \
-             WHERE ts_epoch >= ?1 AND error_message IS NOT NULL AND error_message <> '' \
+             WHERE ts_epoch >= ?1 AND operation = 'inference' \
+             AND error_message IS NOT NULL AND error_message <> '' \
              ORDER BY ts_epoch ASC",
         ) {
             Ok(s) => s,
@@ -1059,7 +1060,7 @@ impl OpsStore {
              COUNT(*), \
              COALESCE(SUM(final_status = 'success'), 0), \
              COALESCE(SUM(final_status = 'interrupted'), 0) \
-             FROM traces WHERE ts_epoch >= ?1 \
+             FROM traces WHERE ts_epoch >= ?1 AND operation = 'inference' \
              GROUP BY bucket, et ORDER BY bucket ASC",
         ) {
             Ok(s) => s,
@@ -1123,7 +1124,8 @@ impl OpsStore {
             "SELECT final_credential_id, COUNT(*), \
              COALESCE(SUM(final_status = 'success'), 0), \
              COALESCE(SUM(error_type IN ('stream_interrupted', 'upstream_truncated')), 0) \
-             FROM traces WHERE ts_epoch >= ?1 AND final_credential_id != 0 \
+             FROM traces WHERE ts_epoch >= ?1 AND operation = 'inference' \
+             AND final_credential_id != 0 \
              GROUP BY final_credential_id",
         ) {
             Ok(s) => s,
@@ -1153,7 +1155,8 @@ impl OpsStore {
         let mut stmt = match conn.prepare(
             "SELECT a.credential_id, a.outcome, COUNT(*) FROM trace_attempts a \
              JOIN traces t ON t.trace_id = a.trace_id \
-             WHERE t.ts_epoch >= ?1 AND a.credential_id != 0 AND a.outcome != 'success' \
+             WHERE t.ts_epoch >= ?1 AND t.operation = 'inference' \
+             AND a.credential_id != 0 AND a.outcome != 'success' \
              GROUP BY a.credential_id, a.outcome",
         ) {
             Ok(s) => s,
@@ -1198,7 +1201,8 @@ impl OpsStore {
              COALESCE(SUM(a.outcome = 'success'), 0), \
              COALESCE(SUM(a.outcome = 'network_error'), 0) \
              FROM trace_attempts a JOIN traces t ON t.trace_id = a.trace_id \
-             WHERE t.ts_epoch >= ?1 GROUP BY COALESCE(a.proxy_url, '')",
+             WHERE t.ts_epoch >= ?1 AND t.operation = 'inference' \
+             GROUP BY COALESCE(a.proxy_url, '')",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -1231,7 +1235,7 @@ impl OpsStore {
             "SELECT COALESCE(a.proxy_url, ''), COUNT(*) \
              FROM traces t JOIN trace_attempts a \
              ON a.trace_id = t.trace_id AND a.outcome = 'success' \
-             WHERE t.ts_epoch >= ?1 \
+             WHERE t.ts_epoch >= ?1 AND t.operation = 'inference' \
              AND t.error_type IN ('stream_interrupted', 'upstream_truncated') \
              GROUP BY COALESCE(a.proxy_url, '')",
         ) {
@@ -1289,7 +1293,8 @@ impl OpsStore {
         let mut stmt = match conn.prepare(
             "SELECT GREATEST(total_attempts, 1) AS hops, \
              COUNT(*), COALESCE(SUM(final_status = 'success'), 0) \
-             FROM traces WHERE ts_epoch >= ?1 GROUP BY hops ORDER BY hops",
+             FROM traces WHERE ts_epoch >= ?1 AND operation = 'inference' \
+             GROUP BY hops ORDER BY hops",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -1394,7 +1399,7 @@ impl OpsStore {
              FROM trace_attempts a \
              JOIN trace_attempts b ON b.trace_id = a.trace_id AND b.attempt = a.attempt + 1 \
              JOIN traces t ON t.trace_id = a.trace_id \
-             WHERE t.ts_epoch >= ?1",
+             WHERE t.ts_epoch >= ?1 AND t.operation = 'inference'",
             [cutoff],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         );
@@ -1425,7 +1430,7 @@ impl OpsStore {
              FROM trace_attempts a \
              JOIN trace_attempts b ON b.trace_id = a.trace_id AND b.attempt = a.attempt + 1 \
              JOIN traces t ON t.trace_id = a.trace_id \
-             WHERE t.ts_epoch >= ?1 \
+             WHERE t.ts_epoch >= ?1 AND t.operation = 'inference' \
              AND a.started_ms IS NOT NULL AND b.started_ms IS NOT NULL",
         ) {
             Ok(s) => s,
@@ -1473,7 +1478,7 @@ impl OpsStore {
                     SUM(CASE WHEN p.outcome NOT IN ('success', 'client_disconnected') THEN 1 ELSE 0 END) AS failed \
              FROM trace_phases p \
              JOIN traces t ON t.trace_id = p.trace_id \
-             WHERE t.ts_epoch >= ?1 \
+             WHERE t.ts_epoch >= ?1 AND t.operation = 'inference' \
              GROUP BY p.phase, proxy",
         ) {
             Ok(s) => s,
@@ -1812,10 +1817,17 @@ mod tests {
         insert_trace(&store, "t2", 60, "interrupted", Some("stream_interrupted"), 1, 245_000);
         insert_trace(&store, "t3", 60, "error", Some("upstream_truncated"), 2, 247_000);
         insert_trace(&store, "t4", 60, "error", Some("auth_failed"), 2, 500);
+        insert_trace(&store, "t-internal", 60, "error", Some("auth_failed"), 2, 500);
+        store.conn.lock().execute(
+            "UPDATE traces SET operation = 'token_refresh', key_source = 'internal' \
+             WHERE trace_id = 't-internal'",
+            [],
+        ).unwrap();
         // 窗口外的记录不计
         insert_trace(&store, "t-old", 3600 * 48, "error", Some("auth_failed"), 2, 500);
 
         let o = store.overview(24);
+        // 内部刷新任务可在请求日志中查询，但不能污染用户推理请求指标。
         assert_eq!(o.total, 4);
         assert_eq!(o.success, 1);
         assert_eq!(o.interrupted, 1);
@@ -1833,6 +1845,13 @@ mod tests {
             .find(|e| e.error_type == "upstream_truncated")
             .unwrap();
         assert_eq!(truncated.count, 1);
+        assert_eq!(
+            o.by_error_type.iter()
+                .find(|e| e.error_type == "auth_failed")
+                .unwrap()
+                .count,
+            1
+        );
     }
 
     /// 分位替代平均值的理由必须可执行验证：双簇样本下平均值落在两簇之间的

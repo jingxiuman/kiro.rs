@@ -1381,6 +1381,7 @@ pub async fn list_traces(
     });
 
     let query = TraceQuery {
+        operation: params.get("operation").filter(|s| !s.is_empty()).cloned(),
         status: params.get("status").filter(|s| !s.is_empty()).cloned(),
         error_type: params.get("errorType").filter(|s| !s.is_empty()).cloned(),
         credential_id: params

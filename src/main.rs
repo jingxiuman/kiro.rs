@@ -193,6 +193,7 @@ async fn main() {
             None
         }
     };
+    token_manager.set_trace_store(trace_store.clone());
 
     // Ops 事件存储：trace 主库成功时用同一持久化文件；trace 降级到内存时 ops 也用内存，
     // 保证两者查询落在同一数据库视图。

@@ -61,6 +61,8 @@ function outcomeStyle(outcome: string): {
       return { label: '额度耗尽', variant: 'warning' }
     case 'account_throttled':
       return { label: '账号风控', variant: 'warning' }
+    case 'rate_limited':
+      return { label: '上游限流', variant: 'warning' }
     case 'auth_failed':
       return { label: '鉴权失败', variant: 'destructive' }
     case 'transient':
@@ -126,9 +128,25 @@ function credLabel(id: number, email?: string | null): string {
   return email ? email : `#${id}`
 }
 
-function keyLabel(keyId: number, keyName?: string | null): string {
+function keyLabel(
+  keyId: number,
+  keyName?: string | null,
+  keySource?: TraceRecord['keySource'],
+): string {
+  if (keySource === 'internal') return '系统任务'
   if (keyName) return keyName
   return `#${keyId}`
+}
+
+function requestLabel(rec: TraceRecord): { label: string; detail?: string } {
+  switch (rec.operation) {
+    case 'balance_refresh':
+      return { label: '余额刷新', detail: 'getUsageLimits' }
+    case 'token_refresh':
+      return { label: 'Token 刷新', detail: rec.attempts[0]?.endpoint }
+    default:
+      return { label: rec.model || '推理请求' }
+  }
 }
 
 const STATUS_OPTIONS = [
@@ -138,10 +156,18 @@ const STATUS_OPTIONS = [
   { value: 'interrupted', label: '中断' },
 ]
 
+const OPERATION_OPTIONS = [
+  { value: '', label: '全部请求类型' },
+  { value: 'inference', label: '推理请求' },
+  { value: 'balance_refresh', label: '余额刷新' },
+  { value: 'token_refresh', label: 'Token 刷新' },
+]
+
 const ERROR_TYPE_OPTIONS = [
   { value: '', label: '全部错误类型' },
   { value: 'quota_exhausted', label: '额度耗尽' },
   { value: 'account_throttled', label: '账号风控' },
+  { value: 'rate_limited', label: '上游限流' },
   { value: 'auth_failed', label: '鉴权失败' },
   { value: 'transient', label: '瞬态错误' },
   { value: 'network_error', label: '网络错误' },
@@ -255,6 +281,7 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
 function TraceRow({ rec, baseline }: { rec: TraceRecord; baseline: PhaseBaselineRow[] | undefined }) {
   const [open, setOpen] = useState(false)
   const errStyle = rec.errorType ? outcomeStyle(rec.errorType) : null
+  const request = requestLabel(rec)
   return (
     <>
       <tr
@@ -272,11 +299,16 @@ function TraceRow({ rec, baseline }: { rec: TraceRecord; baseline: PhaseBaseline
           {formatTime(rec.ts)}
         </td>
         <td className="py-2.5 pr-3 text-[13px]">
-          <span className="inline-block max-w-[220px] truncate align-middle">{rec.model}</span>
-          {rec.isStream && <Badge variant="outline" className="ml-1.5">流式</Badge>}
+          <span className="inline-block max-w-[220px] truncate align-middle">{request.label}</span>
+          {request.detail && (
+            <span className="ml-1.5 font-mono text-[11px] text-muted-foreground">
+              {request.detail}
+            </span>
+          )}
+          {rec.operation === 'inference' && rec.isStream && <Badge variant="outline" className="ml-1.5">流式</Badge>}
         </td>
         <td className="py-2.5 pr-3 text-[13px]">
-          <Badge variant="outline">{keyLabel(rec.keyId, rec.keyName)}</Badge>
+          <Badge variant="outline">{keyLabel(rec.keyId, rec.keyName, rec.keySource)}</Badge>
         </td>
         <td className="py-2.5 pr-3">
           <StatusBadge status={rec.finalStatus} />
@@ -546,6 +578,7 @@ function GovernanceButton() {
 const PAGE_SIZE = 50
 
 export function TraceLogPage() {
+  const [operation, setOperation] = useState('')
   const [status, setStatus] = useState('')
   const [errorType, setErrorType] = useState('')
   const [keyId, setKeyId] = useState('')
@@ -572,6 +605,7 @@ export function TraceLogPage() {
   }
 
   const query: TraceQuery = {
+    operation: operation || undefined,
     status: status || undefined,
     errorType: errorType || undefined,
     keyId: keyId ? Number(keyId) : undefined,
@@ -596,6 +630,7 @@ export function TraceLogPage() {
           {total > 0 && <Badge variant="secondary">{total}</Badge>}
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-2">
+          <Select value={operation} onChange={resetTo(setOperation)} options={OPERATION_OPTIONS} />
           <Select value={keyId} onChange={resetTo(setKeyId)} options={keyOptions} />
           <Select value={group} onChange={resetTo(setGroup)} options={groupSelectOptions} />
           <Select value={status} onChange={resetTo(setStatus)} options={STATUS_OPTIONS} />
@@ -628,7 +663,7 @@ export function TraceLogPage() {
             <div className="p-6 text-sm text-muted-foreground">加载中…</div>
           ) : records.length === 0 ? (
             <div className="p-6 text-sm text-muted-foreground">
-              暂无记录。发起几次 /v1/messages 请求后即可看到链路。
+              暂无记录。
             </div>
           ) : (
             <div className="overflow-x-auto">
@@ -637,7 +672,7 @@ export function TraceLogPage() {
                   <tr className="whitespace-nowrap border-b border-border/60 text-[12px] uppercase tracking-wider text-muted-foreground">
                     <th className="py-2 pl-3 pr-2 font-medium"></th>
                     <th className="py-2 pr-3 font-medium">时间</th>
-                    <th className="py-2 pr-3 font-medium">模型</th>
+                    <th className="py-2 pr-3 font-medium">请求</th>
                     <th className="py-2 pr-3 font-medium">入口 Key</th>
                     <th className="py-2 pr-3 font-medium">状态</th>
                     <th className="py-2 pr-3 font-medium">最终凭据</th>
@@ -690,7 +725,5 @@ export function TraceLogPage() {
     </div>
   )
 }
-
-
 
 

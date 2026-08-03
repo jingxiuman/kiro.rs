@@ -262,6 +262,7 @@ impl RequestTracer {
             ts: self.ts.clone(),
             key_id: self.key_id,
             key_source: self.key_source,
+            operation: crate::admin::trace_db::operation::INFERENCE.to_string(),
             model: self.model.clone(),
             is_stream: self.is_stream,
             final_status: final_status.to_string(),
@@ -3533,6 +3534,7 @@ mod tracer_tests {
         // 埋点，不证明落库），而是查 TraceStore，证明 finalize_on_disconnect
         // 真的把这条 trace 写进了 traces 表——ops UI 能查到它。
         let query = crate::admin::trace_db::TraceQuery {
+            operation: None,
             status: None,
             error_type: Some(outcome::CLIENT_DISCONNECTED.to_string()),
             credential_id: None,

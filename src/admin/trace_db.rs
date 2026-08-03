@@ -106,6 +106,8 @@ pub enum TraceKeySource {
     MasterApiKey,
     /// Admin UI 中创建并分发的客户端 Key。
     ClientKey,
+    /// 服务自身发起的后台或管理类上游请求。
+    Internal,
 }
 
 impl TraceKeySource {
@@ -113,6 +115,7 @@ impl TraceKeySource {
         match self {
             Self::MasterApiKey => "masterApiKey",
             Self::ClientKey => "clientKey",
+            Self::Internal => "internal",
         }
     }
 
@@ -120,6 +123,7 @@ impl TraceKeySource {
         match value {
             "masterApiKey" => Ok(Self::MasterApiKey),
             "clientKey" => Ok(Self::ClientKey),
+            "internal" => Ok(Self::Internal),
             other => Err(duckdb::Error::FromSqlConversionFailure(
                 column,
                 Type::Text,
@@ -144,6 +148,9 @@ pub struct TraceRecord {
     pub key_id: u64,
     /// 入口 Key 类型，区分管理员API密钥与创建的客户端 Key。
     pub key_source: TraceKeySource,
+    /// 请求类型，见 [`operation`]。历史记录默认是 inference。
+    #[serde(default = "default_operation")]
+    pub operation: String,
     /// 模型名
     pub model: String,
     /// 是否流式
@@ -195,11 +202,23 @@ pub struct TraceRecord {
     pub phases: Vec<TracePhase>,
 }
 
+fn default_operation() -> String {
+    operation::INFERENCE.to_string()
+}
+
+/// trace 顶层请求类型。
+pub mod operation {
+    pub const INFERENCE: &str = "inference";
+    pub const BALANCE_REFRESH: &str = "balance_refresh";
+    pub const TOKEN_REFRESH: &str = "token_refresh";
+}
+
 /// 失败分类（attempt.outcome / record.error_type 取值）
 pub mod outcome {
     pub const SUCCESS: &str = "success";
     pub const QUOTA_EXHAUSTED: &str = "quota_exhausted";
     pub const ACCOUNT_THROTTLED: &str = "account_throttled";
+    pub const RATE_LIMITED: &str = "rate_limited";
     pub const AUTH_FAILED: &str = "auth_failed";
     pub const TRANSIENT: &str = "transient";
     pub const NETWORK_ERROR: &str = "network_error";
@@ -247,6 +266,8 @@ pub trait TraceSink: Send + Sync {
 /// 查询过滤条件
 #[derive(Debug, Default, Clone)]
 pub struct TraceQuery {
+    /// operation 精确匹配（inference / balance_refresh / token_refresh）
+    pub operation: Option<String>,
     /// final_status 精确匹配（success/error/interrupted）
     pub status: Option<String>,
     /// error_type 精确匹配
@@ -336,7 +357,7 @@ impl TraceStore {
         // 注意全部不带 NOT NULL：DuckDB 的 ALTER ADD COLUMN 不支持附加约束
         // （"Adding columns with constraints not yet supported"）；带 DEFAULT 的列
         // 老行会被填成默认值，key_source 以 NULL 添加后在下方回填。新插入永远写入合法值。
-        let columns: [(&str, &str); 8] = [
+        let columns: [(&str, &str); 9] = [
             ("input_tokens", "BIGINT DEFAULT 0"),
             ("output_tokens", "BIGINT DEFAULT 0"),
             ("cache_creation_tokens", "BIGINT DEFAULT 0"),
@@ -345,6 +366,7 @@ impl TraceStore {
             ("first_token_ms", "BIGINT"),
             ("key_source", "VARCHAR"),
             ("session_id", "VARCHAR"),
+            ("operation", "VARCHAR DEFAULT 'inference'"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -362,6 +384,9 @@ impl TraceStore {
                  THEN 'masterApiKey' ELSE 'clientKey' END WHERE key_source IS NULL;",
             )?;
         }
+        conn.execute_batch(
+            "UPDATE traces SET operation = 'inference' WHERE operation IS NULL OR operation = '';",
+        )?;
         // trace_attempts 补列：历史行保持 NULL = 未知
         // （proxy_url：未知出口/直连；started_ms：起点不可知，前端退化为顺序堆叠）
         let attempt_cols = Self::table_columns(conn, "trace_attempts")?;
@@ -416,18 +441,19 @@ impl TraceStore {
             .unwrap_or_else(|_| Utc::now().timestamp());
         let res = (|| -> duckdb::Result<()> {
             tx.execute(
-                "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, \
+                "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, operation, model, \
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
                  credits, first_token_ms, session_id) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
                 duckdb::params![
                     rec.trace_id,
                     rec.ts,
                     ts_epoch,
                     rec.key_id as i64,
                     rec.key_source.as_str(),
+                    rec.operation,
                     rec.model,
                     rec.is_stream as i64,
                     rec.final_status,
@@ -521,6 +547,10 @@ impl TraceStore {
             clauses.push("final_status = ?".to_string());
             params.push(Box::new(s.clone()));
         }
+        if let Some(operation) = &q.operation {
+            clauses.push("operation = ?".to_string());
+            params.push(Box::new(operation.clone()));
+        }
         if let Some(t) = &q.error_type {
             clauses.push("error_type = ?".to_string());
             params.push(Box::new(t.clone()));
@@ -590,7 +620,7 @@ impl TraceStore {
             q.limit
         };
         let sql = format!(
-            "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
+            "SELECT trace_id, ts, key_id, key_source, operation, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
              session_id \
@@ -605,22 +635,23 @@ impl TraceStore {
                 ts: row.get(1)?,
                 key_id: row.get::<_, i64>(2)? as u64,
                 key_source: TraceKeySource::from_db(row.get::<_, String>(3)?.as_str(), 3)?,
-                model: row.get(4)?,
-                is_stream: row.get::<_, i64>(5)? != 0,
-                final_status: row.get(6)?,
-                final_credential_id: row.get::<_, i64>(7)? as u64,
-                error_type: row.get(8)?,
-                error_message: row.get(9)?,
-                total_attempts: row.get::<_, i64>(10)? as u32,
-                duration_ms: row.get::<_, i64>(11)? as u64,
-                interrupted_after_bytes: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
-                input_tokens: row.get::<_, i64>(13)? as u64,
-                output_tokens: row.get::<_, i64>(14)? as u64,
-                cache_creation_tokens: row.get::<_, i64>(15)? as u64,
-                cache_read_tokens: row.get::<_, i64>(16)? as u64,
-                credits: row.get::<_, f64>(17)?,
-                first_token_ms: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
-                session_id: row.get::<_, Option<String>>(19)?,
+                operation: row.get(4)?,
+                model: row.get(5)?,
+                is_stream: row.get::<_, i64>(6)? != 0,
+                final_status: row.get(7)?,
+                final_credential_id: row.get::<_, i64>(8)? as u64,
+                error_type: row.get(9)?,
+                error_message: row.get(10)?,
+                total_attempts: row.get::<_, i64>(11)? as u32,
+                duration_ms: row.get::<_, i64>(12)? as u64,
+                interrupted_after_bytes: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+                input_tokens: row.get::<_, i64>(14)? as u64,
+                output_tokens: row.get::<_, i64>(15)? as u64,
+                cache_creation_tokens: row.get::<_, i64>(16)? as u64,
+                cache_read_tokens: row.get::<_, i64>(17)? as u64,
+                credits: row.get::<_, f64>(18)?,
+                first_token_ms: row.get::<_, Option<i64>>(19)?.map(|v| v as u64),
+                session_id: row.get::<_, Option<String>>(20)?,
                 attempts: Vec::new(),
                 phases: Vec::new(),
             })
@@ -763,9 +794,10 @@ impl TraceStore {
         let mut out: std::collections::HashMap<u64, FailureStats> =
             std::collections::HashMap::new();
         let mut stmt = match conn.prepare(
-            "SELECT credential_id, outcome, COUNT(*) FROM trace_attempts \
-             WHERE outcome != 'success' AND credential_id != 0 \
-             GROUP BY credential_id, outcome",
+            "SELECT a.credential_id, a.outcome, COUNT(*) FROM trace_attempts a \
+             JOIN traces t ON t.trace_id = a.trace_id \
+             WHERE t.operation = 'inference' AND a.outcome != 'success' \
+             AND a.credential_id != 0 GROUP BY a.credential_id, a.outcome",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -800,7 +832,8 @@ impl TraceStore {
         // 需要从 traces 表按最终凭据单独归集，否则凭据卡片看不到这类上游问题。
         let mut trace_stmt = match conn.prepare(
             "SELECT final_credential_id, COUNT(*) FROM traces \
-             WHERE error_type IN ('stream_interrupted', 'upstream_truncated') \
+             WHERE operation = 'inference' \
+             AND error_type IN ('stream_interrupted', 'upstream_truncated') \
              AND final_credential_id != 0 GROUP BY final_credential_id",
         ) {
             Ok(s) => s,
@@ -857,6 +890,7 @@ mod tests {
             ts: Utc::now().to_rfc3339(),
             key_id: 1,
             key_source: TraceKeySource::ClientKey,
+            operation: operation::INFERENCE.to_string(),
             model: input.model.to_string(),
             is_stream: true,
             final_status: input.status.to_string(),
@@ -942,6 +976,7 @@ mod tests {
         assert_eq!(out[0].attempts.len(), 2);
         assert_eq!(out[0].attempts[0].outcome, outcome::ACCOUNT_THROTTLED);
         assert_eq!(out[0].key_source, TraceKeySource::ClientKey);
+        assert_eq!(out[0].operation, operation::INFERENCE);
         // token 分项往返
         assert_eq!(out[0].input_tokens, 1093);
         assert_eq!(out[0].output_tokens, 779);
@@ -1052,6 +1087,7 @@ mod tests {
             old.attempts[0].started_ms, None,
             "历史行起点不可知，必须是 None 而非伪造的 0"
         );
+        assert_eq!(old.operation, operation::INFERENCE, "历史行必须回填为推理请求");
 
         // 迁移后新写入仍带上偏移
         store.insert(&sample(TraceSample {
@@ -1066,6 +1102,38 @@ mod tests {
         });
         let new = out.iter().find(|r| r.trace_id == "t-new").unwrap();
         assert_eq!(new.attempts[0].started_ms, Some(0));
+    }
+
+    #[test]
+    fn internal_operation_roundtrips_and_can_be_filtered() {
+        let store = mem_store();
+        let mut inference = sample(TraceSample {
+            trace_id: "inference",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        });
+        store.insert(&inference);
+
+        inference.trace_id = "token-refresh".to_string();
+        inference.key_source = TraceKeySource::Internal;
+        inference.operation = operation::TOKEN_REFRESH.to_string();
+        inference.model.clear();
+        store.insert(&inference);
+
+        let out = store.query(&TraceQuery {
+            operation: Some(operation::TOKEN_REFRESH.to_string()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].trace_id, "token-refresh");
+        assert_eq!(out[0].key_source, TraceKeySource::Internal);
+        assert_eq!(
+            store.failure_stats().get(&9).unwrap().throttle,
+            1,
+            "内部刷新 attempt 不得污染凭据卡片的推理失败统计"
+        );
     }
 
     #[test]

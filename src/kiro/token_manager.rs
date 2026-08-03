@@ -5,7 +5,7 @@
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
@@ -16,6 +16,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
+use crate::admin::trace_db::{
+    operation, outcome, truncate_snippet, SharedTraceStore, TraceAttempt, TraceKeySource,
+    TraceRecord,
+};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
@@ -118,6 +122,41 @@ impl fmt::Display for RefreshTokenInvalidError {
 
 impl std::error::Error for RefreshTokenInvalidError {}
 
+/// 保留上游 HTTP 状态码，供内部请求 trace 做可靠分类。
+#[derive(Debug)]
+struct UpstreamHttpError {
+    status: u16,
+    message: String,
+}
+
+impl fmt::Display for UpstreamHttpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for UpstreamHttpError {}
+
+fn upstream_http_error(status: reqwest::StatusCode, message: &str, body: &str) -> anyhow::Error {
+    UpstreamHttpError {
+        status: status.as_u16(),
+        message: format!("{}: {} {}", message, status, body),
+    }
+    .into()
+}
+
+/// 只根据 OAuth 标准错误码识别永久失效，不依赖供应商可变的英文描述。
+fn is_invalid_grant(status: reqwest::StatusCode, body: &str) -> bool {
+    if status != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("error").and_then(|error| error.as_str()).map(str::to_owned))
+        .as_deref()
+        == Some("invalid_grant")
+}
+
 /// 刷新 Token
 pub(crate) async fn refresh_token(
     credentials: &KiroCredentials,
@@ -207,11 +246,7 @@ async fn refresh_social_token(
             return Err(error.into());
         }
 
-        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
-        if status.as_u16() == 400
-            && body_text.contains("\"invalid_grant\"")
-            && body_text.contains("Invalid refresh token provided")
-        {
+        if is_invalid_grant(status, &body_text) {
             return Err(RefreshTokenInvalidError {
                 message: format!("Social refreshToken 已失效 (invalid_grant): {}", body_text),
             }
@@ -225,7 +260,7 @@ async fn refresh_social_token(
             500..=599 => "服务器错误，AWS OAuth 服务暂时不可用",
             _ => "Token 刷新失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        return Err(upstream_http_error(status, error_msg, &body_text));
     }
 
     let data: RefreshResponse = response.json().await?;
@@ -310,11 +345,7 @@ async fn refresh_idc_token(
             return Err(error.into());
         }
 
-        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
-        if status.as_u16() == 400
-            && body_text.contains("\"invalid_grant\"")
-            && body_text.contains("Invalid refresh token provided")
-        {
+        if is_invalid_grant(status, &body_text) {
             return Err(RefreshTokenInvalidError {
                 message: format!("IdC refreshToken 已失效 (invalid_grant): {}", body_text),
             }
@@ -328,7 +359,7 @@ async fn refresh_idc_token(
             500..=599 => "服务器错误，AWS OIDC 服务暂时不可用",
             _ => "IdC Token 刷新失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        return Err(upstream_http_error(status, error_msg, &body_text));
     }
 
     let data: IdcRefreshResponse = response.json().await?;
@@ -414,7 +445,7 @@ async fn refresh_external_idp_token(
 
         // invalid_grant → refreshToken 永久失效（Azure 返回
         // {"error":"invalid_grant","error_description":"..."}）
-        if status.as_u16() == 400 && body_text.contains("invalid_grant") {
+        if is_invalid_grant(status, &body_text) {
             return Err(RefreshTokenInvalidError {
                 message: format!(
                     "External IdP refreshToken 已失效 (invalid_grant): {}",
@@ -431,7 +462,7 @@ async fn refresh_external_idp_token(
             500..=599 => "服务器错误，IdP token 端点暂时不可用",
             _ => "External IdP Token 刷新失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        return Err(upstream_http_error(status, error_msg, &body_text));
     }
 
     let data: ExternalIdpTokenResponse = response.json().await?;
@@ -568,7 +599,7 @@ pub(crate) async fn get_usage_limits(
             500..=599 => "服务器错误，AWS 服务暂时不可用",
             _ => "获取使用额度失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        return Err(upstream_http_error(status, error_msg, &body_text));
     }
 
     // 所有候选端点均失败（理论上循环内已 return / bail，此处为兜底）
@@ -1045,6 +1076,8 @@ pub struct MultiTokenManager {
     /// 填充时机：启动时由 `main.rs` 从 `models.json` 灌入，之后每轮同步
     /// （定时调度器 / `POST /models/sync`）落盘成功后刷新。
     credential_support: parking_lot::RwLock<std::collections::HashMap<String, Vec<String>>>,
+    /// 内部上游请求复用请求日志存储；启动后由 main 注入。
+    trace_store: RwLock<Option<SharedTraceStore>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1064,6 +1097,12 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+}
+
+enum TokenRefreshErrorAction {
+    RateLimited,
+    Reloaded,
+    Recorded { has_available: bool },
 }
 
 /// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
@@ -1283,6 +1322,7 @@ impl MultiTokenManager {
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             credential_support: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            trace_store: RwLock::new(None),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1319,6 +1359,139 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 注入与外部推理请求共用的 trace 存储。
+    pub fn set_trace_store(&self, store: Option<SharedTraceStore>) {
+        *self.trace_store.write() = store;
+    }
+
+    fn refresh_endpoint_label(credentials: &KiroCredentials) -> &'static str {
+        if credentials.is_external_idp_credential() {
+            "oauth/token"
+        } else if credentials.auth_method.as_deref().map(|method| {
+            method.eq_ignore_ascii_case("idc")
+                || method.eq_ignore_ascii_case("builder-id")
+                || method.eq_ignore_ascii_case("iam")
+        }).unwrap_or_else(|| {
+            credentials.client_id.is_some() && credentials.client_secret.is_some()
+        }) {
+            "oidc/token"
+        } else {
+            "refreshToken"
+        }
+    }
+
+    fn classify_internal_error(error: &anyhow::Error) -> (Option<u16>, &'static str) {
+        if error.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+            return (Some(400), outcome::AUTH_FAILED);
+        }
+        if error.downcast_ref::<UpstreamRateLimitError>().is_some() {
+            return (Some(429), outcome::RATE_LIMITED);
+        }
+        if let Some(error) = error.downcast_ref::<UpstreamHttpError>() {
+            let outcome = match error.status {
+                401 | 403 => outcome::AUTH_FAILED,
+                429 => outcome::RATE_LIMITED,
+                500..=599 => outcome::TRANSIENT,
+                _ => outcome::UNKNOWN,
+            };
+            return (Some(error.status), outcome);
+        }
+        if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+            let status = error.status().map(|status| status.as_u16());
+            let outcome = match status {
+                Some(401 | 403) => outcome::AUTH_FAILED,
+                Some(429) => outcome::RATE_LIMITED,
+                Some(500..=599) => outcome::TRANSIENT,
+                Some(_) => outcome::UNKNOWN,
+                None => outcome::NETWORK_ERROR,
+            };
+            return (status, outcome);
+        }
+        (None, outcome::UNKNOWN)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_internal_request<T>(
+        &self,
+        request_operation: &str,
+        credential_id: u64,
+        endpoint: &str,
+        proxy: Option<&ProxyConfig>,
+        started_at: String,
+        started: Instant,
+        result: &anyhow::Result<T>,
+    ) {
+        let Some(store) = self.trace_store.read().clone() else {
+            return;
+        };
+        let (http_status, attempt_outcome, error_message) = match result {
+            Ok(_) => (Some(200), outcome::SUCCESS, None),
+            Err(error) => {
+                let (status, classified) = Self::classify_internal_error(error);
+                (status, classified, truncate_snippet(&error.to_string()))
+            }
+        };
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let final_status = if result.is_ok() { "success" } else { "error" };
+        store.insert(&TraceRecord {
+            trace_id: uuid::Uuid::new_v4().to_string(),
+            ts: started_at,
+            key_id: 0,
+            key_source: TraceKeySource::Internal,
+            operation: request_operation.to_string(),
+            model: String::new(),
+            is_stream: false,
+            final_status: final_status.to_string(),
+            final_credential_id: credential_id,
+            error_type: result.is_err().then(|| attempt_outcome.to_string()),
+            error_message: error_message.clone(),
+            total_attempts: 1,
+            duration_ms,
+            interrupted_after_bytes: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.0,
+            first_token_ms: None,
+            session_id: None,
+            attempts: vec![TraceAttempt {
+                attempt: 0,
+                credential_id,
+                endpoint: endpoint.to_string(),
+                http_status,
+                outcome: attempt_outcome.to_string(),
+                error_snippet: error_message.clone(),
+                duration_ms,
+                started_ms: Some(0),
+                proxy_url: Some(proxy.map(|proxy| proxy.url.as_str())
+                    .unwrap_or(KiroCredentials::PROXY_DIRECT).to_string()),
+            }],
+            phases: Vec::new(),
+        });
+    }
+
+    async fn refresh_token_traced(
+        &self,
+        id: u64,
+        credentials: &KiroCredentials,
+        proxy: Option<&ProxyConfig>,
+    ) -> anyhow::Result<KiroCredentials> {
+        let started_at = Utc::now().to_rfc3339();
+        let started = Instant::now();
+        let result = refresh_token(credentials, &self.config, proxy).await;
+        self.record_internal_request(
+            operation::TOKEN_REFRESH,
+            id,
+            Self::refresh_endpoint_label(credentials),
+            proxy,
+            started_at,
+            started,
+            &result,
+        );
+        result
     }
 
     /// 获取全局代理配置的克隆（可安全跨锁使用）
@@ -1572,13 +1745,18 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
-                    let Some(has_available) = self.handle_token_refresh_error(id, e)? else {
-                        // 从源文件加载到了轮换后的 Token，不计失败次数，直接重试。
-                        continue;
-                    };
-                    attempt_count += 1;
-                    if !has_available {
-                        anyhow::bail!("所有凭据均已禁用（0/{}）", total);
+                    match self.handle_token_refresh_error(id, &e) {
+                        TokenRefreshErrorAction::RateLimited => return Err(e),
+                        TokenRefreshErrorAction::Reloaded => {
+                            // 从源文件加载到了轮换后的 Token，不计失败次数，直接重试。
+                            continue;
+                        }
+                        TokenRefreshErrorAction::Recorded { has_available } => {
+                            attempt_count += 1;
+                            if !has_available {
+                                anyhow::bail!("所有凭据均已禁用（0/{}）", total);
+                            }
+                        }
                     }
                 }
             }
@@ -1587,29 +1765,32 @@ impl MultiTokenManager {
 
     /// 分类并记录一次 Token 刷新错误。
     ///
-    /// 上游 429 是临时流控，不代表凭据失效，因此直接保留类型化错误返回，绝不增加
-    /// `refresh_failure_count`。`Ok(None)` 表示已从源文件加载到轮换后的 Token，调用方
-    /// 应使用同一凭据立即重试；`Ok(Some(_))` 返回记录失败后是否仍有可用凭据。
+    /// 上游 429 是临时流控，不代表凭据失效，绝不增加 `refresh_failure_count`。
+    /// Reloaded 表示已从源文件加载到轮换后的 Token，调用方应使用同一凭据立即重试。
     fn handle_token_refresh_error(
         &self,
         id: u64,
-        error: anyhow::Error,
-    ) -> anyhow::Result<Option<bool>> {
+        error: &anyhow::Error,
+    ) -> TokenRefreshErrorAction {
         if error.downcast_ref::<UpstreamRateLimitError>().is_some() {
             tracing::warn!("凭据 #{} Token 刷新被上游限流", id);
-            return Err(error);
+            return TokenRefreshErrorAction::RateLimited;
         }
 
         if error.downcast_ref::<RefreshTokenInvalidError>().is_some() {
             // 先尝试从源文件重新加载（适用于 IDE 退出后 token rotation 导致失效的场景）。
             if self.try_reload_credential_from_file(id) {
-                return Ok(None);
+                return TokenRefreshErrorAction::Reloaded;
             }
             tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, error);
-            Ok(Some(self.report_refresh_token_invalid(id)))
+            TokenRefreshErrorAction::Recorded {
+                has_available: self.report_refresh_token_invalid(id),
+            }
         } else {
             tracing::warn!("凭据 #{} Token 刷新失败: {}", id, error);
-            Ok(Some(self.report_refresh_failure(id)))
+            TokenRefreshErrorAction::Recorded {
+                has_available: self.report_refresh_failure(id),
+            }
         }
     }
 
@@ -1682,8 +1863,9 @@ impl MultiTokenManager {
                 // 确实需要刷新
                 let global_proxy = self.proxy.lock().clone();
                 let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
-                let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                let new_creds = self
+                    .refresh_token_traced(id, &current_creds, effective_proxy.as_ref())
+                    .await?;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -1889,6 +2071,7 @@ impl MultiTokenManager {
                 entry.credentials.refresh_token = new_refresh_token;
                 entry.credentials.access_token = new_access_token;
                 entry.credentials.expires_at = new_expires_at;
+                entry.credentials.disabled = false;
                 entry.disabled = false;
                 entry.disabled_reason = None;
                 entry.refresh_failure_count = 0;
@@ -2229,12 +2412,9 @@ impl MultiTokenManager {
                 None => return entries.iter().any(|e| !e.disabled),
             };
 
-            if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
-            }
-
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
+            entry.credentials.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
 
             tracing::error!(
@@ -2259,6 +2439,9 @@ impl MultiTokenManager {
                 false
             }
         };
+        if let Err(error) = self.persist_credentials() {
+            tracing::warn!("持久化 refreshToken 失效禁用状态失败: {}", error);
+        }
         self.save_stats_debounced();
         result
     }
@@ -2636,77 +2819,31 @@ impl MultiTokenManager {
 
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
-        let credentials = {
+        let global_proxy = self.proxy.lock().clone();
+        let effective_proxy = {
             let entries = self.entries.lock();
             entries
                 .iter()
                 .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+                .and_then(|entry| entry.credentials.effective_proxy(global_proxy.as_ref()))
         };
+        let started_at = Utc::now().to_rfc3339();
+        let started = Instant::now();
+        let result = self.get_usage_limits_for_inner(id).await;
+        self.record_internal_request(
+            operation::BALANCE_REFRESH,
+            id,
+            "getUsageLimits",
+            effective_proxy.as_ref(),
+            started_at,
+            started,
+            &result,
+        );
+        result
+    }
 
-        // API Key 凭据直接使用 kiro_api_key，无需刷新
-        let token = if credentials.is_api_key_credential() {
-            credentials
-                .kiro_api_key
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
-        } else {
-            // 检查是否需要刷新 token
-            let needs_refresh =
-                is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
-
-            if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
-                let current_creds = {
-                    let entries = self.entries.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == id)
-                        .map(|e| e.credentials.clone())
-                        .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-                };
-
-                if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let global_proxy = self.proxy.lock().clone();
-                    let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
-                    let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
-                    {
-                        let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
-                        }
-                    }
-                    // 持久化失败只记录警告，不影响本次请求
-                    if let Err(e) = self.persist_credentials() {
-                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                    }
-                    new_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
-                } else {
-                    current_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-                }
-            } else {
-                credentials
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-            }
-        };
-
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
+    async fn get_usage_limits_for_inner(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
+        let (token, credentials) = self.prepare_request_token(id).await?;
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         let usage_limits =
@@ -2782,24 +2919,9 @@ impl MultiTokenManager {
         &self,
         id: u64,
     ) -> anyhow::Result<(String, KiroCredentials)> {
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
-        // API Key 凭据直接使用 kiro_api_key，无需刷新
-        let token = if credentials.is_api_key_credential() {
-            credentials
-                .kiro_api_key
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
-        } else if is_token_expired(&credentials) || is_token_expiring_soon(&credentials) {
-            let _guard = self.refresh_lock.lock().await;
-            let current_creds = {
+        // 文件发生 token rotation 时最多原凭据重试一次；第二次仍失败就按永久失效处置。
+        for _ in 0..2 {
+            let credentials = {
                 let entries = self.entries.lock();
                 entries
                     .iter()
@@ -2807,48 +2929,16 @@ impl MultiTokenManager {
                     .map(|e| e.credentials.clone())
                     .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
             };
-
-            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                let global_proxy = self.proxy.lock().clone();
-                let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
-                let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
-                {
-                    let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
-                    }
-                }
-                // 持久化失败只记录警告，不影响本次请求
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                }
-                new_creds
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
-            } else {
-                current_creds
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+            match self.try_ensure_token(id, &credentials).await {
+                Ok(context) => return Ok((context.token, context.credentials)),
+                Err(error) => match self.handle_token_refresh_error(id, &error) {
+                    TokenRefreshErrorAction::Reloaded => continue,
+                    TokenRefreshErrorAction::RateLimited
+                    | TokenRefreshErrorAction::Recorded { .. } => return Err(error),
+                },
             }
-        } else {
-            credentials
-                .access_token
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-        };
-
-        // 重新读取最新凭据（刷新可能改写了 access_token 之外的字段）
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
-        Ok((token, credentials))
+        }
+        anyhow::bail!("凭据 #{} 从文件加载轮换 Token 后仍无法刷新", id)
     }
 
     /// 构造**钉死在指定凭据**上的调用上下文（Admin 模型测试用）
@@ -2895,76 +2985,7 @@ impl MultiTokenManager {
             anyhow::bail!("overageStatus 必须是 ENABLED 或 DISABLED");
         }
 
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
-        // API Key 凭据：直接当 Bearer 用
-        let token = if credentials.is_api_key_credential() {
-            credentials
-                .kiro_api_key
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
-        } else {
-            // 复用与 get_usage_limits_for 完全相同的过期检查与刷新逻辑
-            let needs_refresh =
-                is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
-
-            if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
-                let current_creds = {
-                    let entries = self.entries.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == id)
-                        .map(|e| e.credentials.clone())
-                        .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-                };
-
-                if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let global_proxy = self.proxy.lock().clone();
-                    let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
-                    let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
-                    {
-                        let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
-                        }
-                    }
-                    if let Err(e) = self.persist_credentials() {
-                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                    }
-                    new_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
-                } else {
-                    current_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-                }
-            } else {
-                credentials
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-            }
-        };
-
-        // 重新读取最新的凭据快照（refresh 可能已修改 access_token 之外的字段）
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
+        let (token, credentials) = self.prepare_request_token(id).await?;
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -3056,7 +3077,11 @@ impl MultiTokenManager {
         } else {
             let global_proxy = self.proxy.lock().clone();
             let effective_proxy = new_cred.effective_proxy(global_proxy.as_ref());
-            refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
+            self.refresh_token_traced(
+                new_cred.id.unwrap_or(0),
+                &new_cred,
+                effective_proxy.as_ref(),
+            ).await?
         };
 
         // 捕获原始输入的去重指纹。刷新可能轮换 refreshToken，且下方 step 5 会把
@@ -3436,7 +3461,7 @@ impl MultiTokenManager {
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
     /// 适用于排查问题、Token 异常但未过期、主动更新凭据状态等场景。
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3448,10 +3473,30 @@ impl MultiTokenManager {
         // 获取刷新锁防止并发刷新
         let _guard = self.refresh_lock.lock().await;
 
-        // 无条件调用 refresh_token
-        let global_proxy = self.proxy.lock().clone();
-        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
-        let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        // 无条件调用 refresh_token；文件里发现 rotation 时以新值重试一次。
+        let mut refreshed = None;
+        for _ in 0..2 {
+            let global_proxy = self.proxy.lock().clone();
+            let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+            match self.refresh_token_traced(id, &credentials, effective_proxy.as_ref()).await {
+                Ok(new_credentials) => {
+                    refreshed = Some(new_credentials);
+                    break;
+                }
+                Err(error) => match self.handle_token_refresh_error(id, &error) {
+                    TokenRefreshErrorAction::Reloaded => {
+                        credentials = self.entries.lock().iter()
+                            .find(|entry| entry.id == id)
+                            .map(|entry| entry.credentials.clone())
+                            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+                    }
+                    TokenRefreshErrorAction::RateLimited
+                    | TokenRefreshErrorAction::Recorded { .. } => return Err(error),
+                },
+            }
+        }
+        let new_creds = refreshed
+            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 从文件加载轮换 Token 后仍无法刷新", id))?;
 
         // 更新 entries 中对应凭据
         {
@@ -3743,6 +3788,32 @@ mod tests {
     }
 
     #[test]
+    fn invalid_grant_classification_uses_error_code_not_description() {
+        for body in [
+            r#"{"error":"invalid_grant","error_description":"Invalid token provided"}"#,
+            r#"{"error":"invalid_grant","error_description":"Invalid refresh token provided"}"#,
+            r#"{"error":"invalid_grant"}"#,
+        ] {
+            assert!(
+                is_invalid_grant(reqwest::StatusCode::BAD_REQUEST, body),
+                "标准 error code 应足以判定永久失效: {body}"
+            );
+        }
+        assert!(!is_invalid_grant(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_request"}"#
+        ));
+        assert!(!is_invalid_grant(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"invalid_grant"}"#
+        ));
+        assert!(!is_invalid_grant(
+            reqwest::StatusCode::BAD_REQUEST,
+            "invalid_grant"
+        ));
+    }
+
+    #[test]
     fn test_sha256_hex() {
         let result = sha256_hex("test");
         assert_eq!(
@@ -4022,16 +4093,106 @@ mod tests {
         .unwrap();
 
         let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
-        let returned = manager
-            .handle_token_refresh_error(1, error)
-            .expect_err("429 应立即返回给调用方");
-
-        assert!(returned.downcast_ref::<UpstreamRateLimitError>().is_some());
+        assert!(matches!(
+            manager.handle_token_refresh_error(1, &error),
+            TokenRefreshErrorAction::RateLimited
+        ));
         let snapshot = manager.snapshot();
         let entry = &snapshot.entries[0];
         assert_eq!(entry.refresh_failure_count, 0);
         assert!(!entry.disabled);
         assert_eq!(entry.disabled_reason, None);
+    }
+
+    #[test]
+    fn invalid_grant_action_immediately_disables_credential() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        ).unwrap();
+        let error = anyhow::Error::new(RefreshTokenInvalidError {
+            message: "invalid_grant".to_string(),
+        });
+
+        assert!(matches!(
+            manager.handle_token_refresh_error(1, &error),
+            TokenRefreshErrorAction::Recorded { has_available: false }
+        ));
+        let entry = &manager.snapshot().entries[0];
+        assert!(entry.disabled);
+        assert_eq!(entry.disabled_reason.as_deref(), Some("InvalidRefreshToken"));
+        assert_eq!(entry.refresh_failure_count, 0);
+        assert!(manager.entries.lock()[0].credentials.disabled);
+    }
+
+    #[test]
+    fn invalid_grant_disable_is_persisted() {
+        let path = tmp_creds_path("invalid_grant_persisted");
+        let credentials = KiroCredentials {
+            id: Some(1),
+            refresh_token: Some("valid_length_refresh_token_".repeat(5)),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&[&credentials]).unwrap()).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credentials],
+            None,
+            Some(path.clone()),
+            true,
+        ).unwrap();
+
+        assert!(!manager.report_refresh_token_invalid(1));
+
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(persisted[0]["disabled"], true);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn internal_trace_preserves_http_status_and_truncates_error() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        ).unwrap();
+        let store = Arc::new(crate::admin::trace_db::TraceStore::open_in_memory().unwrap());
+        manager.set_trace_store(Some(Arc::clone(&store)));
+        let result: anyhow::Result<()> = Err(upstream_http_error(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "上游暂时不可用",
+            &"x".repeat(3_000),
+        ));
+
+        manager.record_internal_request(
+            operation::TOKEN_REFRESH,
+            1,
+            "oidc/token",
+            None,
+            Utc::now().to_rfc3339(),
+            Instant::now(),
+            &result,
+        );
+
+        let (records, total) = store.query_paged(&crate::admin::trace_db::TraceQuery {
+            operation: Some(operation::TOKEN_REFRESH.to_string()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        let record = &records[0];
+        assert_eq!(record.key_source, TraceKeySource::Internal);
+        assert_eq!(record.error_type.as_deref(), Some(outcome::TRANSIENT));
+        assert_eq!(record.attempts[0].http_status, Some(503));
+        assert_eq!(record.attempts[0].endpoint, "oidc/token");
+        assert_eq!(record.error_message, record.attempts[0].error_snippet);
+        assert!(record.error_message.as_ref().unwrap().len() < 3_000);
     }
 
     #[test]
@@ -4654,6 +4815,13 @@ mod tests {
         )
         .unwrap();
 
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].disabled = true;
+            entries[0].credentials.disabled = true;
+            entries[0].disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+        }
+
         // 模拟 IDE rotation：文件写入新 token
         let mut updated_cred = KiroCredentials::default();
         updated_cred.id = Some(1);
@@ -4669,6 +4837,7 @@ mod tests {
         let entry = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
         assert!(!entry.disabled, "reload 后凭据应重新启用");
         assert_eq!(entry.failure_count, 0);
+        assert!(!manager.entries.lock()[0].credentials.disabled);
 
         let _ = std::fs::remove_file(&path);
     }

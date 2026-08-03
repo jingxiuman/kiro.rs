@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS traces (
     ts_epoch          BIGINT NOT NULL,
     key_id            BIGINT NOT NULL,
     key_source        VARCHAR,
+    operation         VARCHAR NOT NULL DEFAULT 'inference',
     model             VARCHAR NOT NULL,
     is_stream         BIGINT NOT NULL,
     final_status      VARCHAR NOT NULL,
