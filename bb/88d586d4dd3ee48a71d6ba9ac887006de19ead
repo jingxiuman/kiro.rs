@@ -1,0 +1,21 @@
+Cargo.lock
+  s_d274b2ff1bca34::t_f60a4cfe0ddd9b 1354
+Cargo.toml
+  s_d274b2ff1bca34::t_e777a7eec50077 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "bb88d586d4dd3ee48a71d6ba9ac887006de19ead",
+  "prompts": {},
+  "sessions": {
+    "s_d274b2ff1bca34": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "416d48c4-1d14-470c-8eb0-979d31f52082",
+        "model": "unknown"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
