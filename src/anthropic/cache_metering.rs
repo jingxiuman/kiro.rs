@@ -480,9 +480,17 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
         commit(&hasher, cum_tokens, &mut segments, ttl);
     }
 
-    // 3. messages：除最后一条外，每条 message 边界切一个递增前缀段。
+    // 3. messages：除最后一条外，每条 message 边界切一个递增前缀段；
+    // **最后一条按 content 项边界切段**（2026-08-04）。理由：
+    // - 单消息增长型客户端（每轮往最后一条消息追加项、块内断点后移）的稳定
+    //   前缀在消息边界模型下永不命中——生产实测每轮 43K/255K 全记 input；
+    //   项边界段使其沿前缀链命中（复现真实 API 的前缀树语义）。
+    // - CC 主循环在最后一条消息末项打 cache_control，真实 Anthropic 语义下
+    //   整段前缀本就是 cache write（creation），旧「当前轮新输入=input」口径
+    //   反而偏离原版计费。
     let last_idx = req.messages.len().saturating_sub(1);
     for (idx, msg) in req.messages.iter().enumerate() {
+        let is_last = idx == last_idx;
         // role 进哈希（区分 user/assistant 边界），但不计入 token。
         feed(&mut hasher, &msg.role, "", &mut cum_tokens);
         match &msg.content {
@@ -524,12 +532,19 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
                             &mut cum_tokens,
                         );
                     }
+                    // 最后一条消息：项边界即段边界（commit 只克隆哈希状态，
+                    // 不影响链本身，后续轮的消息边界 hash 与旧模型完全一致）。
+                    if is_last {
+                        commit(&hasher, cum_tokens, &mut segments, ttl);
+                    }
                 }
             }
             _ => {}
         }
-        // 最后一条不切段（当前轮新输入，属 cache_creation 尾部）。
-        if idx != last_idx {
+        // 非最后一条：消息边界切段（原模型不变）。
+        // 最后一条为 String 内容：消息末尾切一段（单项消息的项边界=消息边界）；
+        // Array 内容的项边界段已在上面循环内逐项 commit。
+        if !is_last || matches!(&msg.content, serde_json::Value::String(_)) {
             commit(&hasher, cum_tokens, &mut segments, ttl);
         }
     }
@@ -828,6 +843,94 @@ mod tests {
         }
     }
 
+    /// 构造「单消息增长型」请求：2 条消息，最后一条含 n 个 text 项，
+    /// 断点打在倒数第二项（模拟 laozhu 客户端的移动断点形态）。
+    fn build_growing_last_message_request(n_items: usize) -> super::super::types::MessagesRequest {
+        use super::super::types::{Message, MessagesRequest};
+        let items: Vec<serde_json::Value> = (0..n_items)
+            .map(|i| {
+                let mut v = serde_json::json!({
+                    "type": "text",
+                    "text": format!("稳定的历史记录第 {i} 条：{}", "x".repeat(200)),
+                });
+                if i == n_items - 2 {
+                    v["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                }
+                v
+            })
+            .collect();
+        MessagesRequest {
+            model: "claude-sonnet-5".to_string(),
+            max_tokens: 32,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String("任务说明".repeat(50)),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::Array(items),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn growing_last_message_hits_at_item_granularity() {
+        // 2026-08-04 生产盲点：单消息增长型客户端（每轮往最后一条消息追加 content 项、
+        // 块内断点后移）相邻两轮前缀逐字节相同，却每轮 43K/255K 全记 input。
+        // 修复后：最后一条消息按项边界切段，第二轮应命中稳定前缀。
+        let cache = CacheMeter::new(None);
+        let r1 = build_growing_last_message_request(10);
+        let u1 = compute_cache_usage(&cache, &r1, 1);
+        assert!(u1.cache_covered_est > 0, "首轮应有覆盖前缀");
+
+        // 第二轮：同前缀 + 追加 2 项（断点随之后移到新的倒数第二项）
+        let r2 = build_growing_last_message_request(12);
+        let u2 = compute_cache_usage(&cache, &r2, 1);
+        assert!(
+            u2.cache_read > 0,
+            "第二轮必须命中稳定前缀（首轮 10 项全部逐字节复现），read={}",
+            u2.cache_read
+        );
+        // 命中深度应达到首轮的整体覆盖（首轮 10 项都已入缓存段）
+        assert!(
+            u2.cache_read >= u1.cache_covered_est,
+            "命中深度应不小于首轮覆盖: read={} vs covered1={}",
+            u2.cache_read,
+            u1.cache_covered_est
+        );
+        // 新增尾部（2 项）记 creation，且远小于命中量
+        let creation_est = u2.cache_covered_est - u2.cache_read;
+        assert!(
+            creation_est > 0 && creation_est < u2.cache_read / 2,
+            "新增尾部应为小额 creation: creation={} read={}",
+            creation_est,
+            u2.cache_read
+        );
+    }
+
+    #[test]
+    fn last_message_tail_is_covered_matching_end_breakpoint_habit() {
+        // CC 主循环在最后一条消息末项打 cache_control——真实 Anthropic 语义下
+        // 整段前缀是 cache write。修复后最后一条消息计入覆盖（creation），
+        // 不再按「当前轮新输入=input」处理。
+        let cache = CacheMeter::new(None);
+        let req = build_request_with_system_breakpoint();
+        let u = compute_cache_usage(&cache, &req, 1);
+        assert_eq!(
+            u.cache_covered_est, u.prompt_total_est,
+            "无动态头部时覆盖应达 prompt 全量（最后一条消息也在链上）"
+        );
+    }
+
     #[test]
     fn compute_cache_usage_first_miss_then_hit() {
         let cache = CacheMeter::new(None);
@@ -904,8 +1007,14 @@ mod tests {
             metadata: None,
         };
         let u = compute_cache_usage(&cache, &req, 1);
-        assert_eq!(u.cache_covered_est, 0);
-        assert_eq!(u.split_against_total(123), (123, 0, 0));
+        // 2026-08-04 起最后一条消息也在前缀链上（项/消息边界切段）：
+        // 单消息即为可缓存前缀，首轮全 creation，第二轮可命中为 read。
+        assert_eq!(u.cache_covered_est, u.prompt_total_est);
+        let (in1, cc1, cr1) = u.split_against_total(123);
+        assert_eq!((in1, cr1), (0, 0));
+        assert_eq!(cc1, 123, "首轮覆盖部分全记 creation");
+        let u2 = compute_cache_usage(&cache, &req, 1);
+        assert!(u2.cache_read > 0, "重放应命中");
     }
 
     /// 构造一个普通工具，input_schema 的顶层 key 按给定顺序插入。
@@ -1401,9 +1510,9 @@ mod tests {
             metadata: None,
         };
         let u = compute_cache_usage(&CacheMeter::new(None), &req, 1);
-        // 历史段（第一条）的 covered 应严格等于纯文本 estimate——
-        // 不含 "user" role、"block:" 前缀、"|" 分隔符的任何 token。
-        let pure = estimate_tokens(history_text) as i32;
+        // covered 应严格等于两条消息的纯文本 estimate 之和（最后一条 2026-08-04 起
+        // 也在链上）——不含 "user" role、"block:" 前缀、"|" 分隔符的任何 token。
+        let pure = estimate_tokens(history_text) as i32 + estimate_tokens("ok") as i32;
         assert_eq!(
             u.cache_covered_est, pure,
             "covered 应只算原文 token，实测 {} vs 纯文本 {}",
