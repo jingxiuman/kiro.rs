@@ -50,6 +50,8 @@ pub struct AppState {
     pub trace_store: Option<SharedTraceStore>,
     /// 请求体全量保留存储（可选，storeRequestBodies=true 时启用）
     pub request_body_store: Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
+    /// omitted 思考正文存储（恢复键 kiro-thinking-v1 的后端，常开）
+    pub thinking_text_store: Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
 }
 
 /// 由 [`capture_raw_body`] 塞进 request extensions 的原始请求体字节。
@@ -96,6 +98,7 @@ impl AppState {
             cache_meter: None,
             trace_store: None,
             request_body_store: None,
+            thinking_text_store: None,
         }
     }
 

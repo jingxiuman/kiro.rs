@@ -1978,6 +1978,7 @@ mod tests {
         req.thinking = Some(Thinking {
             thinking_type: "adaptive".to_string(),
             budget_tokens: 20000,
+            display: None,
         });
         req
     }
@@ -1989,6 +1990,7 @@ mod tests {
         req.thinking = Some(Thinking {
             thinking_type: "adaptive".to_string(),
             budget_tokens: 20000,
+            display: None,
         });
         req
     }
@@ -2001,6 +2003,7 @@ mod tests {
         req.thinking = Some(Thinking {
             thinking_type: thinking_type.to_string(),
             budget_tokens: 20000,
+            display: None,
         });
         req
     }
@@ -2226,6 +2229,7 @@ mod tests {
         req.thinking = Some(Thinking {
             thinking_type: "enabled".into(),
             budget_tokens: 3_000,
+            display: None,
         });
         let result = convert_request(&req).unwrap();
         assert_eq!(

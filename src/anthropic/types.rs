@@ -81,6 +81,11 @@ pub struct Thinking {
         deserialize_with = "deserialize_budget_tokens"
     )]
     pub budget_tokens: i32,
+    /// 思考展示模式。CC 2.1.220 起发 `"omitted"`：客户端不需要思考正文，
+    /// 只要块结构与签名。对齐原版语义：omitted 时正文不下发、服务端凭
+    /// 签名恢复（见 stream.rs 的 kiro-thinking-v1 恢复键）。
+    #[serde(default)]
+    pub display: Option<String>,
 }
 
 impl Thinking {

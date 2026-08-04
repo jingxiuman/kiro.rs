@@ -165,6 +165,11 @@ struct RequestTraceOptions {
 
 struct ResponseProcessingConfig {
     thinking_enabled: bool,
+    /// display:"omitted"——思考正文不下发，签名=恢复键
+    thinking_omitted: bool,
+    /// 恢复键正文存储（omitted 时使用）
+    thinking_text_store:
+        Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
     cache_usage: super::cache_metering::CacheUsage,
@@ -180,6 +185,42 @@ fn session_id_of(payload: &super::types::MessagesRequest) -> Option<String> {
         .as_ref()
         .and_then(|m| m.user_id.as_deref())
         .and_then(super::metadata::extract_session_id)
+}
+
+/// omitted 轻量往返的回程恢复：历史 assistant 消息里「空正文 + kiro-thinking-v1 恢复键」
+/// 的 thinking 块，凭键从本地 blob 回填正文。必须在 token 计数 / cache 计量 / 转换
+/// 之前调用——上游看到的内容与计量口径要一致。键失效（已过保留期）时保持为空，
+/// 不伪造内容；该块推理上下文丢失，与原版签名过期语义一致。
+fn restore_omitted_thinking(
+    payload: &mut MessagesRequest,
+    store: &crate::admin::request_body_store::RequestBodyStore,
+) {
+    const KEY_PREFIX: &str = "kiro-thinking-v1:";
+    for msg in payload.messages.iter_mut() {
+        if msg.role != "assistant" {
+            continue;
+        }
+        let serde_json::Value::Array(blocks) = &mut msg.content else {
+            continue;
+        };
+        for b in blocks.iter_mut() {
+            if b["type"] != "thinking" {
+                continue;
+            }
+            let empty = b["thinking"].as_str().map(str::is_empty).unwrap_or(true);
+            let Some(id) = b["signature"]
+                .as_str()
+                .and_then(|s| s.strip_prefix(KEY_PREFIX))
+            else {
+                continue;
+            };
+            if empty && let Some(text) = store.load(id) {
+                b["thinking"] = serde_json::Value::String(
+                    String::from_utf8_lossy(&text).into_owned(),
+                );
+            }
+        }
+    }
 }
 
 /// 把入站原始请求体按 trace_id 落盘（storeRequestBodies 启用时）。
@@ -849,6 +890,11 @@ pub async fn post_messages(
     if let Err(error) = validate_max_tokens(payload.max_tokens) {
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
+    // omitted 轻量往返回程：先凭恢复键回填历史思考正文，
+    // 再进 token 计数 / cache 计量 / 转换——上游所见与计量口径一致。
+    if let Some(store) = &state.thinking_text_store {
+        restore_omitted_thinking(&mut payload, store);
+    }
     if img_stats.total_b64_bytes > IMAGE_BUDGET_WARN_BYTES {
         tracing::warn!(
             image_count = %img_stats.count,
@@ -968,6 +1014,13 @@ pub async fn post_messages(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
+    // display:"omitted"：思考正文不下发（签名=恢复键，回传时服务端恢复）
+    let thinking_omitted = thinking_enabled
+        && payload
+            .thinking
+            .as_ref()
+            .and_then(|t| t.display.as_deref())
+            == Some("omitted");
 
     let context_window = conversion_result.context_window;
     let tool_name_map = conversion_result.tool_name_map;
@@ -1002,6 +1055,8 @@ pub async fn post_messages(
             tracer,
             ResponseProcessingConfig {
                 thinking_enabled,
+                thinking_omitted,
+                thinking_text_store: state.thinking_text_store.clone(),
                 tool_name_map,
                 known_tool_names,
                 cache_usage,
@@ -1032,6 +1087,8 @@ pub async fn post_messages(
             tracer,
             ResponseProcessingConfig {
                 thinking_enabled: extract_thinking,
+                thinking_omitted,
+                thinking_text_store: state.thinking_text_store.clone(),
                 tool_name_map,
                 known_tool_names,
                 cache_usage,
@@ -1055,6 +1112,8 @@ async fn handle_stream_request(
 ) -> Response {
     let ResponseProcessingConfig {
         thinking_enabled,
+        thinking_omitted,
+        thinking_text_store,
         tool_name_map,
         known_tool_names,
         cache_usage,
@@ -1085,6 +1144,7 @@ async fn handle_stream_request(
         tool_name_map,
         known_tool_names,
     );
+    ctx.set_thinking_omitted(thinking_omitted, thinking_text_store);
     ctx.cache_usage = cache_usage;
 
     // 生成初始事件
@@ -1465,6 +1525,8 @@ async fn handle_non_stream_request(
 ) -> Response {
     let ResponseProcessingConfig {
         thinking_enabled,
+        thinking_omitted,
+        thinking_text_store,
         tool_name_map,
         // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探。
         known_tool_names: _,
@@ -1700,6 +1762,8 @@ async fn handle_non_stream_request(
         text_content,
         native_thinking,
         native_redacted_thinking,
+        thinking_omitted,
+        thinking_text_store.as_deref(),
     );
     content.extend(tool_uses);
 
@@ -1770,29 +1834,57 @@ fn build_non_stream_content(
     text_content: String,
     native_thinking: String,
     native_redacted_thinking: Vec<String>,
+    thinking_omitted: bool,
+    thinking_text_store: Option<&crate::admin::request_body_store::RequestBodyStore>,
 ) -> Vec<serde_json::Value> {
+    // omitted：正文不下发，存 blob 换恢复键（与流式 thinking_close_signature 同语义）
+    let omitted_signature = |text: &str| -> Option<String> {
+        if !thinking_omitted || text.is_empty() {
+            return None;
+        }
+        let store = thinking_text_store?;
+        let id = uuid::Uuid::new_v4().to_string();
+        store.save(&id, text.as_bytes());
+        Some(format!("kiro-thinking-v1:{}", id))
+    };
     let mut content = Vec::new();
     let has_native_thinking = !native_thinking.is_empty();
 
     if thinking_enabled {
         if has_native_thinking {
-            content.push(json!({
-                "type": "thinking",
-                "thinking": native_thinking.clone(),
-                // 真签名不透传（与流式路径一致）：回传即被 serde 丢弃，只膨胀历史。
-                "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
-            }));
+            if let Some(sig) = omitted_signature(&native_thinking) {
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": "",
+                    "signature": sig,
+                }));
+            } else {
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": native_thinking.clone(),
+                    // 真签名不透传（与流式路径一致）：回传即被 serde 丢弃，只膨胀历史。
+                    "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
+                }));
+            }
         } else {
             // 从完整文本中提取 thinking 块，兼容旧的 <thinking> 文本路径。
             let (thinking, remaining_text) =
                 super::stream::extract_thinking_from_complete_text(&text_content);
 
             if let Some(thinking_text) = thinking {
-                content.push(json!({
-                    "type": "thinking",
-                    "thinking": thinking_text,
-                    "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
-                }));
+                if let Some(sig) = omitted_signature(&thinking_text) {
+                    content.push(json!({
+                        "type": "thinking",
+                        "thinking": "",
+                        "signature": sig,
+                    }));
+                } else {
+                    content.push(json!({
+                        "type": "thinking",
+                        "thinking": thinking_text,
+                        "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
+                    }));
+                }
             }
 
             if !remaining_text.is_empty() {
@@ -1852,9 +1944,12 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         "模型名包含 thinking 后缀，覆写 thinking 配置"
     );
 
+    // 保留客户端原有的 display 声明（-thinking 后缀只覆写开关，不覆写展示模式）
+    let display = payload.thinking.as_ref().and_then(|t| t.display.clone());
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
+        display,
     });
 
     if is_opus_4_6 {
@@ -1917,6 +2012,11 @@ pub async fn post_messages_cc(
     );
     if let Err(error) = validate_max_tokens(payload.max_tokens) {
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+    }
+    // omitted 轻量往返回程：先凭恢复键回填历史思考正文，
+    // 再进 token 计数 / cache 计量 / 转换——上游所见与计量口径一致。
+    if let Some(store) = &state.thinking_text_store {
+        restore_omitted_thinking(&mut payload, store);
     }
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
 
@@ -2030,6 +2130,13 @@ pub async fn post_messages_cc(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
+    // display:"omitted"：思考正文不下发（签名=恢复键，回传时服务端恢复）
+    let thinking_omitted = thinking_enabled
+        && payload
+            .thinking
+            .as_ref()
+            .and_then(|t| t.display.as_deref())
+            == Some("omitted");
 
     let context_window = conversion_result.context_window;
     let tool_name_map = conversion_result.tool_name_map;
@@ -2063,6 +2170,8 @@ pub async fn post_messages_cc(
             tracer,
             ResponseProcessingConfig {
                 thinking_enabled,
+                thinking_omitted,
+                thinking_text_store: state.thinking_text_store.clone(),
                 tool_name_map,
                 known_tool_names,
                 cache_usage,
@@ -2093,6 +2202,8 @@ pub async fn post_messages_cc(
             tracer,
             ResponseProcessingConfig {
                 thinking_enabled: extract_thinking,
+                thinking_omitted,
+                thinking_text_store: state.thinking_text_store.clone(),
                 tool_name_map,
                 known_tool_names,
                 cache_usage,
@@ -2119,6 +2230,8 @@ async fn handle_stream_request_buffered(
 ) -> Response {
     let ResponseProcessingConfig {
         thinking_enabled,
+        thinking_omitted,
+        thinking_text_store,
         tool_name_map,
         known_tool_names,
         cache_usage,
@@ -2148,6 +2261,7 @@ async fn handle_stream_request_buffered(
         tool_name_map,
         known_tool_names,
     );
+    ctx.set_thinking_omitted(thinking_omitted, thinking_text_store);
     ctx.set_cache_usage(cache_usage);
 
     // 创建缓冲 SSE 流；并发门禁 permit 挂进流闭包，流结束/断开时才释放凭据并发位
@@ -2356,6 +2470,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn restore_omitted_thinking_refills_text_from_store() {
+        // omitted 轻量往返的回程：客户端历史里是空正文 + kiro-thinking-v1 恢复键，
+        // 预处理必须凭键恢复正文，converter 才能把推理上下文带给上游。
+        let root = std::env::temp_dir().join(format!(
+            "kiro-restore-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = crate::admin::request_body_store::RequestBodyStore::new(root.clone(), true, 7);
+        store.save("abc-123", "被省略的推理".as_bytes());
+
+        let mut payload: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-5",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "", "signature": "kiro-thinking-v1:abc-123"},
+                    {"type": "thinking", "thinking": "", "signature": "kiro-thinking-v1:missing-id"},
+                    {"type": "thinking", "thinking": "本来就有", "signature": "kiro-rs-thinking-signature"},
+                    {"type": "text", "text": "ok"}
+                ]}
+            ]
+        }))
+        .unwrap();
+
+        restore_omitted_thinking(&mut payload, &store);
+
+        let content = &payload.messages[1].content;
+        assert_eq!(content[0]["thinking"], "被省略的推理", "恢复键应回填正文");
+        assert_eq!(content[1]["thinking"], "", "键失效（过期）时保持为空，不伪造");
+        assert_eq!(content[2]["thinking"], "本来就有", "非 omitted 块不动");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn tracer_observe_events_persists_stream_shape_and_first_render() {
         // 形态摘要必须经 observe_events → finalize 落到 trace 行；
         // 这是事件语义层唯一的服务端观测点。
@@ -2496,6 +2646,8 @@ mod tests {
             "final answer".to_string(),
             "native thinking".to_string(),
             vec!["encrypted-thinking".to_string()],
+            false,
+            None,
         );
 
         assert_eq!(content.len(), 3);
@@ -2513,12 +2665,41 @@ mod tests {
     }
 
     #[test]
+    fn non_stream_omitted_thinking_stores_text_and_emits_restore_key() {
+        let root = std::env::temp_dir().join(format!(
+            "kiro-ns-omit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = std::sync::Arc::new(
+            crate::admin::request_body_store::RequestBodyStore::new(root.clone(), true, 7),
+        );
+        let content = build_non_stream_content(
+            true,
+            "final answer".to_string(),
+            "native thinking".to_string(),
+            Vec::new(),
+            true,
+            Some(&store),
+        );
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "", "omitted 时非流式同样不下发正文");
+        let sig = content[0]["signature"].as_str().unwrap();
+        assert!(sig.starts_with("kiro-thinking-v1:"), "签名应为恢复键: {sig}");
+        let restored = store.load(sig.trim_start_matches("kiro-thinking-v1:")).unwrap();
+        assert_eq!(String::from_utf8_lossy(&restored), "native thinking");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn non_stream_legacy_thinking_extraction_still_works_without_native_reasoning() {
         let content = build_non_stream_content(
             true,
             "<thinking>legacy thinking</thinking>\n\nfinal answer".to_string(),
             String::new(),
             Vec::new(),
+            false,
+            None,
         );
 
         assert_eq!(content.len(), 2);
@@ -2539,6 +2720,8 @@ mod tests {
             String::new(),
             "native thinking fallback".to_string(),
             vec!["ignored-redacted".to_string()],
+            false,
+            None,
         );
 
         assert_eq!(content.len(), 1);

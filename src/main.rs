@@ -208,6 +208,15 @@ async fn main() {
         tracing::info!("请求体全量保留已启用（request_bodies/，保留 {} 天）", config.trace_retention_days);
     }
 
+    // omitted 思考正文存储（恢复键后端，常开：客户端发 display:omitted 才会写入）
+    let thinking_text_store = Some(std::sync::Arc::new(
+        admin::request_body_store::RequestBodyStore::new(
+            cache_dir.join("thinking_texts"),
+            true,
+            config.trace_retention_days as u64,
+        ),
+    ));
+
     // Ops 事件存储：trace 主库成功时用同一持久化文件；trace 降级到内存时 ops 也用内存，
     // 保证两者查询落在同一数据库视图。
     let ops_store = Arc::new(if trace_store.is_some() {
@@ -306,6 +315,7 @@ async fn main() {
         let ops_store = ops_store.clone();
         let balance_cleanup = balance_store.clone();
         let body_cleanup = request_body_store.clone();
+        let thinking_cleanup = thinking_text_store.clone();
         tokio::spawn(async move {
             let day = std::time::Duration::from_secs(24 * 3600);
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -320,6 +330,9 @@ async fn main() {
                 }
                 if let Some(rb) = &body_cleanup {
                     rb.cleanup();
+                }
+                if let Some(tt) = &thinking_cleanup {
+                    tt.cleanup();
                 }
                 tokio::time::sleep(day).await;
             }
@@ -460,6 +473,7 @@ async fn main() {
         Some(cache_meter.clone()),
         trace_store.clone(),
         request_body_store.clone(),
+        thinking_text_store.clone(),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）

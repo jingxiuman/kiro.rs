@@ -1487,6 +1487,12 @@ pub struct StreamContext {
     pub invoke_sniff_buffer: String,
     /// 是否在 thinking 块内
     pub in_thinking_block: bool,
+    /// display:"omitted"——思考正文不下发，签名改为服务端恢复键（对齐原版语义）
+    thinking_display_omitted: bool,
+    /// omitted 模式下累积的当前块思考正文（闭块时存 blob、换恢复键）
+    omitted_thinking_buf: String,
+    /// 思考正文 blob 存储（omitted 模式必需；None 时退化为占位符+丢正文）
+    thinking_text_store: Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
     /// thinking 块索引
     pub thinking_block_index: Option<i32>,
     /// 文本块索引（thinking 启用时动态分配）
@@ -1586,6 +1592,9 @@ impl StreamContext {
             thinking_buffer: String::new(),
             invoke_sniff_buffer: String::new(),
             in_thinking_block: false,
+            thinking_display_omitted: false,
+            omitted_thinking_buf: String::new(),
+            thinking_text_store: None,
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
@@ -1834,11 +1843,12 @@ impl StreamContext {
                     // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty()
-                        && let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
+                        && let Some(thinking_index) = self.thinking_block_index
+                            && let Some(ev) =
+                                self.emit_thinking_text(thinking_index, &thinking_content)
+                            {
+                                events.push(ev);
+                            }
 
                     // 结束 thinking 块（后续若再出现 <thinking> 标签会另开新块）
                     self.in_thinking_block = false;
@@ -1875,11 +1885,12 @@ impl StreamContext {
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
                         if !safe_content.is_empty()
-                            && let Some(thinking_index) = self.thinking_block_index {
-                                events.push(
-                                    self.create_thinking_delta_event(thinking_index, &safe_content),
-                                );
-                            }
+                            && let Some(thinking_index) = self.thinking_block_index
+                                && let Some(ev) =
+                                    self.emit_thinking_text(thinking_index, &safe_content)
+                                {
+                                    events.push(ev);
+                                }
                         self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                     }
                     break;
@@ -2211,6 +2222,17 @@ impl StreamContext {
         events
     }
 
+    /// 启用 display:"omitted" 模式（思考正文不下发，签名=恢复键）。
+    /// 在 ctx 构造后、处理任何事件前调用。
+    pub fn set_thinking_omitted(
+        &mut self,
+        omitted: bool,
+        store: Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
+    ) {
+        self.thinking_display_omitted = omitted;
+        self.thinking_text_store = store;
+    }
+
     fn close_open_thinking_block(&mut self) -> Vec<SseEvent> {
         let Some(idx) = self.thinking_block_index else {
             return Vec::new();
@@ -2256,9 +2278,10 @@ impl StreamContext {
         {
             self.output_tokens += estimate_tokens(text);
             events.extend(self.ensure_thinking_block());
-            if let Some(idx) = self.thinking_block_index {
-                events.push(self.create_thinking_delta_event(idx, text));
-            }
+            if let Some(idx) = self.thinking_block_index
+                && let Some(ev) = self.emit_thinking_text(idx, text) {
+                    events.push(ev);
+                }
         }
 
         if let Some(redacted) = reasoning.redacted_content.as_deref()
@@ -2295,6 +2318,34 @@ impl StreamContext {
     }
 
     /// 创建 thinking_delta 事件
+    /// 思考正文的唯一发射口：omitted 模式下不下发、只累积（闭块时存 blob 换恢复键）。
+    /// 空串（闭块 ritual）始终照发。
+    fn emit_thinking_text(&mut self, index: i32, thinking: &str) -> Option<SseEvent> {
+        if self.thinking_display_omitted && !thinking.is_empty() {
+            self.omitted_thinking_buf.push_str(thinking);
+            return None;
+        }
+        Some(self.create_thinking_delta_event(index, thinking))
+    }
+
+    /// 计算 thinking 块闭合时下发的签名。
+    /// omitted 模式且正文已存 blob：`kiro-thinking-v1:<id>` 恢复键——回传时
+    /// handlers 的预处理凭它恢复正文再进 converter，上游推理上下文零损失
+    /// （对齐原版「签名即凭证」语义）。其余情况：占位符。
+    fn thinking_close_signature(&mut self) -> String {
+        if self.thinking_display_omitted && !self.omitted_thinking_buf.is_empty() {
+            let text = std::mem::take(&mut self.omitted_thinking_buf);
+            if let Some(store) = &self.thinking_text_store {
+                let id = Uuid::new_v4().to_string();
+                store.save(&id, text.as_bytes());
+                return format!("kiro-thinking-v1:{}", id);
+            }
+            // 无存储可用：正文只能丢弃，退化为占位符（上游将丢失这段推理上下文）
+            tracing::warn!("thinking omitted 但无 blob 存储，正文 {} 字节被丢弃", text.len());
+        }
+        THINKING_SIGNATURE_PLACEHOLDER.to_string()
+    }
+
     fn create_thinking_delta_event(&self, index: i32, thinking: &str) -> SseEvent {
         SseEvent::new(
             "content_block_delta",
@@ -2319,8 +2370,9 @@ impl StreamContext {
     /// 上游 Kiro 不是 Anthropic 服务端，不会下发真实签名，因此这里发一个非空
     /// 占位字符串以满足客户端本地校验。该字段不参与转发回 Kiro 的逻辑
     /// （converter 只读 `block.thinking`，不读 signature）。
-    fn create_signature_delta_event(&self, index: i32) -> SseEvent {
-        self.create_signature_delta_event_with(index, THINKING_SIGNATURE_PLACEHOLDER)
+    fn create_signature_delta_event(&mut self, index: i32) -> SseEvent {
+        let signature = self.thinking_close_signature();
+        self.create_signature_delta_event_with(index, &signature)
     }
 
     fn create_signature_delta_event_with(&self, index: i32, signature: &str) -> SseEvent {
@@ -2412,11 +2464,12 @@ impl StreamContext {
             && let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
                 if !thinking_content.is_empty()
-                    && let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &thinking_content),
-                        );
-                    }
+                    && let Some(thinking_index) = self.thinking_block_index
+                        && let Some(ev) =
+                            self.emit_thinking_text(thinking_index, &thinking_content)
+                        {
+                            events.push(ev);
+                        }
 
                 // 结束 thinking 块（后续若再出现 <thinking> 标签会另开新块）
                 self.in_thinking_block = false;
@@ -2505,11 +2558,12 @@ impl StreamContext {
                 {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty()
-                        && let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
+                        && let Some(thinking_index) = self.thinking_block_index
+                            && let Some(ev) =
+                                self.emit_thinking_text(thinking_index, &thinking_content)
+                            {
+                                events.push(ev);
+                            }
 
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
@@ -2534,9 +2588,10 @@ impl StreamContext {
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
-                        );
+                        let buffered = self.thinking_buffer.clone();
+                        if let Some(ev) = self.emit_thinking_text(thinking_index, &buffered) {
+                            events.push(ev);
+                        }
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
@@ -2633,6 +2688,15 @@ pub struct BufferedStreamContext {
 }
 
 impl BufferedStreamContext {
+    /// 透传 omitted 设置到内部 StreamContext。
+    pub fn set_thinking_omitted(
+        &mut self,
+        omitted: bool,
+        store: Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
+    ) {
+        self.inner.set_thinking_omitted(omitted, store);
+    }
+
     /// 创建缓冲流上下文。`context_window` 同 [`StreamContext::new_with_thinking`]，
     /// 必填、来自请求入口快照。
     pub fn new(
@@ -3279,6 +3343,122 @@ mod tests {
             712_000,
         );
         assert_eq!(shape.first_render_ms(), Some(712_000));
+    }
+
+    fn temp_blob_store() -> (std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "kiro-omit-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        (
+            std::sync::Arc::new(crate::admin::request_body_store::RequestBodyStore::new(
+                root.clone(),
+                true,
+                7,
+            )),
+            root,
+        )
+    }
+
+    #[test]
+    fn omitted_thinking_suppresses_text_and_signature_is_restore_key() {
+        // display:"omitted"（对齐原版语义）：思考正文不下发，块结构保留，
+        // 签名变成服务端恢复键 kiro-thinking-v1:<id>，正文存本地 blob。
+        let (store, root) = temp_blob_store();
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, 200_000, true, HashMap::new(), test_known_tools(),
+        );
+        ctx.set_thinking_omitted(true, Some(store.clone()));
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("<thinking>机密推理内容</thinking>\n\n答案"));
+        all.extend(ctx.generate_final_events());
+
+        let thinking_text: String = all
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta")
+            .filter_map(|e| e.data["delta"]["thinking"].as_str())
+            .collect();
+        assert_eq!(thinking_text, "", "omitted 时思考正文不得下发");
+
+        let sig = all
+            .iter()
+            .find(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta")
+            .and_then(|e| e.data["delta"]["signature"].as_str())
+            .expect("thinking 块仍需签名");
+        assert!(sig.starts_with("kiro-thinking-v1:"), "签名应为恢复键: {sig}");
+
+        let id = sig.trim_start_matches("kiro-thinking-v1:");
+        let restored = store.load(id).expect("正文应已存入 blob");
+        assert_eq!(String::from_utf8_lossy(&restored), "机密推理内容");
+
+        // 正文 token 仍需计量（内容真实生成过，只是不下发）
+        assert!(ctx.output_tokens > 0);
+        // text 块正常
+        let text_all: String = all
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(text_all, "答案");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn omitted_native_reasoning_also_suppressed_and_stored() {
+        let (store, root) = temp_blob_store();
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, 200_000, true, HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        ctx.set_thinking_omitted(true, Some(store.clone()));
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("native 推理".to_string()),
+                signature: Some("upstream-sig".to_string()),
+                redacted_content: None,
+            },
+        )));
+        all.extend(ctx.process_assistant_response("答案"));
+        all.extend(ctx.generate_final_events());
+
+        let thinking_text: String = all
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta")
+            .filter_map(|e| e.data["delta"]["thinking"].as_str())
+            .collect();
+        assert_eq!(thinking_text, "", "native 路径 omitted 同样不下发正文");
+        let sig = all
+            .iter()
+            .find(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta")
+            .and_then(|e| e.data["delta"]["signature"].as_str())
+            .unwrap();
+        assert!(sig.starts_with("kiro-thinking-v1:"));
+        let restored = store.load(sig.trim_start_matches("kiro-thinking-v1:")).unwrap();
+        assert_eq!(String::from_utf8_lossy(&restored), "native 推理");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn non_omitted_behavior_unchanged() {
+        // 不带 display:omitted 的客户端行为完全不变：全文下发 + 占位符签名
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, 200_000, true, HashMap::new(), test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("<thinking>abc</thinking>\n\nhi"));
+        all.extend(ctx.generate_final_events());
+        let thinking_text: String = all
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta")
+            .filter_map(|e| e.data["delta"]["thinking"].as_str())
+            .collect();
+        assert_eq!(thinking_text, "abc");
+        assert!(all.iter().any(|e| e.data["delta"]["signature"] == THINKING_SIGNATURE_PLACEHOLDER));
     }
 
     #[test]
