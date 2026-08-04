@@ -53,6 +53,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -66,6 +67,7 @@ pub fn create_router(
     usage_store: Option<SharedUsageStore>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    request_body_store: Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
@@ -74,11 +76,28 @@ pub fn create_router(
     state = state.with_usage(client_keys, usage_store);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
+    state.request_body_store = request_body_store;
 
     // 需要认证的 /v1 路由
+    // 请求体保留启用时才挂原始字节捕获层（层本身有缓冲成本，不白挂）
+    let capture = state
+        .request_body_store
+        .as_ref()
+        .map(|s| s.is_enabled())
+        .unwrap_or(false);
+    let messages_route = if capture {
+        post(post_messages).layer(middleware::from_fn(super::middleware::capture_raw_body))
+    } else {
+        post(post_messages)
+    };
+    let messages_cc_route = if capture {
+        post(post_messages_cc).layer(middleware::from_fn(super::middleware::capture_raw_body))
+    } else {
+        post(post_messages_cc)
+    };
     let v1_routes = Router::new()
         .route("/models", get(get_models))
-        .route("/messages", post(post_messages))
+        .route("/messages", messages_route)
         .route("/messages/count_tokens", post(count_tokens))
         .route("/chat/completions", post(post_chat_completions))
         .route("/responses", post(post_responses))
@@ -90,7 +109,7 @@ pub fn create_router(
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
     // 与 /v1 的区别：流式响应会等待 contextUsageEvent 后再发送 message_start
     let cc_v1_routes = Router::new()
-        .route("/messages", post(post_messages_cc))
+        .route("/messages", messages_cc_route)
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
             state.clone(),

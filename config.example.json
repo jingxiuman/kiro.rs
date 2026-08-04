@@ -16,5 +16,6 @@
   "modelSyncEnabled": false,
   "modelSyncTime": "04:00",
   "modelSyncProbeCredentialId": null,
-  "allowUnknownModelPassthrough": false
+  "allowUnknownModelPassthrough": false,
+  "storeRequestBodies": false
 }

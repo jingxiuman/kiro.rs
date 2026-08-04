@@ -48,6 +48,36 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// 请求体全量保留存储（可选，storeRequestBodies=true 时启用）
+    pub request_body_store: Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
+}
+
+/// 由 [`capture_raw_body`] 塞进 request extensions 的原始请求体字节。
+/// Bytes 引用计数克隆，无拷贝开销。
+#[derive(Clone)]
+pub struct RawRequestBody(pub bytes::Bytes);
+
+/// 缓冲请求体并把原始字节存入 extensions，供 handler 落盘请求体。
+/// 仅在 request_body_store 启用时挂载本层；Json 解析语义不受影响。
+pub async fn capture_raw_body(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let (parts, body) = req.into_parts();
+    match axum::body::to_bytes(body, 50 * 1024 * 1024).await {
+        Ok(bytes) => {
+            let mut req = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes.clone()));
+            req.extensions_mut().insert(RawRequestBody(bytes));
+            next.run(req).await
+        }
+        Err(e) => {
+            // 体积超限等：交回一个空体请求让下游 Json 提取器报它自己的错，
+            // 观测层不改变错误语义。
+            tracing::warn!("请求体缓冲失败: {}", e);
+            let req = axum::extract::Request::from_parts(parts, axum::body::Body::empty());
+            next.run(req).await
+        }
+    }
 }
 
 impl AppState {
@@ -65,6 +95,7 @@ impl AppState {
             usage_store: None,
             cache_meter: None,
             trace_store: None,
+            request_body_store: None,
         }
     }
 

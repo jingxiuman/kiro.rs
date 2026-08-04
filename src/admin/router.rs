@@ -19,7 +19,7 @@ use super::{
         export_credentials, force_refresh_token, get_account_throttle_config,
         get_all_credentials, get_credential_balance, get_credential_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_update_config,
-        list_client_keys, list_groups, list_traces, trace_failure_stats,
+        get_trace_request_body, list_client_keys, list_groups, list_traces, trace_failure_stats,
         ops_error_crosstab, ops_error_fingerprints, ops_overview,
         ops_retry_effectiveness, ops_trend,
         ops_by_credential, ops_by_proxy, ops_events, ops_phase_baseline, poll_idc_login,
@@ -200,6 +200,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             patch(patch_model).delete(delete_model),
         )
         .route("/traces", get(list_traces))
+        .route("/traces/{trace_id}/request-body", get(get_trace_request_body))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

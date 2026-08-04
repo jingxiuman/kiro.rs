@@ -35,6 +35,8 @@ pub struct AdminState {
     pub trace_store: SharedTraceStore,
     /// 账号分组注册表（持久化到 groups.json）
     pub groups: SharedGroupManager,
+    /// 请求体全量保留存储（storeRequestBodies=true 时启用）
+    pub request_body_store: Option<std::sync::Arc<super::request_body_store::RequestBodyStore>>,
 }
 
 impl AdminState {
@@ -45,6 +47,7 @@ impl AdminState {
         usage_store: SharedUsageStore,
         trace_store: SharedTraceStore,
         groups: SharedGroupManager,
+        request_body_store: Option<std::sync::Arc<super::request_body_store::RequestBodyStore>>,
     ) -> Self {
         Self {
             admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
@@ -53,6 +56,7 @@ impl AdminState {
             usage_store,
             trace_store,
             groups,
+            request_body_store,
         }
     }
 }

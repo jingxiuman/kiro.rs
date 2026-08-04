@@ -235,6 +235,13 @@ pub struct Config {
     #[serde(default = "default_trace_retention_days")]
     pub trace_retention_days: u32,
 
+    /// 是否全量保留 /v1/messages 原始请求体（gzip 落盘 request_bodies/，
+    /// 保留期跟随 traceRetentionDays）。默认 false：内容含用户源码与对话，
+    /// 显式开启才存。用途：复盘「未知字段膨胀」类问题（如 208KB thinking 签名），
+    /// serde 解析后的视图恰好会丢掉这类字段，必须存线上原始字节。
+    #[serde(default)]
+    pub store_request_bodies: bool,
+
     /// 请求用量日志（usage_log.*.jsonl + 聚合桶）保留天数（默认 31）。
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
@@ -414,6 +421,7 @@ impl Default for Config {
             default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
+            store_request_bodies: false,
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
             model_sync_enabled: false,

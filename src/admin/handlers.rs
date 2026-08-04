@@ -1509,6 +1509,35 @@ pub async fn list_traces(
     Json(serde_json::json!({ "records": enriched, "total": total }))
 }
 
+/// GET /api/admin/traces/{trace_id}/request-body
+/// 读回该请求的原始入站请求体（storeRequestBodies=true 时才有数据）。
+/// 404：未启用 / 已过保留期 / trace_id 不存在。
+pub async fn get_trace_request_body(
+    State(state): State<AdminState>,
+    axum::extract::Path(trace_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let Some(store) = &state.request_body_store else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "request body retention not enabled (storeRequestBodies)"})),
+        )
+            .into_response();
+    };
+    match store.load(&trace_id) {
+        Some(body) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "request body not found (expired or unknown trace_id)"})),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /api/admin/traces/failure-stats
 /// 按凭据聚合失败次数（鉴权 / 账号风控 / 其他三类），用于卡片分色展示。
 /// 返回 { "<credentialId>": { auth, throttle, other }, ... }

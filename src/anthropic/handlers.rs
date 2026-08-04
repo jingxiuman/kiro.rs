@@ -182,6 +182,25 @@ fn session_id_of(payload: &super::types::MessagesRequest) -> Option<String> {
         .and_then(super::metadata::extract_session_id)
 }
 
+/// 把入站原始请求体按 trace_id 落盘（storeRequestBodies 启用时）。
+/// gzip + fs 走 spawn_blocking，不占请求路径；失败仅告警。
+fn persist_request_body(
+    state: &AppState,
+    tracer: &RequestTracer,
+    raw_body: &Option<Extension<super::middleware::RawRequestBody>>,
+) {
+    let (Some(store), Some(Extension(raw))) = (&state.request_body_store, raw_body) else {
+        return;
+    };
+    if !store.is_enabled() {
+        return;
+    }
+    let store = store.clone();
+    let trace_id = tracer.trace_id.clone();
+    let bytes = raw.0.clone();
+    tokio::task::spawn_blocking(move || store.save(&trace_id, &bytes));
+}
+
 impl RequestTracer {
     fn new(state: &AppState, options: RequestTraceOptions) -> Self {
         Self {
@@ -812,6 +831,7 @@ fn validate_max_tokens(max_tokens: i32) -> Result<(), ErrorResponse> {
 pub async fn post_messages(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    raw_body: Option<Extension<super::middleware::RawRequestBody>>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
@@ -972,6 +992,7 @@ pub async fn post_messages(
                 session_id: session_id_of(&payload),
             },
         ));
+        persist_request_body(&state, &tracer, &raw_body);
         handle_stream_request(
             provider,
             &request_body,
@@ -1001,6 +1022,7 @@ pub async fn post_messages(
                 session_id: session_id_of(&payload),
             },
         ));
+        persist_request_body(&state, &tracer, &raw_body);
         handle_non_stream_request(
             provider,
             &request_body,
@@ -1883,6 +1905,7 @@ pub async fn count_tokens(
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    raw_body: Option<Extension<super::middleware::RawRequestBody>>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -2030,6 +2053,7 @@ pub async fn post_messages_cc(
                 session_id: session_id_of(&payload),
             },
         ));
+        persist_request_body(&state, &tracer, &raw_body);
         handle_stream_request_buffered(
             provider,
             &request_body,
@@ -2059,6 +2083,7 @@ pub async fn post_messages_cc(
                 session_id: session_id_of(&payload),
             },
         ));
+        persist_request_body(&state, &tracer, &raw_body);
         handle_non_stream_request(
             provider,
             &request_body,

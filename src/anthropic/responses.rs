@@ -160,7 +160,7 @@ pub async fn post_responses(
     };
 
     // 2. 复用 Anthropic 全链路（内部强制非流式）
-    let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
+    let inner = post_messages(State(state), Extension(key_ctx), None, Json(anthropic_req)).await;
 
     let status = inner.status();
     let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {

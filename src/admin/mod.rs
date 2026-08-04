@@ -31,6 +31,7 @@ pub mod duck;
 pub mod balance_store;
 pub mod usage_store;
 pub mod usage_stats;
+pub mod request_body_store;
 pub mod trace_db;
 
 pub use client_keys::ClientKeyManager;

@@ -195,6 +195,19 @@ async fn main() {
     };
     token_manager.set_trace_store(trace_store.clone());
 
+    // 请求体全量保留存储（storeRequestBodies=true 时启用；保留期跟随 trace）
+    let request_body_store = Some(std::sync::Arc::new(
+        admin::request_body_store::RequestBodyStore::new(
+            cache_dir.join("request_bodies"),
+            config.store_request_bodies,
+            config.trace_retention_days as u64,
+        ),
+    ))
+    .filter(|s| s.is_enabled());
+    if request_body_store.is_some() {
+        tracing::info!("请求体全量保留已启用（request_bodies/，保留 {} 天）", config.trace_retention_days);
+    }
+
     // Ops 事件存储：trace 主库成功时用同一持久化文件；trace 降级到内存时 ops 也用内存，
     // 保证两者查询落在同一数据库视图。
     let ops_store = Arc::new(if trace_store.is_some() {
@@ -292,6 +305,7 @@ async fn main() {
         let trace_store = trace_store.clone();
         let ops_store = ops_store.clone();
         let balance_cleanup = balance_store.clone();
+        let body_cleanup = request_body_store.clone();
         tokio::spawn(async move {
             let day = std::time::Duration::from_secs(24 * 3600);
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -303,6 +317,9 @@ async fn main() {
                 }
                 if let Some(bs) = &balance_cleanup {
                     bs.cleanup();
+                }
+                if let Some(rb) = &body_cleanup {
+                    rb.cleanup();
                 }
                 tokio::time::sleep(day).await;
             }
@@ -442,6 +459,7 @@ async fn main() {
         Some(usage_store.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        request_body_store.clone(),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -483,6 +501,7 @@ async fn main() {
                 usage_store.clone(),
                 admin_trace_store,
                 group_manager.clone(),
+                request_body_store.clone(),
             );
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
