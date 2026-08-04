@@ -1,0 +1,41 @@
+src/anthropic/stream.rs
+  s_d274b2ff1bca34::t_9f860b77e68108 3200-3283
+  s_d274b2ff1bca34::t_353cc878d8551d 1080-1101,1144-1162
+  s_d274b2ff1bca34::t_f7f4af17614028 1102-1143
+src/anthropic/handlers.rs
+  s_d274b2ff1bca34::t_9e662272a355ad 207-214,273-276,298-299
+  s_d274b2ff1bca34::t_1a449c719051a1 2334-2353,2355-2357,2359-2361,2363-2368,2370-2384
+  s_d274b2ff1bca34::t_6ec3a5bb945e3b 3056
+  s_d274b2ff1bca34::t_8f5131cc731cab 138-139,201,205-206
+  s_d274b2ff1bca34::t_14d905f4ccb94c 1159-1160,1216-1217,1235,1262,2242,2276
+  s_d274b2ff1bca34::t_68f82194d4a7c6 2354,2358,2362,2369
+  s_d274b2ff1bca34::t_71a85a8bde55f5 3523
+  s_d274b2ff1bca34::t_29d32cc82cf4da 2333
+src/admin/duck.rs
+  s_d274b2ff1bca34::t_ee524e1cea5bd1 116-118
+src/kiro/token_manager.rs
+  s_d274b2ff1bca34::t_f61fc1267af25d 1459-1460
+src/admin/trace_db.rs
+  s_d274b2ff1bca34::t_801ce8c121bb8c 483-484,638,667-668
+  s_d274b2ff1bca34::t_8284616490fd1e 977-1033
+  s_d274b2ff1bca34::t_ee524e1cea5bd1 368,378-379,458-459
+  s_d274b2ff1bca34::t_64399822964660 194-201,931-932
+src/admin/handlers.rs
+  s_d274b2ff1bca34::t_1a4b096345896b 1499-1502
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "6eb25c883feda79cac2d908d2c4ae8ab5f6bfc54",
+  "prompts": {},
+  "sessions": {
+    "s_d274b2ff1bca34": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "416d48c4-1d14-470c-8eb0-979d31f52082",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
