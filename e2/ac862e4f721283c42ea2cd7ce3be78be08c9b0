@@ -1,0 +1,20 @@
+src/anthropic/converter.rs
+  s_d274b2ff1bca34::t_8654f3d7b93544 2265,2268-2269,2273-2276,2278-2281,2283-2285,2287-2289,2291-2293
+  s_d274b2ff1bca34::t_578e803912629b 2266-2267,2270-2272,2277,2282,2286,2290
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "e2ac862e4f721283c42ea2cd7ce3be78be08c9b0",
+  "prompts": {},
+  "sessions": {
+    "s_d274b2ff1bca34": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "416d48c4-1d14-470c-8eb0-979d31f52082",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
