@@ -1456,6 +1456,8 @@ impl MultiTokenManager {
             cache_read_tokens: 0,
             credits: 0.0,
             first_token_ms: None,
+            first_render_ms: None,
+            stream_shape: None,
             session_id: None,
             attempts: vec![TraceAttempt {
                 attempt: 0,

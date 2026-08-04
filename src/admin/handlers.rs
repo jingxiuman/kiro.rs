@@ -1496,6 +1496,10 @@ pub async fn list_traces(
                 "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
                 "credits": r.credits,
                 "firstTokenMs": r.first_token_ms,
+                // 首个可渲染帧时刻与流形态摘要（[{t,ms,b}]，形态不含内容）
+                "firstRenderMs": r.first_render_ms,
+                "streamShape": r.stream_shape.as_deref()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
                 "sessionId": r.session_id,
                 "attempts": attempts,
                 "phases": phases,

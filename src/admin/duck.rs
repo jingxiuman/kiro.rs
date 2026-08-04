@@ -113,7 +113,9 @@ CREATE TABLE IF NOT EXISTS traces (
     cache_read_tokens BIGINT NOT NULL DEFAULT 0,
     credits           DOUBLE NOT NULL DEFAULT 0,
     first_token_ms    BIGINT,
-    session_id        VARCHAR
+    session_id        VARCHAR,
+    first_render_ms   BIGINT,
+    stream_shape      VARCHAR
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);

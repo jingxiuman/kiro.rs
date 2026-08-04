@@ -191,6 +191,14 @@ pub struct TraceRecord {
     /// 或该列存在前的历史行。
     #[serde(default)]
     pub first_token_ms: Option<u64>,
+    /// 首个可渲染帧时刻（ms，相对请求开始）。区别于 first_token_ms（首个上游 chunk）：
+    /// 「流在推进」≠「客户端有东西可看」，长时间无可渲染帧正是用户感知的空等。
+    #[serde(default)]
+    pub first_render_ms: Option<u64>,
+    /// 流形态摘要 JSON：`[{"t":块类型,"ms":出现时刻,"b":内容字节}]`。
+    /// 只存形态不存内容。非流式或无块时为 None。
+    #[serde(default)]
+    pub stream_shape: Option<String>,
     /// Claude Code 会话 id（取自 metadata.user_id 的 `_session_<uuid>`）。
     /// 同一把客户端 Key 上区分不同会话/子代理；也用于观测 compact 是否更换 session。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -357,7 +365,7 @@ impl TraceStore {
         // 注意全部不带 NOT NULL：DuckDB 的 ALTER ADD COLUMN 不支持附加约束
         // （"Adding columns with constraints not yet supported"）；带 DEFAULT 的列
         // 老行会被填成默认值，key_source 以 NULL 添加后在下方回填。新插入永远写入合法值。
-        let columns: [(&str, &str); 9] = [
+        let columns: [(&str, &str); 11] = [
             ("input_tokens", "BIGINT DEFAULT 0"),
             ("output_tokens", "BIGINT DEFAULT 0"),
             ("cache_creation_tokens", "BIGINT DEFAULT 0"),
@@ -367,6 +375,8 @@ impl TraceStore {
             ("key_source", "VARCHAR"),
             ("session_id", "VARCHAR"),
             ("operation", "VARCHAR DEFAULT 'inference'"),
+            ("first_render_ms", "BIGINT"),
+            ("stream_shape", "VARCHAR"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -445,8 +455,8 @@ impl TraceStore {
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
-                 credits, first_token_ms, session_id) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+                 credits, first_token_ms, session_id, first_render_ms, stream_shape) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
                 duckdb::params![
                     rec.trace_id,
                     rec.ts,
@@ -470,6 +480,8 @@ impl TraceStore {
                     rec.credits,
                     rec.first_token_ms.map(|v| v as i64),
                     rec.session_id,
+                    rec.first_render_ms.map(|v| v as i64),
+                    rec.stream_shape,
                 ],
             )?;
             for a in &rec.attempts {
@@ -623,7 +635,7 @@ impl TraceStore {
             "SELECT trace_id, ts, key_id, key_source, operation, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
-             session_id \
+             session_id, first_render_ms, stream_shape \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -652,6 +664,8 @@ impl TraceStore {
                 credits: row.get::<_, f64>(18)?,
                 first_token_ms: row.get::<_, Option<i64>>(19)?.map(|v| v as u64),
                 session_id: row.get::<_, Option<String>>(20)?,
+                first_render_ms: row.get::<_, Option<i64>>(21)?.map(|v| v as u64),
+                stream_shape: row.get::<_, Option<String>>(22)?,
                 attempts: Vec::new(),
                 phases: Vec::new(),
             })
@@ -914,6 +928,8 @@ mod tests {
             cache_read_tokens: 101760,
             credits: 0.0,
             first_token_ms: None,
+            first_render_ms: None,
+            stream_shape: None,
             session_id: Some("sess-test".to_string()),
             attempts: vec![
                 TraceAttempt {
@@ -956,6 +972,63 @@ mod tests {
             enabled: AtomicBool::new(true),
             retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
         }
+    }
+
+    #[test]
+    fn stream_shape_and_first_render_roundtrip() {
+        // 流形态摘要与首个可渲染帧时刻必须持久化：它们是事件语义层唯一的观测
+        // （块顺序颠倒、长时间无可渲染帧在传输层指标里不可见）。
+        let store = mem_store();
+        let mut rec = sample(TraceSample {
+            trace_id: "t-shape",
+            status: "success",
+            credential_id: 5,
+            model: "claude-opus-5",
+        });
+        rec.first_render_ms = Some(8350);
+        rec.stream_shape =
+            Some(r#"[{"t":"thinking","ms":8300,"b":615},{"t":"tool_use","ms":8350,"b":56}]"#.to_string());
+        store.insert(&rec);
+
+        let out = store.query(&TraceQuery { limit: 10, ..Default::default() });
+        let got = out.iter().find(|r| r.trace_id == "t-shape").unwrap();
+        assert_eq!(got.first_render_ms, Some(8350));
+        assert_eq!(got.stream_shape.as_deref(), Some(r#"[{"t":"thinking","ms":8300,"b":615},{"t":"tool_use","ms":8350,"b":56}]"#));
+    }
+
+    /// 老库（无 stream_shape / first_render_ms 列）迁移后可读写，历史行为 None。
+    #[test]
+    fn migrate_adds_stream_shape_columns_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE traces (
+                trace_id TEXT PRIMARY KEY, ts TEXT NOT NULL, ts_epoch INTEGER NOT NULL,
+                key_id INTEGER NOT NULL, model TEXT NOT NULL, is_stream INTEGER NOT NULL,
+                final_status TEXT NOT NULL, final_credential_id INTEGER NOT NULL,
+                error_type TEXT, error_message TEXT, total_attempts INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL, interrupted_after_bytes INTEGER);
+             CREATE TABLE trace_attempts (
+                trace_id TEXT NOT NULL, attempt INTEGER NOT NULL, credential_id INTEGER NOT NULL,
+                endpoint TEXT NOT NULL, http_status INTEGER, outcome TEXT NOT NULL,
+                error_snippet TEXT, duration_ms INTEGER NOT NULL,
+                PRIMARY KEY (trace_id, attempt));
+             INSERT INTO traces VALUES
+                ('t-old-shape','2026-07-30T00:00:00Z',1785369600,0,'m1',1,'success',5,NULL,NULL,1,700,NULL);",
+        )
+        .unwrap();
+        TraceStore::migrate(&conn).unwrap();
+        TraceStore::migrate(&conn).unwrap(); // 幂等
+        conn.execute_batch(SCHEMA).unwrap();
+
+        let store = TraceStore {
+            conn: Mutex::new(conn),
+            enabled: AtomicBool::new(true),
+            retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
+        };
+        let out = store.query(&TraceQuery { limit: 10, ..Default::default() });
+        let old = out.iter().find(|r| r.trace_id == "t-old-shape").unwrap();
+        assert_eq!(old.stream_shape, None, "历史行无形态数据，必须是 None");
+        assert_eq!(old.first_render_ms, None);
     }
 
     #[test]

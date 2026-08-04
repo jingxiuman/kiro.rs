@@ -1077,6 +1077,89 @@ pub struct SseEvent {
     pub data: serde_json::Value,
 }
 
+/// 流形态摘要：观察发给客户端的 SseEvent 序列，产出每块的
+/// `{t: 块类型, ms: 出现时刻(相对请求开始), b: 内容字节}` 与首个可渲染帧时刻。
+///
+/// 动机（reports/2026-08-03-thinking-visibility）：现有 trace 只有传输层指标
+/// （耗时/状态码/字节数），看不见事件语义层——「流在推进」和「客户端有东西可看」
+/// 是两件事，块顺序颠倒、长时间无可渲染帧这类缺陷在 trace 里完全不可见。
+/// 本结构不存任何内容，只存形态（类型/时刻/字节数），无隐私暴露。
+#[derive(Debug, Default)]
+pub struct StreamShape {
+    /// (块 index, 类型, 出现时刻 ms, 内容字节数)。按出现顺序排列。
+    entries: Vec<(i64, String, u64, u64)>,
+    /// 首个可渲染事件时刻：非空 thinking/text delta，或 tool_use /
+    /// redacted_thinking 块开始。message_start / ping / signature_delta 不算。
+    first_render_ms: Option<u64>,
+}
+
+/// 形态摘要最多记录的块数。超过后只累计已有块的字节，不再新增条目——
+/// 防御性上限，正常响应远小于此。
+const STREAM_SHAPE_MAX_BLOCKS: usize = 64;
+
+impl StreamShape {
+    /// 观察一批即将下发给客户端的事件。`elapsed_ms` 为相对请求开始的时刻。
+    pub fn observe(&mut self, events: &[SseEvent], elapsed_ms: u64) {
+        for e in events {
+            match e.event.as_str() {
+                "content_block_start" => {
+                    let idx = e.data["index"].as_i64().unwrap_or(-1);
+                    let block_type = e.data["content_block"]["type"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_string();
+                    // 工具卡片 / redacted 块一出现即可渲染；thinking / text 的
+                    // start 本身无内容，等首个非空 delta。
+                    if matches!(block_type.as_str(), "tool_use" | "redacted_thinking")
+                        && self.first_render_ms.is_none()
+                    {
+                        self.first_render_ms = Some(elapsed_ms);
+                    }
+                    if self.entries.len() < STREAM_SHAPE_MAX_BLOCKS {
+                        self.entries.push((idx, block_type, elapsed_ms, 0));
+                    }
+                }
+                "content_block_delta" => {
+                    let delta = &e.data["delta"];
+                    let payload_len = match delta["type"].as_str() {
+                        Some("text_delta") => delta["text"].as_str().map(str::len),
+                        Some("thinking_delta") => delta["thinking"].as_str().map(str::len),
+                        Some("input_json_delta") => delta["partial_json"].as_str().map(str::len),
+                        // signature_delta / 其它：非内容，不计入
+                        _ => None,
+                    };
+                    let Some(len) = payload_len else { continue };
+                    if len > 0 && self.first_render_ms.is_none() {
+                        self.first_render_ms = Some(elapsed_ms);
+                    }
+                    let idx = e.data["index"].as_i64().unwrap_or(-1);
+                    if let Some(entry) = self.entries.iter_mut().rev().find(|(i, ..)| *i == idx) {
+                        entry.3 += len as u64;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn first_render_ms(&self) -> Option<u64> {
+        self.first_render_ms
+    }
+
+    /// 序列化为紧凑 JSON（无块时返回 None，trace 列留 NULL）。
+    pub fn to_json(&self) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let arr: Vec<serde_json::Value> = self
+            .entries
+            .iter()
+            .map(|(_, t, ms, b)| json!({"t": t, "ms": ms, "b": b}))
+            .collect();
+        serde_json::to_string(&arr).ok()
+    }
+}
+
 impl SseEvent {
     pub fn new(event: impl Into<String>, data: serde_json::Value) -> Self {
         Self {
@@ -3112,6 +3195,90 @@ mod tests {
             }),
             "should emit text_delta after restarting text block"
         );
+    }
+
+    fn shape_ev(event: &str, data: serde_json::Value) -> SseEvent {
+        SseEvent::new(event, data)
+    }
+
+    #[test]
+    fn stream_shape_records_block_sequence_bytes_and_first_render() {
+        let mut shape = StreamShape::default();
+        // message_start / ping 不是可渲染帧
+        shape.observe(
+            &[shape_ev("message_start", json!({"type":"message_start"}))],
+            100,
+        );
+        assert_eq!(shape.first_render_ms(), None, "message_start 不算可渲染");
+
+        // thinking 块开始（start 本身无内容，不算可渲染）；首个非空 delta 才算
+        shape.observe(
+            &[shape_ev(
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"thinking","thinking":""}}),
+            )],
+            8300,
+        );
+        assert_eq!(shape.first_render_ms(), None, "空 thinking 块开始不算可渲染");
+        shape.observe(
+            &[
+                shape_ev(
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"thinking_delta","thinking":"思考中"}}),
+                ),
+                shape_ev(
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"signature_delta","signature":"kiro-rs-thinking-signature"}}),
+                ),
+            ],
+            8350,
+        );
+        assert_eq!(shape.first_render_ms(), Some(8350), "首个非空 thinking_delta 即可渲染");
+
+        // tool_use 块开始即可渲染（工具卡片）；input_json_delta 计入其字节
+        shape.observe(
+            &[
+                shape_ev(
+                    "content_block_start",
+                    json!({"index":1,"content_block":{"type":"tool_use","id":"t1","name":"Read","input":{}}}),
+                ),
+                shape_ev(
+                    "content_block_delta",
+                    json!({"index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/a\"}"}}),
+                ),
+            ],
+            9000,
+        );
+
+        let json_str = shape.to_json().expect("有块时应产出 JSON");
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["t"], "thinking");
+        assert_eq!(arr[0]["ms"], 8300);
+        assert_eq!(arr[0]["b"], "思考中".len() as u64, "签名不计入内容字节");
+        assert_eq!(arr[1]["t"], "tool_use");
+        assert_eq!(arr[1]["ms"], 9000);
+        assert_eq!(arr[1]["b"], "{\"path\":\"/a\"}".len() as u64);
+    }
+
+    #[test]
+    fn stream_shape_empty_stream_yields_none() {
+        let shape = StreamShape::default();
+        assert_eq!(shape.to_json(), None, "无块时列留 NULL 而非空数组");
+        assert_eq!(shape.first_render_ms(), None);
+    }
+
+    #[test]
+    fn stream_shape_tool_use_start_sets_first_render() {
+        let mut shape = StreamShape::default();
+        shape.observe(
+            &[shape_ev(
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"tool_use","id":"t1","name":"Bash","input":{}}}),
+            )],
+            712_000,
+        );
+        assert_eq!(shape.first_render_ms(), Some(712_000));
     }
 
     #[test]

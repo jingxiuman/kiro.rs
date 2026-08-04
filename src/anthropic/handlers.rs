@@ -135,6 +135,8 @@ pub(crate) struct RequestTracer {
     phases: parking_lot::Mutex<Vec<TracePhase>>,
     /// 当前打开的段：(段名, 起点)
     open_phase: parking_lot::Mutex<Option<(&'static str, Instant)>>,
+    /// 流形态摘要：观察发给客户端的事件序列（类型/时刻/字节，不存内容）
+    shape: parking_lot::Mutex<super::stream::StreamShape>,
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -196,7 +198,18 @@ impl RequestTracer {
             attempts: parking_lot::Mutex::new(Vec::new()),
             phases: parking_lot::Mutex::new(Vec::new()),
             open_phase: parking_lot::Mutex::new(None),
+            shape: parking_lot::Mutex::new(super::stream::StreamShape::default()),
         }
+    }
+
+    /// 观察一批即将下发给客户端的 SSE 事件，累积流形态摘要。
+    /// 必须在事件转字节的唯一出口调用，保证形态与客户端所见一致。
+    pub fn observe_events(&self, events: &[super::stream::SseEvent]) {
+        if self.store.is_none() || events.is_empty() {
+            return;
+        }
+        let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
+        self.shape.lock().observe(events, elapsed_ms);
     }
 
     /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
@@ -257,6 +270,10 @@ impl RequestTracer {
             .first_token_at
             .lock()
             .map(|t| t.duration_since(self.started_at).as_millis() as u64);
+        let (first_render_ms, stream_shape) = {
+            let shape = self.shape.lock();
+            (shape.first_render_ms(), shape.to_json())
+        };
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
@@ -278,6 +295,8 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
+            first_render_ms,
+            stream_shape,
             session_id: self.session_id.clone(),
             attempts,
             phases,
@@ -1137,7 +1156,8 @@ fn create_sse_stream(
     tracer: std::sync::Arc<RequestTracer>,
     ops_feedback: Option<StreamOpsFeedback>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    // 先发送初始事件
+    // 先发送初始事件（同时喂形态摘要——观察必须发生在对应 finalize 之前）
+    tracer.observe_events(&initial_events);
     let initial_stream = stream::iter(
         initial_events
             .into_iter()
@@ -1193,7 +1213,8 @@ fn create_sse_stream(
                                 }
                             }
 
-                            // 转换为 SSE 字节流
+                            // 转换为 SSE 字节流（先喂形态摘要）
+                            tracer.observe_events(&events);
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1211,6 +1232,7 @@ fn create_sse_stream(
                             }
                             // 发送最终事件并结束（记为 error）
                             let final_events = ctx.generate_final_events();
+                            tracer.observe_events(&final_events);
                             record_stream_usage(&hook, &ctx, credential_id, "error");
                             // 连接已建立后断流 = 传输链路失败，计入所用代理
                             report_stream_outcome(&ops_feedback, true, &detail);
@@ -1237,6 +1259,7 @@ fn create_sse_stream(
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
+                            tracer.observe_events(&final_events);
                             phase_on_finish(
                                 &tracer,
                                 sent_bytes,
@@ -2216,6 +2239,7 @@ fn create_buffered_sse_stream(
                                 }
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
+                                tracer.observe_events(&all_events);
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, (cc, cr), credits, "error");
                                 report_stream_outcome(&ops_feedback, true, &detail);
@@ -2249,6 +2273,7 @@ fn create_buffered_sse_stream(
                                 // finish_and_get_all_events 内部会 finish() 累积器；若有半截 /
                                 // 非法工具调用 JSON，error 事件已随缓冲发出，这里据此记 error。
                                 let all_events = ctx.finish_and_get_all_events();
+                                tracer.observe_events(&all_events);
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 let trace_usage = TraceUsage {
                                     input_tokens: i.max(0) as u64,
@@ -2304,6 +2329,58 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracer_observe_events_persists_stream_shape_and_first_render() {
+        // 形态摘要必须经 observe_events → finalize 落到 trace 行；
+        // 这是事件语义层唯一的服务端观测点。
+        let store = std::sync::Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().unwrap(),
+        );
+        let tracer = RequestTracer {
+            store: Some(store.clone()),
+            trace_id: "t-shape-int".to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 1,
+            key_source: TraceKeySource::ClientKey,
+            model: "claude-opus-5".to_string(),
+            is_stream: true,
+            session_id: None,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+            phases: parking_lot::Mutex::new(Vec::new()),
+            open_phase: parking_lot::Mutex::new(None),
+            shape: parking_lot::Mutex::new(crate::anthropic::stream::StreamShape::default()),
+        };
+
+        tracer.observe_events(&[
+            crate::anthropic::stream::SseEvent::new(
+                "content_block_start",
+                serde_json::json!({"index":0,"content_block":{"type":"thinking","thinking":""}}),
+            ),
+            crate::anthropic::stream::SseEvent::new(
+                "content_block_delta",
+                serde_json::json!({"index":0,"delta":{"type":"thinking_delta","thinking":"abc"}}),
+            ),
+        ]);
+        tracer.finalize("success", None, None, None, TraceUsage::zero());
+
+        let (out, _) = store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        let rec = out
+            .iter()
+            .find(|r| r.trace_id == "t-shape-int")
+            .expect("trace 行应已落库");
+        let shape = rec.stream_shape.as_deref().expect("形态摘要应已持久化");
+        assert!(shape.contains("\"t\":\"thinking\""), "形态应含 thinking 块: {shape}");
+        assert!(
+            rec.first_render_ms.is_some(),
+            "非空 thinking_delta 应记为首个可渲染帧"
+        );
+    }
 
     #[test]
     fn bedrock_client_validation_errors_map_to_400() {
@@ -2976,6 +3053,7 @@ mod tracer_tests {
             attempts: parking_lot::Mutex::new(Vec::new()),
             phases: parking_lot::Mutex::new(Vec::new()),
             open_phase: parking_lot::Mutex::new(None),
+            shape: parking_lot::Mutex::new(crate::anthropic::stream::StreamShape::default()),
         }
     }
 
@@ -3442,6 +3520,7 @@ mod tracer_tests {
             attempts: parking_lot::Mutex::new(Vec::new()),
             phases: parking_lot::Mutex::new(Vec::new()),
             open_phase: parking_lot::Mutex::new(None),
+            shape: parking_lot::Mutex::new(crate::anthropic::stream::StreamShape::default()),
         });
         // 与真实调用点保持一致：guard 构造前先手动打开 FIRST_TOKEN，
         // 首个 chunk 到达时再由 guard.mark_first_chunk() 切到 STREAMING
