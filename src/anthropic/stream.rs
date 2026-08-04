@@ -1375,8 +1375,6 @@ pub struct StreamContext {
     pub thinking_extracted: bool,
     /// thinking 块索引
     pub thinking_block_index: Option<i32>,
-    /// 上游原生 reasoningContentEvent 下发的 thinking 签名
-    pending_thinking_signature: Option<String>,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
     /// 是否需要剥离 thinking 内容开头的换行符
@@ -1452,7 +1450,6 @@ impl StreamContext {
             in_thinking_block: false,
             thinking_extracted: false,
             thinking_block_index: None,
-            pending_thinking_signature: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
@@ -2098,13 +2095,9 @@ impl StreamContext {
             return Vec::new();
         }
 
-        let signature = self
-            .pending_thinking_signature
-            .take()
-            .unwrap_or_else(|| THINKING_SIGNATURE_PLACEHOLDER.to_string());
         let mut events = vec![
             self.create_thinking_delta_event(idx, ""),
-            self.create_signature_delta_event_with(idx, &signature),
+            self.create_signature_delta_event(idx),
         ];
         if let Some(stop_event) = self.state_manager.handle_content_block_stop(idx) {
             events.push(stop_event);
@@ -2128,11 +2121,11 @@ impl StreamContext {
 
         let mut events = Vec::new();
 
-        if let Some(signature) = reasoning.signature.as_deref()
-            && !signature.is_empty()
-        {
-            self.pending_thinking_signature = Some(signature.to_string());
-        }
+        // 上游真签名有意不透传（reasoning.signature 直接忽略）：
+        // 客户端回传时 ContentBlock 无 signature 字段、serde 静默丢弃，converter 也不读，
+        // 它从不回到上游。而 Bedrock 真签名可达 208KB（为 thinking 正文的 5-18 倍），
+        // 会随 assistant 历史每轮重传，实测把单次请求体推到 2.9MB（签名占 45%）。
+        // 统一发占位符：客户端本地非空校验照过，历史零膨胀。
 
         if let Some(text) = reasoning.text.as_deref()
             && !text.is_empty()
@@ -4589,11 +4582,22 @@ mod tests {
 
         assert_eq!(collect_thinking_content(&all_events), "native reasoning");
         assert_eq!(collect_text_content(&all_events), "final answer");
+        // 上游真签名不透传：客户端回传时 serde 会静默丢弃 signature、converter 也不读，
+        // 真签名（实测最大 208KB，为正文 5-18 倍）只会膨胀客户端历史与每轮请求体。
+        // 统一下发占位符，客户端本地非空校验照过。
         assert!(all_events.iter().any(|e| {
             e.event == "content_block_delta"
                 && e.data["delta"]["type"] == "signature_delta"
-                && e.data["delta"]["signature"] == "real-signature"
+                && e.data["delta"]["signature"] == THINKING_SIGNATURE_PLACEHOLDER
         }));
+        assert!(
+            !all_events.iter().any(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "signature_delta"
+                    && e.data["delta"]["signature"] == "real-signature"
+            }),
+            "上游真签名不应透传给客户端"
+        );
     }
 
     #[test]
@@ -4618,10 +4622,11 @@ mod tests {
         all_events.extend(ctx.generate_final_events());
 
         assert_eq!(collect_thinking_content(&all_events), "delayed native reasoning");
+        // 先到的签名不影响块归属；签名本身统一为占位符（真签名不透传）。
         assert!(all_events.iter().any(|e| {
             e.event == "content_block_delta"
                 && e.data["delta"]["type"] == "signature_delta"
-                && e.data["delta"]["signature"] == "signature-before-text"
+                && e.data["delta"]["signature"] == THINKING_SIGNATURE_PLACEHOLDER
         }));
     }
 

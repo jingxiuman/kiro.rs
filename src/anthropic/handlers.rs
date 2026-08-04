@@ -1105,7 +1105,6 @@ async fn handle_non_stream_request(
 
     let mut text_content = String::new();
     let mut native_thinking = String::new();
-    let mut native_thinking_signature: Option<String> = None;
     let mut native_redacted_thinking: Vec<String> = Vec::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
@@ -1138,11 +1137,6 @@ async fn handle_non_stream_request(
                                 && !text.is_empty()
                             {
                                 native_thinking.push_str(&text);
-                            }
-                            if let Some(signature) = reasoning.signature
-                                && !signature.is_empty()
-                            {
-                                native_thinking_signature = Some(signature);
                             }
                             if let Some(redacted) = reasoning.redacted_content
                                 && !redacted.is_empty()
@@ -1247,7 +1241,6 @@ async fn handle_non_stream_request(
         thinking_enabled,
         text_content,
         native_thinking,
-        native_thinking_signature,
         native_redacted_thinking,
     );
     content.extend(tool_uses);
@@ -1319,7 +1312,6 @@ fn build_non_stream_content(
     thinking_enabled: bool,
     text_content: String,
     native_thinking: String,
-    native_thinking_signature: Option<String>,
     native_redacted_thinking: Vec<String>,
 ) -> Vec<serde_json::Value> {
     let mut content = Vec::new();
@@ -1330,8 +1322,8 @@ fn build_non_stream_content(
             content.push(json!({
                 "type": "thinking",
                 "thinking": native_thinking.clone(),
-                "signature": native_thinking_signature
-                    .unwrap_or_else(|| super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()),
+                // 真签名不透传（与流式路径一致）：回传即被 serde 丢弃，只膨胀历史。
+                "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
             }));
         } else {
             // 从完整文本中提取 thinking 块，兼容旧的 <thinking> 文本路径。
@@ -1941,14 +1933,17 @@ mod tests {
             true,
             "final answer".to_string(),
             "native thinking".to_string(),
-            Some("real-signature".to_string()),
             vec!["encrypted-thinking".to_string()],
         );
 
         assert_eq!(content.len(), 3);
         assert_eq!(content[0]["type"], "thinking");
         assert_eq!(content[0]["thinking"], "native thinking");
-        assert_eq!(content[0]["signature"], "real-signature");
+        // 真签名不透传（与流式路径一致）：回传即被 serde 丢弃，只膨胀历史。
+        assert_eq!(
+            content[0]["signature"],
+            crate::anthropic::stream::THINKING_SIGNATURE_PLACEHOLDER
+        );
         assert_eq!(content[1]["type"], "redacted_thinking");
         assert_eq!(content[1]["data"], "encrypted-thinking");
         assert_eq!(content[2]["type"], "text");
@@ -1961,7 +1956,6 @@ mod tests {
             true,
             "<thinking>legacy thinking</thinking>\n\nfinal answer".to_string(),
             String::new(),
-            None,
             Vec::new(),
         );
 
@@ -1982,7 +1976,6 @@ mod tests {
             false,
             String::new(),
             "native thinking fallback".to_string(),
-            Some("ignored-signature".to_string()),
             vec!["ignored-redacted".to_string()],
         );
 
