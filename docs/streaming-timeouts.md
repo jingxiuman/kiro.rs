@@ -13,6 +13,14 @@
 在旧的 720 秒总超时下距硬顶仅 8 秒;撞上去的后果是客户端等了十分钟、输入 token
 成本全部烧掉,最后拿到一个 timeout 错误。这是最贵的失败形态。
 
+> **2026-08-04 更正**：这条 712s 请求后来被证实**不是健康的慢流**——那 700+KB
+> 里大头是 208KB 的 Bedrock thinking 签名以大量小 `signature_delta` 帧下发,
+> 每帧都重置 read_timeout,传输层看着健康,但客户端整整 712 秒没有一个可渲染的块。
+> 「流在推进」和「客户端有东西可看」是两件事,本文的三层活性保障全部只测前者。
+> 换 read_timeout 的结论本身仍然成立,但当时把它当「成功请求」是误判。
+> 根因(签名透传)已在 0.9.5 修复,事件语义层观测(`first_render_ms`)已在 0.9.6
+> 补上,全案见 docs/thinking-pipeline.md。
+
 `read_timeout()` 才是流式该用的:它按**每次读取**计时,每收到一个数据帧即重置
 (reqwest 0.12 `async_impl/body.rs` 的 `ReadTimeoutBody::poll_frame`,注释写着
 `// a ready frame means timeout is reset`)。
