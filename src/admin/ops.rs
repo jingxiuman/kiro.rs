@@ -529,8 +529,10 @@ pub struct OpsTrendPoint {
     /// 本字段按 `traces.error_type` 列分组，而实测 `error_type` 同时存在于
     /// `final_status = 'error'`（`transient` / `network_error` / `unknown` /
     /// `bad_request` / `upstream_truncated`）和 `final_status = 'interrupted'`
-    /// （`stream_interrupted` / `client_disconnected`）两类状态上。
-    /// 所以本字段之和 ≈ `error + interrupted`，而不是 `error`。
+    /// （`stream_interrupted` / `client_disconnected`）两类状态上；
+    /// `dead_air`（假活流）还挂在 `final_status = 'success'` 上——流正常收尾，
+    /// 病的是事件语义层，所以它同时计入 `success` 与本字段。
+    /// 所以本字段之和 ≈ `error + interrupted (+ dead_air)`，而不是 `error`。
     /// 前端若拿本字段与 `error` 对账必然对不上，这不是 bug。
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub by_error_type: std::collections::HashMap<String, u64>,
@@ -1797,6 +1799,37 @@ mod tests {
                 duckdb::params![trace_id, seq as i64, phase, outcome],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn dead_air_on_success_traces_appears_in_classification_and_trend() {
+        // 假活流的接入契约：final_status 仍为 success、只带 error_type =
+        // 'dead_air' 的行，必须被错误分类与趋势拾取（两处查询都只看
+        // error_type IS NOT NULL，不筛 final_status），同时不得污染
+        // error = total - success - interrupted 的口径。
+        let store = mem_store_with_traces();
+        insert_trace(&store, "t-da", 60, "success", Some("dead_air"), 1, 45_000);
+        insert_trace(&store, "t-ok", 60, "success", None, 1, 1_000);
+
+        let ov = store.overview(1);
+        assert_eq!(ov.error, 0, "假活流最终 success，不得计入 error");
+        assert_eq!(ov.success, 2);
+        assert!(
+            ov.by_error_type
+                .iter()
+                .any(|c| c.error_type == "dead_air" && c.count == 1),
+            "错误分类应含 dead_air: {:?}",
+            ov.by_error_type
+        );
+
+        let trend = store.error_trend(1);
+        let dead: u64 = trend
+            .iter()
+            .filter_map(|p| p.by_error_type.get("dead_air"))
+            .sum();
+        assert_eq!(dead, 1, "趋势 by_error_type 应含 dead_air");
+        let success: u64 = trend.iter().map(|p| p.success).sum();
+        assert_eq!(success, 2, "success 计数不受 error_type 标注影响");
     }
 
     #[test]

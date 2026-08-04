@@ -63,6 +63,7 @@ const ERROR_TYPE_LABELS: Record<string, string> = {
   stream_interrupted: '流中断',
   upstream_truncated: '上游截断',
   upstream_invalid: '上游非法JSON',
+  dead_air: '假活流',
   unknown: '未知',
 }
 

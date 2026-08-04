@@ -242,6 +242,12 @@ pub mod outcome {
     pub const UPSTREAM_INVALID: &str = "upstream_invalid";
     /// 仅用作 phase.outcome：客户端主动断开（非上游故障，不计入代理健康）
     pub const CLIENT_DISCONNECTED: &str = "client_disconnected";
+    /// 仅用作 record.error_type：假活流（dead-air）——上游持续发 chunk（首字节
+    /// 已到），但首个客户端可渲染帧滞后超阈值，含直到流结束都没有任何可渲染帧
+    /// 的极端形。**唯一一个可挂在 `final_status = 'success'` 行上的分类**：
+    /// 流本身正常收尾，病的是事件语义层。判定在 `RequestTracer::finalize`
+    /// （见 handlers.rs 的 `DEAD_AIR_THRESHOLD_MS`）。
+    pub const DEAD_AIR: &str = "dead_air";
 }
 
 /// 把上游错误体截断到安全长度（按字符边界，避免切碎 UTF-8）

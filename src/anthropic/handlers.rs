@@ -334,6 +334,18 @@ impl RequestTracer {
             let shape = self.shape.lock();
             (shape.first_render_ms(), shape.to_json())
         };
+        let duration_ms = self.started_at.elapsed().as_millis() as u64;
+        // 假活流（dead-air）分类：见 [`classify_dead_air`]。只在没有更高优先级
+        // 分类时补记——已有 error_type 说明主因是别的故障（断流/截断/断连），
+        // 主因决定处置动作，假活细节仍可从 stream_shape 追溯。
+        // 纯计算、不新增任何可失败路径，落库失败与既有逻辑一样仅 warn。
+        let dead_air = (error_type.is_none() && self.is_stream)
+            .then(|| classify_dead_air(first_token_ms, first_render_ms, duration_ms))
+            .flatten();
+        let (error_type, error_message) = match dead_air {
+            Some(msg) => (Some(outcome::DEAD_AIR), Some(msg)),
+            None => (error_type, error_message.map(str::to_string)),
+        };
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
@@ -345,9 +357,9 @@ impl RequestTracer {
             final_status: final_status.to_string(),
             final_credential_id,
             error_type: error_type.map(|s| s.to_string()),
-            error_message: error_message.map(|s| s.to_string()),
+            error_message,
             total_attempts: attempts.len() as u32,
-            duration_ms: self.started_at.elapsed().as_millis() as u64,
+            duration_ms,
             interrupted_after_bytes,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
@@ -390,6 +402,45 @@ impl RequestTracer {
             TraceUsage::zero(),
         );
     }
+}
+
+/// 假活流（dead-air）判定阈值：首个上游 chunk（first_token）到首个客户端
+/// 可渲染帧（first_render）之间允许的最大间隔。
+///
+/// 依据：健康流实测 first_render ≈ first_token + 1ms（首个 chunk 里就带内容
+/// delta）；病态案例是 712 秒无任何可渲染帧的假活。两者相差五个数量级，
+/// 30 秒落在这条鸿沟中间——正常抖动（秒级以内）远够不着，真假活（分钟级）
+/// 必被命中。刻意用常量而非配置项：没有任何已知场景需要把它调到别处，
+/// 加配置只会稀释「超过它一定有病」这个判据的确定性。
+const DEAD_AIR_THRESHOLD_MS: u64 = 30_000;
+
+/// 假活流判定：流已开始（首字节已到）却长时间没有任何可渲染帧。
+/// 命中时返回描述消息（作 error_message，进 ops 错误指纹），否则 None。
+///
+/// 两种形态共用同一判据：
+/// - 首帧迟到：`first_render - first_token > 阈值`；
+/// - 从未渲染（次要形态，做进来的理由）：`first_render` 为 None 时以流结束
+///   时刻（`duration_ms`）代替——它是同一病灶的极端形（712s 病态案例若在
+///   渲染前中止即属此类），漏掉它等于假活越严重反而越不可见。
+///
+/// `first_token` 为 None（一个字节都没来）不判：那类故障由既有
+/// error/interrupted 分类负责，这里量的是「活着却不出活」。
+fn classify_dead_air(
+    first_token_ms: Option<u64>,
+    first_render_ms: Option<u64>,
+    duration_ms: u64,
+) -> Option<String> {
+    let first_token = first_token_ms?;
+    let gap = first_render_ms
+        .unwrap_or(duration_ms)
+        .saturating_sub(first_token);
+    if gap <= DEAD_AIR_THRESHOLD_MS {
+        return None;
+    }
+    Some(match first_render_ms {
+        Some(_) => format!("假活流: 首个可渲染帧滞后首字节 {gap}ms"),
+        None => format!("假活流: 流结束仍无可渲染帧(首字节后 {gap}ms)"),
+    })
 }
 
 impl TraceSink for RequestTracer {
@@ -2554,6 +2605,170 @@ mod tests {
         assert!(
             rec.first_render_ms.is_some(),
             "非空 thinking_delta 应记为首个可渲染帧"
+        );
+    }
+
+    /// 构造可控时钟的 tracer：`started_secs_ago` 把请求起点拨到过去，
+    /// 让 finalize 的 duration / first_render（observe 用真实 now 计算 elapsed）
+    /// 落在假活阈值两侧，而不用真的 sleep。
+    fn tracer_with_clock(
+        store: std::sync::Arc<crate::admin::trace_db::TraceStore>,
+        trace_id: &str,
+        started_secs_ago: u64,
+        is_stream: bool,
+    ) -> RequestTracer {
+        RequestTracer {
+            store: Some(store),
+            trace_id: trace_id.to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 1,
+            key_source: TraceKeySource::ClientKey,
+            model: "claude-opus-5".to_string(),
+            is_stream,
+            session_id: None,
+            started_at: Instant::now()
+                .checked_sub(Duration::from_secs(started_secs_ago))
+                .expect("回拨起点应在 Instant 可表示范围内"),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+            phases: parking_lot::Mutex::new(Vec::new()),
+            open_phase: parking_lot::Mutex::new(None),
+            shape: parking_lot::Mutex::new(crate::anthropic::stream::StreamShape::default()),
+        }
+    }
+
+    fn finalized_record(
+        store: &crate::admin::trace_db::TraceStore,
+        trace_id: &str,
+    ) -> crate::admin::trace_db::TraceRecord {
+        let (out, _) = store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        out.into_iter()
+            .find(|r| r.trace_id == trace_id)
+            .expect("trace 行应已落库")
+    }
+
+    fn renderable_text_delta() -> crate::anthropic::stream::SseEvent {
+        crate::anthropic::stream::SseEvent::new(
+            "content_block_delta",
+            serde_json::json!({"index":0,"delta":{"type":"text_delta","text":"hi"}}),
+        )
+    }
+
+    #[test]
+    fn dead_air_gap_over_threshold_is_classified_on_success() {
+        // 首字节早到、首个可渲染帧晚到 30s 以上：即便流最终 success，
+        // 也必须打上 dead_air 分类，否则假活流在 ops 错误分类里完全不可见。
+        let store = std::sync::Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().unwrap(),
+        );
+        let tracer = tracer_with_clock(store.clone(), "t-dead-air", 40, true);
+        *tracer.first_token_at.lock() = Some(tracer.started_at + Duration::from_millis(5));
+        // observe 用真实 now 计算 elapsed ≈ 40_000ms → gap ≈ 40s > 30s
+        tracer.observe_events(&[renderable_text_delta()]);
+        tracer.finalize("success", None, None, None, TraceUsage::zero());
+
+        let rec = finalized_record(&store, "t-dead-air");
+        assert_eq!(rec.final_status, "success", "假活不改变 final_status 口径");
+        assert_eq!(
+            rec.error_type.as_deref(),
+            Some(outcome::DEAD_AIR),
+            "首帧滞后超阈值必须分类为 dead_air"
+        );
+        let msg = rec.error_message.as_deref().unwrap_or("");
+        assert!(msg.contains("假活"), "error_message 应描述假活: {msg}");
+    }
+
+    #[test]
+    fn healthy_late_stream_with_prompt_render_is_not_flagged() {
+        // 长请求但首帧紧跟首字节（健康流实测差 ≈1ms）：不得误伤。
+        let store = std::sync::Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().unwrap(),
+        );
+        let tracer = tracer_with_clock(store.clone(), "t-healthy", 40, true);
+        // 首字节也很晚（上游 prefill 40s），但渲染帧随即到达 → gap ≈ 数 ms
+        *tracer.first_token_at.lock() = Some(Instant::now() - Duration::from_millis(3));
+        tracer.observe_events(&[renderable_text_delta()]);
+        tracer.finalize("success", None, None, None, TraceUsage::zero());
+
+        let rec = finalized_record(&store, "t-healthy");
+        assert_eq!(rec.error_type, None, "首帧紧跟首字节的流不得判假活");
+    }
+
+    #[test]
+    fn dead_air_stream_never_rendering_is_flagged_at_stream_end() {
+        // 次要形态：首字节之后直到流结束都没有任何可渲染帧。这是假活的
+        // 极端形（病态案例 712s 在渲染前中止即属此类），以流结束时刻代替
+        // first_render 参与同一判据，不另设阈值。
+        let store = std::sync::Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().unwrap(),
+        );
+        let tracer = tracer_with_clock(store.clone(), "t-never-render", 40, true);
+        *tracer.first_token_at.lock() = Some(tracer.started_at + Duration::from_millis(5));
+        tracer.finalize("success", None, None, None, TraceUsage::zero());
+
+        let rec = finalized_record(&store, "t-never-render");
+        assert_eq!(
+            rec.error_type.as_deref(),
+            Some(outcome::DEAD_AIR),
+            "整流无可渲染帧且超阈值必须判假活"
+        );
+        let msg = rec.error_message.as_deref().unwrap_or("");
+        assert!(msg.contains("无可渲染帧"), "消息应区分「从未渲染」形态: {msg}");
+    }
+
+    #[test]
+    fn dead_air_never_overrides_primary_error_type() {
+        // 已有主因分类（如 stream_interrupted）时不得被 dead_air 覆盖：
+        // 主因决定处置动作，假活细节仍可从 stream_shape 追溯。
+        let store = std::sync::Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().unwrap(),
+        );
+        let tracer = tracer_with_clock(store.clone(), "t-primary-err", 40, true);
+        *tracer.first_token_at.lock() = Some(tracer.started_at + Duration::from_millis(5));
+        tracer.finalize(
+            "interrupted",
+            Some(outcome::STREAM_INTERRUPTED),
+            Some("上游断流"),
+            Some(128),
+            TraceUsage::zero(),
+        );
+
+        let rec = finalized_record(&store, "t-primary-err");
+        assert_eq!(
+            rec.error_type.as_deref(),
+            Some(outcome::STREAM_INTERRUPTED),
+            "主因分类不得被 dead_air 覆盖"
+        );
+        assert_eq!(rec.error_message.as_deref(), Some("上游断流"));
+    }
+
+    #[test]
+    fn dead_air_ignores_non_stream_and_streams_without_first_token() {
+        // 非流式没有「渲染帧」概念（shape 恒空），长请求不得误判；
+        // 首字节从未到达的流由既有分类（error/interrupted）负责，也不判假活。
+        let store = std::sync::Arc::new(
+            crate::admin::trace_db::TraceStore::open_in_memory().unwrap(),
+        );
+        let non_stream = tracer_with_clock(store.clone(), "t-non-stream", 40, false);
+        *non_stream.first_token_at.lock() =
+            Some(non_stream.started_at + Duration::from_millis(5));
+        non_stream.finalize("success", None, None, None, TraceUsage::zero());
+
+        let no_first_token = tracer_with_clock(store.clone(), "t-no-token", 40, true);
+        no_first_token.finalize("success", None, None, None, TraceUsage::zero());
+
+        assert_eq!(
+            finalized_record(&store, "t-non-stream").error_type,
+            None,
+            "非流式不得判假活"
+        );
+        assert_eq!(
+            finalized_record(&store, "t-no-token").error_type,
+            None,
+            "无首字节的流不得判假活"
         );
     }
 
