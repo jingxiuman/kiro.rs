@@ -1,0 +1,31 @@
+admin-ui/src/components/ops-page.tsx
+  s_d274b2ff1bca34::t_575aa0de048e72 66
+src/admin/trace_db.rs
+  s_d274b2ff1bca34::t_9ce3f1f7ae4868 245-250
+src/anthropic/handlers.rs
+  s_d274b2ff1bca34::t_b2d0dc5293a7b5 360,362
+  s_d274b2ff1bca34::t_8059ed084f4018 337-341,348
+  s_d274b2ff1bca34::t_56a190c98877c4 407-445
+  s_d274b2ff1bca34::t_ccdebc5033b40c 342-347
+  s_d274b2ff1bca34::t_2c77b67892dc67 2611-2774
+src/admin/ops.rs
+  s_d274b2ff1bca34::t_f9c903b426a751 1805-1834
+  s_d274b2ff1bca34::t_96a9672fa77d34 532-535
+  s_d274b2ff1bca34::t_3c7844f100019f 1804
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "97b2d15384cc1a1a46b9d3c82dccc4a8c257c8c0",
+  "prompts": {},
+  "sessions": {
+    "s_d274b2ff1bca34": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "416d48c4-1d14-470c-8eb0-979d31f52082",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
