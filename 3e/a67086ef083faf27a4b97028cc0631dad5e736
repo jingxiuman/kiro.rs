@@ -1,0 +1,28 @@
+src/anthropic/stream.rs
+  s_d274b2ff1bca34::t_1eb9903ba0dbd4 270-286
+  s_d274b2ff1bca34::t_fb565cb5332288 1763,2345
+  s_d274b2ff1bca34::t_7deed43d305a30 3249-3251,3259,3263-3264
+  s_d274b2ff1bca34::t_e72e36320b2d99 3228-3239
+  s_d274b2ff1bca34::t_5359b44bc8663e 1686
+  s_d274b2ff1bca34::t_b43fb30d2cd9be 3124-3181,3219
+  s_d274b2ff1bca34::t_8fd68cbfab7945 2380-2383
+  s_d274b2ff1bca34::t_d796e554ff64ee 3182-3218
+  s_d274b2ff1bca34::t_6fb7573352aa69 1720-1723
+  s_d274b2ff1bca34::t_02dba4ef2414d2 3220
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "3ea67086ef083faf27a4b97028cc0631dad5e736",
+  "prompts": {},
+  "sessions": {
+    "s_d274b2ff1bca34": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "416d48c4-1d14-470c-8eb0-979d31f52082",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
