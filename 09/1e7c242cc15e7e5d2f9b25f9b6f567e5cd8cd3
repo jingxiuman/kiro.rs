@@ -1,0 +1,21 @@
+docs/streaming-timeouts.md
+  s_d274b2ff1bca34::t_bf424869991345 16-23
+docs/thinking-pipeline.md
+  s_d274b2ff1bca34::t_25789b0b0de5a6 1-134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "091e7c242cc15e7e5d2f9b25f9b6f567e5cd8cd3",
+  "prompts": {},
+  "sessions": {
+    "s_d274b2ff1bca34": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "416d48c4-1d14-470c-8eb0-979d31f52082",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
