@@ -1,0 +1,23 @@
+src/anthropic/cache_metering.rs
+  s_d274b2ff1bca34::t_77abf82f466bde 1513-1515
+  s_d274b2ff1bca34::t_a36f397fde1286 1010-1017
+  s_d274b2ff1bca34::t_9f5a837706a58e 545-547
+  s_d274b2ff1bca34::t_c3b69e04b12acf 846-933
+  s_d274b2ff1bca34::t_30585c35020357 483-490,493,535-539,544
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "37c127806734bf0740403760e9990d0d7ce2f549",
+  "prompts": {},
+  "sessions": {
+    "s_d274b2ff1bca34": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "416d48c4-1d14-470c-8eb0-979d31f52082",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
