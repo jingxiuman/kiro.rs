@@ -32,6 +32,17 @@ export async function getTraces(query: TraceQuery): Promise<TracePage> {
   return data
 }
 
+/**
+ * 读取某条 trace 的原始入站请求体（storeRequestBodies=true 时才有数据）。
+ * 404 = 未启用保留 / 已过期 / trace 不存在——由调用方按 axios 错误的 status 区分提示。
+ */
+export async function getTraceRequestBody(traceId: string): Promise<unknown> {
+  const { data } = await api.get<unknown>(
+    `/traces/${encodeURIComponent(traceId)}/request-body`,
+  )
+  return data
+}
+
 export async function getFailureStats(): Promise<FailureStatsMap> {
   const { data } = await api.get<FailureStatsMap>('/traces/failure-stats')
   return data

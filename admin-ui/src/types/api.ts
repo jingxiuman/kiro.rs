@@ -534,6 +534,16 @@ export interface PhaseBaselineRow {
   failed: number
 }
 
+/** 流形态摘要里的单个内容块 */
+export interface StreamShapeBlock {
+  /** 块类型：thinking / text / tool_use / redacted_thinking */
+  t: string
+  /** 块出现时刻（相对请求开始 ms） */
+  ms: number
+  /** 内容字节数 */
+  b: number
+}
+
 /** 一个外部请求的完整链路 */
 export interface TraceRecord {
   traceId: string
@@ -571,6 +581,10 @@ export interface TraceRecord {
   credits?: number
   /** 首 Token 延迟（毫秒，仅流式有值） */
   firstTokenMs?: number | null
+  /** 首个可渲染帧时刻（相对请求开始 ms）。与 firstTokenMs 差值大 = 假活流（流在推进但客户端无可渲染内容） */
+  firstRenderMs?: number | null
+  /** 流形态摘要：每个内容块的类型 / 出现时刻 / 内容字节；无形态数据为 null */
+  streamShape?: StreamShapeBlock[] | null
   /** Claude Code 会话 id（metadata.user_id 的 _session_<uuid>）；同一 Key 上区分会话/子代理 */
   sessionId?: string | null
   attempts: TraceAttempt[]

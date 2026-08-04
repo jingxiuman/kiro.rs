@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import axios from 'axios'
 import { toast } from 'sonner'
 import {
   ScrollText,
@@ -8,10 +9,18 @@ import {
   ChevronDown,
   AlertTriangle,
   CheckCircle2,
+  FileJson,
   Unplug,
   Settings2,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -36,6 +45,7 @@ import {
   SelectItem as UiSelectItem,
 } from '@/components/ui/select'
 import { useTraces } from '@/hooks/use-traces'
+import { getTraceRequestBody } from '@/api/traces'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import {
@@ -47,7 +57,13 @@ import { formatDuration } from '@/lib/format'
 import { TracePhaseLane } from '@/components/trace-phase-lane'
 import { TraceTimingBar } from '@/components/trace-timing-bar'
 import { usePhaseBaseline } from '@/hooks/use-ops'
-import type { PhaseBaselineRow, TraceAttempt, TraceQuery, TraceRecord } from '@/types/api'
+import type {
+  PhaseBaselineRow,
+  StreamShapeBlock,
+  TraceAttempt,
+  TraceQuery,
+  TraceRecord,
+} from '@/types/api'
 
 /** 失败分类 → 中文标签 + Badge 颜色 */
 function outcomeStyle(outcome: string): {
@@ -278,6 +294,114 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   )
 }
 
+/** 假活流阈值：首个可渲染帧比首个上游 chunk 晚超过 30s，视为「流在推进但客户端无可渲染内容」 */
+const FAKE_LIVE_GAP_MS = 30_000
+
+/** 首Token / 首渲染帧单元格：两者差值过大时用告警配色标记假活流 */
+function FirstTokenCell({ rec }: { rec: TraceRecord }) {
+  const first = rec.firstTokenMs
+  const render = rec.firstRenderMs
+  const fakeLive = first != null && render != null && render - first > FAKE_LIVE_GAP_MS
+  return (
+    <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground">
+      {first != null ? formatDuration(first) : '—'}
+      {render != null && (
+        <span
+          className={
+            fakeLive
+              ? 'ml-1 font-medium text-amber-600 dark:text-amber-400'
+              : 'ml-1 text-muted-foreground/70'
+          }
+          title={
+            fakeLive && first != null
+              ? `首个可渲染帧比首个上游 chunk 晚 ${formatDuration(render - first)}，疑似假活流`
+              : `首个可渲染帧 ${formatDuration(render)}`
+          }
+        >
+          /{formatDuration(render)}
+        </span>
+      )}
+    </td>
+  )
+}
+
+/** 流形态块类型 → 配色（与 TokenCell 的输入/输出色系保持同族） */
+const SHAPE_TYPE_STYLE: Record<string, string> = {
+  thinking: 'text-violet-600 dark:text-violet-400',
+  text: 'text-emerald-600 dark:text-emerald-400',
+  tool_use: 'text-sky-600 dark:text-sky-400',
+  redacted_thinking: 'text-muted-foreground',
+}
+
+/** 流形态紧凑展示：thinking@4.6s(308B) → text@5.7s(299B) */
+function StreamShapeLine({ shape }: { shape: StreamShapeBlock[] }) {
+  return (
+    <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 font-mono text-[12px]">
+      {shape.map((blk, i) => (
+        <span key={i} className="inline-flex items-center gap-1.5">
+          {i > 0 && <span className="text-muted-foreground/50">→</span>}
+          <span className={SHAPE_TYPE_STYLE[blk.t] ?? 'text-foreground/80'}>
+            {blk.t}@{(blk.ms / 1000).toFixed(1)}s({blk.b}B)
+          </span>
+        </span>
+      ))}
+    </div>
+  )
+}
+
+/** 查看原始请求体：懒加载调 request-body 端点，404 = 未启用保留或已过期 */
+function RequestBodyButton({ traceId }: { traceId: string }) {
+  const [open, setOpen] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [body, setBody] = useState('')
+
+  const view = async () => {
+    setLoading(true)
+    try {
+      const data = await getTraceRequestBody(traceId)
+      setBody(typeof data === 'string' ? data : JSON.stringify(data, null, 2))
+      setOpen(true)
+    } catch (err) {
+      if (axios.isAxiosError(err) && err.response?.status === 404) {
+        toast.error('请求体不可用：未启用保留（storeRequestBodies）或已过期')
+      } else {
+        toast.error('读取请求体失败：' + extractErrorMessage(err))
+      }
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <>
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-7 text-xs"
+        disabled={loading}
+        onClick={(e) => {
+          e.stopPropagation()
+          view()
+        }}
+      >
+        <FileJson className="h-3.5 w-3.5" />
+        {loading ? '读取中…' : '查看请求体'}
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>原始请求体</DialogTitle>
+            <DialogDescription className="font-mono text-[12px]">{traceId}</DialogDescription>
+          </DialogHeader>
+          <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-all rounded-lg bg-secondary/40 p-3 font-mono text-[11px]">
+            {body}
+          </pre>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}
+
 function TraceRow({ rec, baseline }: { rec: TraceRecord; baseline: PhaseBaselineRow[] | undefined }) {
   const [open, setOpen] = useState(false)
   const errStyle = rec.errorType ? outcomeStyle(rec.errorType) : null
@@ -320,9 +444,7 @@ function TraceRow({ rec, baseline }: { rec: TraceRecord; baseline: PhaseBaseline
         <td className="py-2.5 pr-3 text-[13px] tabular-nums">
           {rec.credits != null && rec.credits > 0 ? rec.credits.toFixed(4) : '—'}
         </td>
-        <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground">
-          {rec.firstTokenMs != null ? formatDuration(rec.firstTokenMs) : '—'}
-        </td>
+        <FirstTokenCell rec={rec} />
         <td className="py-2.5 pr-3">
           {errStyle ? <Badge variant={errStyle.variant}>{errStyle.label}</Badge> : '—'}
         </td>
@@ -407,8 +529,22 @@ function ExpandedDetail({
             : `中断前已从上游收到 ${rec.interruptedAfterBytes} 字节`}
         </div>
       )}
+      {rec.operation === 'inference' && (
+        <div className="flex items-center">
+          <RequestBodyButton traceId={rec.traceId} />
+        </div>
+      )}
       <div className="text-[12px] font-medium text-muted-foreground">耗时分布</div>
       <TraceTimingBar rec={rec} />
+      {rec.streamShape && rec.streamShape.length > 0 && (
+        <>
+          <div className="text-[12px] font-medium text-muted-foreground">
+            流形态（{rec.streamShape.length} 块
+            {rec.firstRenderMs != null ? `，首个可渲染帧 ${formatDuration(rec.firstRenderMs)}` : ''}）
+          </div>
+          <StreamShapeLine shape={rec.streamShape} />
+        </>
+      )}
       <div className="text-[12px] font-medium text-muted-foreground">
         尝试链路（{rec.attempts.length} 次
         {rec.attempts.length > 1 ? `，含 ${rec.attempts.length - 1} 次重试` : "，未重试"}）
@@ -678,7 +814,9 @@ export function TraceLogPage() {
                     <th className="py-2 pr-3 font-medium">最终凭据</th>
                     <th className="py-2 pr-3 font-medium">Token</th>
                     <th className="py-2 pr-3 font-medium">费用</th>
-                    <th className="py-2 pr-3 font-medium">首Token</th>
+                    <th className="py-2 pr-3 font-medium" title="首个上游 chunk / 首个可渲染帧">
+                      首Token/渲染
+                    </th>
                     <th className="py-2 pr-3 font-medium">错误类型</th>
                     <th className="py-2 pr-3 font-medium">重试</th>
                     <th className="py-2 pr-3 font-medium">耗时</th>
