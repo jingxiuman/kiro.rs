@@ -1,0 +1,46 @@
+src/model/config.rs
+  s_d274b2ff1bca34::t_9fb62eaafb1686 238-244,424
+src/anthropic/responses.rs
+  s_d274b2ff1bca34::t_82036a08406f29 163
+src/admin/request_body_store.rs
+  s_d274b2ff1bca34::t_107a7d834de5f8 1-102,109-174
+  s_d274b2ff1bca34::t_2269bd16d94c58 103-108
+src/anthropic/router.rs
+  s_d274b2ff1bca34::t_de5df363289458 56,70,79,82-97,100,112
+src/admin/mod.rs
+  s_d274b2ff1bca34::t_620b2ef83eee41 34
+src/anthropic/middleware.rs
+  s_d274b2ff1bca34::t_de5df363289458 51-80,98
+config.example.json
+  s_d274b2ff1bca34::t_ba09485aef3723 19-21
+src/main.rs
+  s_d274b2ff1bca34::t_d50d714c435ea4 504
+  s_d274b2ff1bca34::t_3b32405277693d 198-210,308,321-323,462
+src/anthropic/handlers.rs
+  s_d274b2ff1bca34::t_baec4a420e029b 185-203,834,995,1025,1908,2056,2086
+src/admin/middleware.rs
+  s_d274b2ff1bca34::t_2718a95c7975fe 38-39,50
+  s_d274b2ff1bca34::t_d50d714c435ea4 59
+src/admin/router.rs
+  s_d274b2ff1bca34::t_d50d714c435ea4 22,203
+src/anthropic/openai.rs
+  s_d274b2ff1bca34::t_82036a08406f29 85
+src/admin/handlers.rs
+  s_d274b2ff1bca34::t_d50d714c435ea4 1512-1540
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "621af43387b3209c3ccc0b69ca6595df91074bc0",
+  "prompts": {},
+  "sessions": {
+    "s_d274b2ff1bca34": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "416d48c4-1d14-470c-8eb0-979d31f52082",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
