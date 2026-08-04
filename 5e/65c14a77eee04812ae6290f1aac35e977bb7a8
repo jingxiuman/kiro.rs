@@ -1,0 +1,49 @@
+src/anthropic/types.rs
+  s_d274b2ff1bca34::t_c7f9d601f8a968 84-88
+src/anthropic/handlers.rs
+  s_d274b2ff1bca34::t_63b0ee47e2795e 2472,2649-2650,2667-2693,2701-2702,2723-2724
+  s_d274b2ff1bca34::t_7afa89c745553f 2020,2473-2507
+  s_d274b2ff1bca34::t_6565b18f0c3a28 168-172,1147,2264
+  s_d274b2ff1bca34::t_3cab448d41347c 893-897,2016-2019
+  s_d274b2ff1bca34::t_0ef7e6ad229013 1947-1948,1952
+  s_d274b2ff1bca34::t_6356348d93b664 1058-1059,1115-1116,1528-1529,2173-2174,2233-2234
+  s_d274b2ff1bca34::t_504b583f48c40b 1765-1766,1837-1838,1840-1849,1855-1868,1875-1887
+  s_d274b2ff1bca34::t_7e83af97194b0d 190-225
+  s_d274b2ff1bca34::t_c139510825e4f3 1017-1023,1090-1091,2133-2139,2205-2206
+src/anthropic/stream.rs
+  s_d274b2ff1bca34::t_0e83b319ad0e87 2321-2348,2373-2375
+  s_d274b2ff1bca34::t_48d19eb1f6b5ae 2691-2699
+  s_d274b2ff1bca34::t_2ab5ec7084696f 2234,3348-3463
+  s_d274b2ff1bca34::t_50622d1abe8488 1490-1495,1595-1597,2225-2233
+  s_d274b2ff1bca34::t_18e8f4dd6aae53 1848-1851,1890-1893,2283-2284,2469-2472,2563-2566,2591-2594
+  s_d274b2ff1bca34::t_4ff6f336e10602 1846-1847
+  s_d274b2ff1bca34::t_1962425c65f09a 1888-1889
+  s_d274b2ff1bca34::t_4dd500ce44b8a4 2235
+  s_d274b2ff1bca34::t_0c30cc7a56bbbb 2281-2282
+  s_d274b2ff1bca34::t_4bb681ec65d81f 2467-2468
+  s_d274b2ff1bca34::t_5f6ddca5b30fef 2561-2562
+src/anthropic/router.rs
+  s_d274b2ff1bca34::t_c139510825e4f3 57,72,82
+src/anthropic/middleware.rs
+  s_d274b2ff1bca34::t_c139510825e4f3 53-54,101
+src/main.rs
+  s_d274b2ff1bca34::t_c139510825e4f3 211-219,318,334-336,476
+src/anthropic/converter.rs
+  s_d274b2ff1bca34::t_0ef7e6ad229013 1981,1993,2006,2232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "5e65c14a77eee04812ae6290f1aac35e977bb7a8",
+  "prompts": {},
+  "sessions": {
+    "s_d274b2ff1bca34": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "416d48c4-1d14-470c-8eb0-979d31f52082",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
