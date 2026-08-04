@@ -2262,6 +2262,35 @@ mod tests {
         assert_eq!(fields.output_config.unwrap().effort, "xhigh");
     }
 
+    #[test]
+    fn cc_2_1_220_wire_shape_honors_explicit_medium_for_5_family() {
+        // 2026-08-03 本地 sink 实测：Claude Code 2.1.220 对 5 系模型发
+        // thinking:{type:"adaptive"}（无 budget_tokens）+ 显式 output_config.effort:"medium"。
+        // 显式 effort 必须优先于 budget 推导（默认 20000 会落 high）。
+        // 生产 claude-opus-5 经 models.json 注册表解析后走同一条 5 系路径，
+        // 测试环境无该注册表行，用 builtin 可解析的 fable-5 等价覆盖。
+        let mut req = minimal_adaptive_thinking_request_with_effort("claude-fable-5", "medium");
+        req.thinking.as_mut().unwrap().budget_tokens = 20000; // serde 默认值，客户端未发
+        let result = convert_request(&req).unwrap();
+        let fields = result
+            .additional_model_request_fields
+            .expect("5 系 adaptive thinking 应下发 output_config");
+        assert_eq!(fields.output_config.unwrap().effort, "medium");
+    }
+
+    #[test]
+    fn adaptive_thinking_without_output_config_falls_back_to_high_for_5_family() {
+        // 客户端只开 thinking、不带 output_config 时（旧版 CC / 其他客户端），
+        // budget 默认 20000 → 推导 high。这是有意的兜底档位，改动前先看
+        // effort_from_budget_tokens 的注释。
+        let req = minimal_thinking_request("claude-fable-5", "adaptive");
+        let result = convert_request(&req).unwrap();
+        let fields = result
+            .additional_model_request_fields
+            .expect("5 系 adaptive thinking 应下发 output_config");
+        assert_eq!(fields.output_config.unwrap().effort, "high");
+    }
+
     // ---- normalize_json_schema: 顶层 type / 组合关键字（PR#6）----
 
     #[test]
