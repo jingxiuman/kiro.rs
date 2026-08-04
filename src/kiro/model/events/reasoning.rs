@@ -16,8 +16,12 @@ pub struct ReasoningContentEvent {
     /// 明文思考内容片段。
     #[serde(default)]
     pub text: Option<String>,
-    /// 思考块签名，Anthropic 客户端下一轮会原样回传。
+    /// 思考块签名。保留字段以完整反映上游线格式，但**有意不使用**：
+    /// Bedrock 真签名可达 208KB（为正文 5-18 倍），下发只会膨胀客户端历史，
+    /// 且回传时 ContentBlock 无此字段、serde 静默丢弃，从不回到上游。
+    /// 下发统一用占位符（见 stream.rs THINKING_SIGNATURE_PLACEHOLDER）。
     #[serde(default)]
+    #[allow(dead_code)]
     pub signature: Option<String>,
     /// 上游返回的加密思考内容。
     #[serde(default)]
