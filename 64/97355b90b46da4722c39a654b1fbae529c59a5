@@ -1,0 +1,56 @@
+src/admin/service.rs
+  s_af638f44356950::t_0447e2b7442063 2420,2422
+  s_6e30e06a2f0f7c::t_8fbb0731211040 2459-2483
+  s_6e30e06a2f0f7c::t_af8a66e945ffba 26-27,36
+  s_af638f44356950::t_62f0cbfd0ec685 657-660
+  s_6e30e06a2f0f7c::t_6ae2e08a72b57a 2484
+src/kiro/token_manager.rs
+  s_6e30e06a2f0f7c::t_506e30da5c2a14 1880
+  s_6e30e06a2f0f7c::t_276abe0e8f6c91 1354-1355
+  s_6e30e06a2f0f7c::t_c5415b14571425 1369-1370
+  s_6e30e06a2f0f7c::t_e920a2e0c5d65b 936-939
+  s_af638f44356950::t_b0ea4ee7f0e4cd 1044-1075
+  s_6e30e06a2f0f7c::t_87dca20b663547 1306,3381
+  s_6e30e06a2f0f7c::t_41f894e0938ee9 13,16
+  s_6e30e06a2f0f7c::t_c302ce8ab027c0 3881-3884
+  s_6e30e06a2f0f7c::t_96cb2aa0087688 1703-1712
+  s_af638f44356950::t_e82b01506b2495 4588-4651
+  s_af638f44356950::t_3383edab1fafc1 1862,1864-1866
+  s_af638f44356950::t_3f298f9aa321ff 3763
+  s_6e30e06a2f0f7c::t_7c63d25c64ee89 3860-3880,3885-3941
+  s_6e30e06a2f0f7c::t_c35ecc70df4971 1920-1929
+  s_6e30e06a2f0f7c::t_6b914efb57b6fc 1608-1702,1713-1745
+  s_6e30e06a2f0f7c::t_5a405a5596d5dd 1106-1109
+  s_6e30e06a2f0f7c::t_25733deeca5c3c 1952-1958
+  s_6e30e06a2f0f7c::t_409d0770298e3e 1746,3942,5800-5900,5902-5904
+  s_6e30e06a2f0f7c::t_8ab4031de7d676 1787-1788
+  s_6e30e06a2f0f7c::t_9714126a9bd8a5 5901
+  s_6e30e06a2f0f7c::t_3edc10d5ef9e76 1125-1128
+  s_af638f44356950::t_80894b1d188e0e 1805-1808,1817
+  s_6e30e06a2f0f7c::t_edc22ccdd02ea1 1747
+  s_6e30e06a2f0f7c::t_d700dd643809ea 1789-1790
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "6497355b90b46da4722c39a654b1fbae529c59a5",
+  "prompts": {},
+  "sessions": {
+    "s_6e30e06a2f0f7c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c6b54644-04aa-4961-98f0-47b3945cc4ab",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    },
+    "s_af638f44356950": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7a349da2-ac5a-4445-b65f-b28b23898997",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
