@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod credential_gate;
+pub mod dispatch;
 pub mod endpoint;
 pub mod error;
 pub mod kiro_version;

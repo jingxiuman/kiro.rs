@@ -52,6 +52,12 @@ impl BalanceCache {
         }
     }
 
+    /// 只读代次号。比 [`Self::snapshot`] 便宜——不 clone 整张 entries 表，
+    /// 供只需判断「是否换代」的热路径（消耗回写）使用。
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().generation
+    }
+
     pub fn snapshot(&self) -> BalanceSnapshotView {
         let inner = self.inner.lock();
         BalanceSnapshotView {
