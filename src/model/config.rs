@@ -208,6 +208,19 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
+    ///
+    /// 开启后：每个凭据独立维护最近 60 秒的滑动窗口计数，达到 `account_rpm_limit`
+    /// 上限时，该凭据在窗口内被临时排除出候选，请求自动故障转移到下一个可用凭据；
+    /// 所有凭据都超限时返回 429。窗口计数不持久化，进程重启后清空。
+    /// 关闭时（默认）完全不计数、不影响调度，存量用户无感知。
+    #[serde(default = "default_account_rpm_limit_enabled")]
+    pub account_rpm_limit_enabled: bool,
+
+    /// 单账号每分钟请求次数上限（默认 60）。仅在 `account_rpm_limit_enabled` 为 true 时生效。
+    #[serde(default = "default_account_rpm_limit")]
+    pub account_rpm_limit: u32,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -349,6 +362,14 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_account_rpm_limit_enabled() -> bool {
+    false
+}
+
+fn default_account_rpm_limit() -> u32 {
+    60
+}
+
 fn default_update_auto_apply_time() -> String {
     "03:00".to_string()
 }
@@ -416,6 +437,8 @@ impl Default for Config {
             credential_queue_timeout_secs: default_credential_queue_timeout_secs(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
+            account_rpm_limit: default_account_rpm_limit(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
@@ -552,5 +575,32 @@ mod streaming_timeout_config_tests {
                 .unwrap();
         assert_eq!(cfg.stream_idle_timeout_secs, 120);
         assert_eq!(cfg.stream_total_timeout_secs, 2400);
+    }
+
+    /// RPM 限流对存量 config.json 必须完全无感：缺字段时默认关闭。
+    /// 这条断言守的是「升级不改变现有调度行为」——一旦默认值被误改成 true，
+    /// 所有存量部署会突然开始按 60 RPM 卡账号。
+    #[test]
+    fn account_rpm_limit_defaults_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.account_rpm_limit_enabled);
+        assert_eq!(config.account_rpm_limit, 60);
+
+        let default = Config::default();
+        assert!(!default.account_rpm_limit_enabled);
+        assert_eq!(default.account_rpm_limit, 60);
+    }
+
+    #[test]
+    fn account_rpm_limit_accepts_explicit_values() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "accountRpmLimitEnabled": true,
+                "accountRpmLimit": 120
+            }"#,
+        )
+        .unwrap();
+        assert!(config.account_rpm_limit_enabled);
+        assert_eq!(config.account_rpm_limit, 120);
     }
 }

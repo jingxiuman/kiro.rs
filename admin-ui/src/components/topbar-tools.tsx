@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck, Network,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Network, Gauge,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -19,6 +19,7 @@ import {
 import {
   useLoadBalancingMode, useSetLoadBalancingMode,
   useAccountThrottleConfig, useSetAccountThrottleConfig,
+  useAccountRpmLimitConfig, useSetAccountRpmLimitConfig,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
 import { updateAdminKey } from '@/api/credentials'
@@ -42,6 +43,8 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const { data: throttleConfig, isLoading: isLoadingThrottle } = useAccountThrottleConfig()
   const { mutate: setThrottleConfig, isPending: isSettingThrottle } = useSetAccountThrottleConfig()
+  const { data: rpmConfig, isLoading: isLoadingRpm } = useAccountRpmLimitConfig()
+  const { mutate: setRpmConfig, isPending: isSettingRpm } = useSetAccountRpmLimitConfig()
   const { data: updateCheck } = useUpdateCheck()
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
@@ -72,6 +75,14 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     const next = !cur
     setThrottleConfig({ failover: next }, {
       onSuccess: () => toast.success(next ? '已开启账号级风控故障转移' : '已关闭账号级风控故障转移'),
+      onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  const handleToggleRpmLimit = () => {
+    const next = !(rpmConfig?.enabled ?? false)
+    setRpmConfig({ enabled: next }, {
+      onSuccess: () => toast.success(next ? '已开启单账号 RPM 限流' : '已关闭单账号 RPM 限流'),
       onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     })
   }
@@ -109,8 +120,17 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     handleToggleLoadBalancing,
     isLoadingMode,
     isLoadingThrottle,
+    isLoadingRpm,
     isSettingMode,
     isSettingThrottle,
+    isSettingRpm,
+    handleToggleRpmLimit,
+    rpmConfig,
+    updateRpmLimit: (limit: number) =>
+      setRpmConfig({ limit }, {
+        onSuccess: () => toast.success(`每分钟上限已设为 ${limit}`),
+        onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+      }),
     loadBalancingMode: loadBalancingData?.mode,
     openImageUpdate: () => setImageUpdateOpen(true),
     openModelMapping: () => setModelMappingOpen(true),
@@ -229,10 +249,15 @@ interface ToolControls {
   handleRefresh: () => void
   handleToggleFailover: () => void
   handleToggleLoadBalancing: () => void
+  handleToggleRpmLimit: () => void
   isLoadingMode: boolean
   isLoadingThrottle: boolean
+  isLoadingRpm: boolean
   isSettingMode: boolean
   isSettingThrottle: boolean
+  isSettingRpm: boolean
+  rpmConfig?: { enabled: boolean; limit: number }
+  updateRpmLimit: (limit: number) => void
   loadBalancingMode?: 'priority' | 'balanced'
   openImageUpdate: () => void
   openKeyDialog: () => void
@@ -252,6 +277,13 @@ function FullTools({ controls }: { controls: ToolControls }) {
         saving={controls.isSettingThrottle}
         onToggleFailover={controls.handleToggleFailover}
         onChangeCooldown={controls.updateCooldown}
+      />
+      <RpmLimitButton
+        config={controls.rpmConfig}
+        loading={controls.isLoadingRpm}
+        saving={controls.isSettingRpm}
+        onToggleEnabled={controls.handleToggleRpmLimit}
+        onChangeLimit={controls.updateRpmLimit}
       />
       <ModelMappingButton controls={controls} />
       <RefreshButton onRefresh={controls.handleRefresh} />
@@ -300,6 +332,13 @@ function CompactTools({ controls }: { controls: ToolControls }) {
           <UploadCloud />镜像在线更新
         </DropdownMenuItem>
         <ThrottleCompactItems {...throttleProps} />
+        <RpmCompactItems
+          config={controls.rpmConfig}
+          loading={controls.isLoadingRpm}
+          saving={controls.isSettingRpm}
+          onToggleEnabled={controls.handleToggleRpmLimit}
+          onChangeLimit={controls.updateRpmLimit}
+        />
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
           <Key />修改登录API密钥（管理面板登录）
@@ -755,4 +794,250 @@ function invalidCooldownMinutes(minutes: number) {
 
 function cooldownPanelClassName(failover: boolean) {
   return `px-2 pb-2 ${failover ? '' : 'opacity-60'}`
+}
+
+// ============================================================================
+// 单账号 RPM 主动限流
+// ============================================================================
+
+interface RpmLimitProps {
+  config?: { enabled: boolean; limit: number }
+  loading: boolean
+  saving: boolean
+  onToggleEnabled: () => void
+  onChangeLimit: (limit: number) => void
+}
+
+interface RpmState {
+  enabled: boolean
+  limit: number
+}
+
+/**
+ * 常用每分钟上限预设（取值与上游 v0.7.5 一致）。
+ *
+ * 口径提醒：这里的「次」是**向上游发出的请求数**，不是客户端消息数——
+ * 一次带 WebSearch 的对话会占掉多格（模型调用 + 每轮 MCP 搜索各一次）。
+ * 按账号实际能承受的上游速率选，而不是按"我一分钟发几条消息"选。
+ */
+const RPM_PRESETS = [10, 30, 60, 120, 300]
+
+const DEFAULT_RPM_LIMIT = 60
+const MIN_CUSTOM_RPM = 1
+const MAX_CUSTOM_RPM = 100000
+
+function readRpmState(config: RpmLimitProps['config']): RpmState {
+  return {
+    enabled: config?.enabled ?? false,
+    limit: config?.limit ?? DEFAULT_RPM_LIMIT,
+  }
+}
+
+function invalidRpmLimit(limit: number) {
+  return Number.isNaN(limit) || limit < MIN_CUSTOM_RPM || limit > MAX_CUSTOM_RPM
+}
+
+function rpmTriggerText(loading: boolean, state: RpmState) {
+  if (loading) return '加载中…'
+  if (!state.enabled) return '不限流'
+  return `RPM · ${state.limit}`
+}
+
+function rpmTitle(loading: boolean, state: RpmState) {
+  if (loading) return '加载中…'
+  if (!state.enabled) return '单账号 RPM 限流：关闭'
+  return `单账号 RPM 限流：开启（每账号每分钟 ${state.limit} 次上游请求）`
+}
+
+function compactRpmText(loading: boolean, state: RpmState) {
+  if (loading) return 'RPM 限流加载中'
+  if (!state.enabled) return '开启 RPM 限流'
+  return `关闭 RPM 限流 · ${state.limit}`
+}
+
+interface RpmTriggerProps extends ComponentPropsWithoutRef<typeof Button> {
+  loading: boolean
+  saving: boolean
+  state: RpmState
+}
+
+const RpmTrigger = forwardRef<HTMLButtonElement, RpmTriggerProps>(
+  function RpmTrigger({ loading, saving, state, ...props }, ref) {
+    return (
+      <Button
+        {...props}
+        ref={ref}
+        variant="outline"
+        size="sm"
+        disabled={loading || saving}
+        title={rpmTitle(loading, state)}
+      >
+        <Gauge className={`h-3.5 w-3.5 ${state.enabled ? 'text-sky-600' : 'text-muted-foreground'}`} />
+        <span className="hidden md:inline">{rpmTriggerText(loading, state)}</span>
+      </Button>
+    )
+  },
+)
+
+/**
+ * RPM 限流开关 + 每分钟上限设置（紧凑下拉）。
+ *
+ * 结构刻意与 `ThrottleConfigButton` 保持一致：同为「账号级调度保护」类配置，
+ * 两处交互不同只会让人以为语义也不同。
+ */
+function RpmLimitButton(props: RpmLimitProps) {
+  const { loading, saving, onToggleEnabled, onChangeLimit } = props
+  const [open, setOpen] = useState(false)
+  const [customLimit, setCustomLimit] = useState('')
+  const state = readRpmState(props.config)
+
+  useEffect(() => {
+    if (!open) setCustomLimit('')
+  }, [open])
+
+  const submitCustom = (e: React.FormEvent) => {
+    e.preventDefault()
+    const limit = parseInt(customLimit, 10)
+    if (invalidRpmLimit(limit)) {
+      toast.error(`请输入 ${MIN_CUSTOM_RPM}-${MAX_CUSTOM_RPM} 之间的整数`)
+      return
+    }
+    onChangeLimit(limit)
+    setOpen(false)
+  }
+
+  return (
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild>
+        <RpmTrigger loading={loading} saving={saving} state={state} />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-64">
+        <DropdownMenuLabel>单账号 RPM 主动限流</DropdownMenuLabel>
+        <div className="px-2 pb-2">
+          <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
+            <div className="text-xs">
+              <div className="font-medium text-foreground">{state.enabled ? '开启' : '关闭'}</div>
+              <div className="leading-snug text-muted-foreground">
+                {state.enabled
+                  ? '账号达到每分钟上限后退出候选，请求自动转移到下一个账号；全部超限返回 429'
+                  : '不统计、不影响调度（默认）'}
+              </div>
+            </div>
+            <Switch
+              checked={state.enabled}
+              disabled={saving}
+              onCheckedChange={() => onToggleEnabled()}
+            />
+          </div>
+        </div>
+        <RpmLimitPanel
+          customLimit={customLimit}
+          saving={saving}
+          state={state}
+          onChangeLimit={onChangeLimit}
+          onCustomLimitChange={setCustomLimit}
+          onDone={() => setOpen(false)}
+          onSubmitCustom={submitCustom}
+        />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+function RpmLimitPanel({
+  customLimit, saving, state, onChangeLimit, onCustomLimitChange, onDone, onSubmitCustom,
+}: {
+  customLimit: string
+  saving: boolean
+  state: RpmState
+  onChangeLimit: (limit: number) => void
+  onCustomLimitChange: (value: string) => void
+  onDone?: () => void
+  onSubmitCustom: (e: React.FormEvent) => void
+}) {
+  const disabled = saving || !state.enabled
+
+  return (
+    <>
+      <DropdownMenuLabel className="pt-1">每分钟上限（上游请求数）</DropdownMenuLabel>
+      <div className={`px-2 pb-2 ${state.enabled ? '' : 'opacity-60'}`}>
+        <div className="grid grid-cols-3 gap-1">
+          {RPM_PRESETS.map((preset) => (
+            <Button
+              key={preset}
+              type="button"
+              size="sm"
+              variant={preset === state.limit ? 'default' : 'outline'}
+              className="h-7 text-xs"
+              disabled={disabled}
+              onClick={() => {
+                if (preset !== state.limit) onChangeLimit(preset)
+                onDone?.()
+              }}
+            >
+              {preset}
+            </Button>
+          ))}
+        </div>
+        <form onSubmit={onSubmitCustom} className="mt-2 flex items-center gap-1.5">
+          <Input
+            type="number"
+            min={MIN_CUSTOM_RPM}
+            max={MAX_CUSTOM_RPM}
+            placeholder={`自定义（当前 ${state.limit}）`}
+            value={customLimit}
+            onChange={(e) => onCustomLimitChange(e.target.value)}
+            disabled={disabled}
+            className="h-7 text-xs"
+          />
+          <span className="text-xs text-muted-foreground">次/分</span>
+          <Button
+            type="submit"
+            size="sm"
+            variant="outline"
+            className="h-7 text-xs"
+            disabled={disabled || !customLimit.trim()}
+          >
+            保存
+          </Button>
+        </form>
+      </div>
+    </>
+  )
+}
+
+function RpmCompactItems(props: RpmLimitProps) {
+  const { loading, saving, onToggleEnabled, onChangeLimit } = props
+  const [customLimit, setCustomLimit] = useState('')
+  const state = readRpmState(props.config)
+  const busy = loading || saving
+
+  const submitCustom = (e: React.FormEvent) => {
+    e.preventDefault()
+    const limit = parseInt(customLimit, 10)
+    if (invalidRpmLimit(limit)) {
+      toast.error(`请输入 ${MIN_CUSTOM_RPM}-${MAX_CUSTOM_RPM} 之间的整数`)
+      return
+    }
+    onChangeLimit(limit)
+    setCustomLimit('')
+  }
+
+  return (
+    <>
+      <DropdownMenuLabel>单账号 RPM 限流</DropdownMenuLabel>
+      <DropdownMenuItem disabled={busy} onSelect={onToggleEnabled}>
+        <Gauge />
+        {compactRpmText(loading, state)}
+      </DropdownMenuItem>
+      <RpmLimitPanel
+        customLimit={customLimit}
+        saving={busy}
+        state={state}
+        onChangeLimit={onChangeLimit}
+        onCustomLimitChange={setCustomLimit}
+        onSubmitCustom={submitCustom}
+      />
+    </>
+  )
 }

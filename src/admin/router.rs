@@ -16,7 +16,8 @@ use super::{
         sync_models, test_model, upsert_alias,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
-        export_credentials, force_refresh_token, get_account_throttle_config,
+        export_credentials, force_refresh_token, get_account_rpm_limit_config,
+        get_account_throttle_config,
         get_all_credentials, get_credential_balance, get_credential_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_update_config,
         get_trace_request_body, list_client_keys, list_groups, list_traces, trace_failure_stats,
@@ -26,7 +27,8 @@ use super::{
         poll_idc_relogin, poll_social_login,
         poll_social_relogin, pull_update_image, reset_all_success_count, reset_client_key_stats,
         reset_failure_count, reset_success_count, rollback_image_update, rotate_client_key,
-        set_account_throttle_config, set_client_key_disabled, set_credential_disabled,
+        set_account_rpm_limit_config, set_account_throttle_config, set_client_key_disabled,
+        set_credential_disabled,
         set_credential_overage, set_credential_priority, set_global_proxy,
         set_load_balancing_mode, set_log_governance_config, set_proxy_enabled, set_update_config,
         start_idc_login, start_idc_relogin, start_social_login,
@@ -111,6 +113,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/account-throttle",
             get(get_account_throttle_config).put(set_account_throttle_config),
+        )
+        .route(
+            "/config/account-rpm-limit",
+            get(get_account_rpm_limit_config).put(set_account_rpm_limit_config),
         )
         .route(
             "/config/log-governance",
