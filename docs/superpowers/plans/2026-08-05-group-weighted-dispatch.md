@@ -280,9 +280,31 @@ impl BalanceCache {
 pub type SharedBalanceCache = Arc<BalanceCache>;
 ```
 
+- [ ] **Step 0: 给 `BalanceResponse` 加 `Default` 派生**
+
+本任务的测试 helper 要用 `BalanceResponse { remaining, ..Default::default() }`，否则每处都得写全 10 个字段。`src/admin/types.rs:317` 当前是
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceResponse {
+```
+
+改为
+
+```rust
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceResponse {
+```
+
+所有字段（`u64` / `f64` / `Option<_>`）都实现了 `Default`，纯附加改动。
+
+Run: `cargo build 2>&1 | tail -5` → 应编译通过。
+
 - [ ] **Step 1: 写失败的测试**
 
-新建 `src/admin/balance_cache.rs`，先只写测试模块：
+新建 `src/admin/balance_cache.rs`，先只写测试模块。注意 `next_reset_at` 字段的类型是 `Option<f64>`：
 
 ```rust
 #[cfg(test)]
@@ -520,27 +542,12 @@ impl GroupDispatcher {
 }
 ```
 
-- [ ] **Step 0: 给 `BalanceResponse` 加 `Default` 派生**
+- [ ] **Step 0: 确认 `BalanceResponse` 已有 `Default` 派生**
 
-`src/admin/types.rs:317` 当前是
+该派生已在 Task 2 Step 0 加入（本任务的测试同样依赖它）。跑一次确认：
 
-```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BalanceResponse {
-```
-
-改为
-
-```rust
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BalanceResponse {
-```
-
-所有字段（`u64` / `f64` / `Option<_>`）都实现了 `Default`，这是纯附加改动。目的是让后续测试能用 `BalanceResponse { remaining: 9000.0, ..Default::default() }` 构造，否则每处都要写全 10 个字段。
-
-Run: `cargo build 2>&1 | tail -5` → 应编译通过。
+Run: `grep -n 'derive.*Default.*Serialize' src/admin/types.rs`
+Expected: 命中 `BalanceResponse` 上方的 derive 行。若未命中，按 Task 2 Step 0 补上。
 
 - [ ] **Step 1: 写失败的测试（数值域部分）**
 
