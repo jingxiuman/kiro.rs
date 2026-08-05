@@ -11,7 +11,21 @@
 ## Global Constraints
 
 - **分支**：全部在当前分支 `feat/absorb-upstream-0.7.5` 上开发提交。
-- **工作区已有大量未提交在制品，且正压在要改的文件上**：`src/kiro/token_manager.rs`、`src/kiro/provider.rs`、`src/admin/service.rs`、`src/admin/router.rs`、`src/model/config.rs`、`admin-ui/src/api/credentials.ts`、`admin-ui/src/components/topbar-tools.tsx`、`admin-ui/src/components/trace-log-page.tsx`、`admin-ui/src/hooks/use-credentials.ts`。**每次提交必须 `git add` 显式列出本任务改动的文件，禁止 `git add -A` / `git add .`**，否则会把在制品打包进来。
+- **提交卫生（Task 1 已踩过一次，务必照做）**：每次提交必须 `git add` 显式列出本任务改动的文件，禁止 `git add -A` / `git add .`。
+
+  **但这还不够。** `git add <file>` 是**文件粒度**的，无法排除同一文件里他人未提交的 hunk。Task 1 就因此把整个 RPM 限流特性的后端半截卷进了提交 `6497355`，导致该提交无法独立构建（`service.rs` import 了当时尚未提交的 `types.rs` 里的类型）。已由 `75339ad` 补齐收尾。
+
+  因此**每个任务提交前必须先自检**：
+
+  ```bash
+  git add <本任务文件>
+  git diff --cached --stat          # 文件清单是否与预期一致
+  git diff --cached | grep -nE '<本任务无关的特征符号>'   # 应无输出
+  ```
+
+  发现混入他人改动时**停下来报告**，不要自行提交，也不要 revert 他人改动。
+
+- **当前工作区剩余在制品**（截至 `75339ad`）：`src/kiro/provider.rs`、`src/anthropic/websearch_loop.rs`，内容是 WebSearch / MCP 的 `ensure_profile_arn` 修复。**Task 5 要改 `provider.rs`，会撞上它**——该任务开工前需先确认这批在制品的处置。
 - **默认行为零变化**：`loadBalancingMode` 默认仍为 `"priority"`；`priority` 与 `balanced` 两个分支的选号结果必须与改动前逐位一致。
 - **锁序**：`dispatcher.pick()` 内部只允许持有 `DispatchState` 一把锁，且调用它之前必须已释放 `entries` 与 `credential_support`。`pick` 内不得做 IO、不得 `await`、不得回调 `token_manager`。
 - **余额单位**：`credits`，与 `BalanceResponse.remaining` / `usageLimit`（10000）同量纲，已由生产数据验证（误差 <2%）。
