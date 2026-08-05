@@ -23,7 +23,8 @@ use crate::model::config::Config;
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
+    AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
+    AddCredentialResponse,
     AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse,
     BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
     CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
@@ -32,7 +33,7 @@ use super::types::{
     LoadBalancingModeResponse, LogGovernanceConfigResponse, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
-    QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
+    QuotaExceededResult, SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
     SetLogGovernanceConfigRequest, SetModelSyncSettingsRequest, SetUpdateConfigRequest,
     StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
@@ -653,7 +654,10 @@ impl AdminService {
         // balanced 模式下 `current_id` 只是内部调度指针（每次请求重新选号），
         // 不存在「当前活跃账号」这个概念；对外暴露它等于显示假信息。
         // 固定为 0，与「无当前凭据」的既有取值（凭据全空时的初值）一致。
-        let exposed_current_id = if self.token_manager.get_load_balancing_mode() == "balanced" {
+        let exposed_current_id = if matches!(
+            self.token_manager.get_load_balancing_mode().as_str(),
+            "balanced" | "weighted"
+        ) {
             0
         } else {
             snapshot.current_id
@@ -2413,9 +2417,9 @@ impl AdminService {
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
         // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
+        if !matches!(req.mode.as_str(), "priority" | "balanced" | "weighted") {
             return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority' 或 'balanced'".to_string(),
+                "mode 必须是 'priority'、'balanced' 或 'weighted'".to_string(),
             ));
         }
 
@@ -2450,6 +2454,32 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 获取单账号 RPM 主动限流配置
+    pub fn get_account_rpm_limit_config(&self) -> AccountRpmLimitConfigResponse {
+        AccountRpmLimitConfigResponse {
+            enabled: self.token_manager.get_account_rpm_limit_enabled(),
+            limit: self.token_manager.get_account_rpm_limit(),
+        }
+    }
+
+    /// 更新单账号 RPM 主动限流配置
+    pub fn set_account_rpm_limit_config(
+        &self,
+        req: SetAccountRpmLimitConfigRequest,
+    ) -> Result<AccountRpmLimitConfigResponse, AdminServiceError> {
+        if req.enabled.is_none() && req.limit.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 enabled 或 limit 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_account_rpm_limit_config(req.enabled, req.limit)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_account_rpm_limit_config())
     }
 
     /// 读取日志治理配置（trace 开关 / trace 保留天数 / usage 保留天数）

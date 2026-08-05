@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::admin::trace_db::{
@@ -933,6 +933,10 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// RPM 主动限流的滑动窗口：最近 60 秒内被选中发起请求的时间戳队列。
+    /// 队列长度达到 `account_rpm_limit` 时该凭据本窗口内被排除出候选。
+    /// 不持久化，进程重启后清空；限流关闭时始终为空。
+    rpm_window: VecDeque<Instant>,
 }
 
 /// 禁用原因
@@ -1037,6 +1041,38 @@ pub struct ManagerSnapshot {
     pub available: usize,
 }
 
+/// 负载均衡模式。序列化仍用原字符串，兼容既有 config.json。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadBalancingMode {
+    Priority,
+    Balanced,
+    Weighted,
+}
+
+impl LoadBalancingMode {
+    /// 未知取值一律落到 Priority——与改动前 `match mode { .. _ => priority }` 的行为一致。
+    pub(crate) fn parse(s: &str) -> Self {
+        match s {
+            "balanced" => Self::Balanced,
+            "weighted" => Self::Weighted,
+            _ => Self::Priority,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Priority => "priority",
+            Self::Balanced => "balanced",
+            Self::Weighted => "weighted",
+        }
+    }
+
+    /// 动态选号模式：每次请求重新选，不固定 current_id。
+    pub(crate) fn is_dynamic(&self) -> bool {
+        matches!(self, Self::Balanced | Self::Weighted)
+    }
+}
+
 /// 多凭据 Token 管理器
 ///
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
@@ -1067,6 +1103,10 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 单账号 RPM 主动限流开关（运行时可修改）
+    account_rpm_limit_enabled: AtomicBool,
+    /// 单账号每分钟请求次数上限（运行时可修改）
+    account_rpm_limit: AtomicU32,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -1082,6 +1122,10 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+
+/// 单账号 RPM 限流的滑动窗口长度（秒）。固定 60 秒 = 每分钟。
+const RPM_WINDOW_SECS: u64 = 60;
+
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -1259,6 +1303,7 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    rpm_window: VecDeque::new(),
                 }
             })
             .collect();
@@ -1306,6 +1351,8 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let rpm_limit_enabled = config.account_rpm_limit_enabled;
+        let rpm_limit = config.account_rpm_limit;
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1319,6 +1366,8 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
+            account_rpm_limit: AtomicU32::new(rpm_limit),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             credential_support: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -1556,6 +1605,146 @@ impl MultiTokenManager {
             .count()
     }
 
+    /// 判断凭据在当前 60 秒滑动窗口内是否已达到 RPM 上限。
+    ///
+    /// 限流未开启时恒为 `false`（不参与调度判断）。只读判断，不修改窗口；
+    /// 过期时间戳的实际清理发生在 [`Self::record_request`]。
+    fn rpm_exceeded(&self, entry: &CredentialEntry, now: Instant) -> bool {
+        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let limit = self.account_rpm_limit.load(Ordering::Relaxed);
+        if limit == 0 {
+            return false;
+        }
+        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
+        let fresh = entry
+            .rpm_window
+            .iter()
+            .filter(|&&ts| now.duration_since(ts) < window)
+            .count();
+        fresh as u32 >= limit
+    }
+
+    /// 当「其它条件都满足」的候选全部耗尽 RPM 额度时，返回最早可重试秒数。
+    ///
+    /// 返回 `None` 表示至少有一个候选仍有额度——此时失败原因不是 RPM，
+    /// 调用方应保留原本的「所有凭据均已禁用」错误，不要退化成误导性的 429。
+    fn rpm_retry_after_secs(
+        &self,
+        entries: &[CredentialEntry],
+        model: Option<&str>,
+        group: Option<&str>,
+        now: Instant,
+    ) -> Option<u64> {
+        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let limit = self.account_rpm_limit.load(Ordering::Relaxed) as usize;
+        if limit == 0 {
+            return None;
+        }
+
+        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
+        let credential_support = self.credential_support.read();
+        let mut earliest_retry_after = None;
+
+        for entry in entries.iter().filter(|entry| {
+            !entry.disabled
+                && !entry
+                    .throttled_until
+                    .map(|until| until > now)
+                    .unwrap_or(false)
+                && credential_matches_request(
+                    &entry.credentials,
+                    entry.id,
+                    model,
+                    group,
+                    &credential_support,
+                )
+        }) {
+            let fresh_count = entry
+                .rpm_window
+                .iter()
+                .filter(|&&ts| now.duration_since(ts) < window)
+                .count();
+            if fresh_count < limit {
+                return None;
+            }
+
+            // 窗口可能因运行时下调 limit 而暂时多于上限；需要等到
+            // fresh_count - limit + 1 个时间戳过期后才重新有额度。
+            let release_index = fresh_count - limit;
+            let release_at = entry
+                .rpm_window
+                .iter()
+                .filter(|&&ts| now.duration_since(ts) < window)
+                .nth(release_index)
+                .copied()
+                .expect("fresh_count 与窗口迭代结果应一致")
+                + window;
+            let remaining = release_at.saturating_duration_since(now);
+            let retry_after = remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                .max(1);
+            earliest_retry_after = Some(
+                earliest_retry_after
+                    .map(|current: u64| current.min(retry_after))
+                    .unwrap_or(retry_after),
+            );
+        }
+
+        earliest_retry_after
+    }
+
+    /// 尝试为一次真实业务请求预留 RPM 额度。
+    ///
+    /// **计数口径（明确选定，勿随手改）**：RPM 统计的是「该账号每分钟向上游发出多少次
+    /// 请求」，不是「客户端发了多少次请求」。因此：
+    /// - [`Self::acquire_context_excluding`]（模型请求）计入；
+    /// - [`Self::acquire_context`]（纯 MCP / WebSearch）计入——它同样是一次真实上游
+    ///   调用、同样消耗账号配额；一次带搜索的对话会占掉多格额度，这是有意为之，
+    ///   因为限流的目的是保护账号不被上游风控，而不是给客户端计费；
+    /// - [`Self::acquire_context_pinned`]（探针 / 诊断）不计入，与 provider 侧
+    ///   「pinned 调用不占并发门禁额度」保持同一口径；
+    /// - 模型发现走 `candidate_credential_ids`，根本不经过本路径，天然不计入。
+    ///
+    /// 在同一把 `entries` 锁内完成过期清理、上限检查和记账，避免多个并发请求
+    /// 在选择阶段同时通过只读检查后全部写入窗口而突破上限。返回 `false` 表示额度
+    /// 已被其它请求抢先占用，调用方应重新选择凭据。
+    fn record_request(&self, id: u64) -> bool {
+        let now = Instant::now();
+        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+            return false;
+        };
+        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            if !entry.rpm_window.is_empty() {
+                entry.rpm_window.clear();
+            }
+            return true;
+        }
+        let limit = self.account_rpm_limit.load(Ordering::Relaxed);
+        if limit == 0 {
+            entry.rpm_window.clear();
+            return true;
+        }
+        while let Some(&front) = entry.rpm_window.front() {
+            if now.duration_since(front) >= window {
+                entry.rpm_window.pop_front();
+            } else {
+                break;
+            }
+        }
+        if entry.rpm_window.len() >= limit as usize {
+            return false;
+        }
+        entry.rpm_window.push_back(now);
+        true
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -1595,6 +1784,10 @@ impl MultiTokenManager {
                 if e.throttled_until.map(|t| t > now).unwrap_or(false) {
                     return false;
                 }
+                // 本窗口 RPM 额度已耗尽：跳过，让请求故障转移到下一个账号
+                if self.rpm_exceeded(e, now) {
+                    return false;
+                }
                 // 模型/分组隔离：请求模型必须由该账号支持，且账号必须匹配请求分组
                 if !credential_matches_request(&e.credentials, e.id, model, group, &credential_support) {
                     return false;
@@ -1608,10 +1801,11 @@ impl MultiTokenManager {
         }
 
         let mode = self.load_balancing_mode.lock().clone();
-        let mode = mode.as_str();
 
-        match mode {
-            "balanced" => {
+        match LoadBalancingMode::parse(&mode) {
+            // Weighted 在 Task 7 接入 dispatcher；在此之前与 Balanced 同行为，
+            // 以便 Task 1 的集成测试能独立锁住「不被 current_id 绕过」这一条。
+            LoadBalancingMode::Balanced | LoadBalancingMode::Weighted => {
                 // Least-Used 策略：选择成功次数最少的凭据
                 // 平局时按优先级排序（数字越小优先级越高）
                 let entry = available
@@ -1620,7 +1814,7 @@ impl MultiTokenManager {
 
                 Some((entry.id, entry.credentials.clone()))
             }
-            _ => {
+            LoadBalancingMode::Priority => {
                 // priority 模式（默认）：选择优先级最高的
                 let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
                 Some((entry.id, entry.credentials.clone()))
@@ -1665,11 +1859,11 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                let mode = LoadBalancingMode::parse(self.load_balancing_mode.lock().as_str());
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                // balanced / weighted：每次请求都重新选号，不固定 current_id
+                // priority：优先使用 current_id 指向的凭据
+                let current_hit = if mode.is_dynamic() {
                     None
                 } else {
                     let entries = self.entries.lock();
@@ -1683,6 +1877,7 @@ impl MultiTokenManager {
                                 && !e.disabled
                                 && !excluded.contains(&e.id)
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                                && !self.rpm_exceeded(e, now)
                                 && credential_matches_request(&e.credentials, e.id, model, group, &credential_support)
                         })
                         .map(|e| (e.id, e.credentials.clone()))
@@ -1722,6 +1917,16 @@ impl MultiTokenManager {
                         (new_id, new_creds)
                     } else {
                         let entries = self.entries.lock();
+                        // 全灭原因优先归给 RPM：所有匹配候选都只是「本窗口额度用完」时，
+                        // 返回带 Retry-After 的类型化 429，而不是「所有凭据均已禁用」——
+                        // 后者会把一个 60 秒后自愈的临时状态误报成需要人工介入的故障。
+                        if let Some(retry_after) =
+                            self.rpm_retry_after_secs(&entries, model, group, Instant::now())
+                        {
+                            return Err(
+                                UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
+                            );
+                        }
                         // 注意：必须在 bail! 之前就地计算，
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
@@ -1744,6 +1949,13 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    // Token 获取期间额度可能被其它并发请求抢先占用；抢不到就重新选号。
+                    // 记账放在选号成功之后，是因为「选中但 token 刷不出来」的凭据
+                    // 并没有真的向上游发请求，不应该消耗它的窗口额度。
+                    if !self.record_request(id) {
+                        attempt_count += 1;
+                        continue;
+                    }
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -3166,6 +3378,7 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 throttled_until: None,
+                rpm_window: VecDeque::new(),
             });
         }
 
@@ -3547,7 +3760,7 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" {
+        if !matches!(mode.as_str(), "priority" | "balanced" | "weighted") {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -3641,6 +3854,89 @@ impl MultiTokenManager {
         config
             .save()
             .with_context(|| format!("持久化账号级风控配置失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// 获取单账号 RPM 限流开关（Admin API）
+    pub fn get_account_rpm_limit_enabled(&self) -> bool {
+        self.account_rpm_limit_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 获取单账号每分钟请求上限（Admin API）
+    pub fn get_account_rpm_limit(&self) -> u32 {
+        self.account_rpm_limit.load(Ordering::Relaxed)
+    }
+
+    /// 设置单账号 RPM 限流配置（Admin API）
+    ///
+    /// 任一参数传 `None` 表示不修改该字段。关闭限流时顺带清空所有滑动窗口，
+    /// 避免下次开启时沿用一批陈旧时间戳。
+    pub fn set_account_rpm_limit_config(
+        &self,
+        enabled: Option<bool>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<()> {
+        if let Some(value) = limit {
+            // 上限取值范围：1..=100000（与上游同口径）。0 会让「限流开着但谁都不受限」
+            // 这种自相矛盾的状态可配置出来，因此直接拒绝，而不是靠运行时把 0 当作不限流兜底。
+            if !(1..=100_000).contains(&value) {
+                anyhow::bail!("每分钟请求上限必须在 1..=100000 内: {}", value);
+            }
+        }
+
+        let prev_enabled = self.get_account_rpm_limit_enabled();
+        let prev_limit = self.get_account_rpm_limit();
+        let new_enabled = enabled.unwrap_or(prev_enabled);
+        let new_limit = limit.unwrap_or(prev_limit);
+
+        if new_enabled == prev_enabled && new_limit == prev_limit {
+            return Ok(());
+        }
+
+        self.account_rpm_limit_enabled
+            .store(new_enabled, Ordering::Relaxed);
+        self.account_rpm_limit.store(new_limit, Ordering::Relaxed);
+
+        if let Err(err) = self.persist_account_rpm_limit_config(new_enabled, new_limit) {
+            self.account_rpm_limit_enabled
+                .store(prev_enabled, Ordering::Relaxed);
+            self.account_rpm_limit.store(prev_limit, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        if !new_enabled {
+            for entry in self.entries.lock().iter_mut() {
+                entry.rpm_window.clear();
+            }
+        }
+
+        tracing::info!(
+            "单账号 RPM 限流配置已更新: enabled={}, limit={}",
+            new_enabled,
+            new_limit
+        );
+        Ok(())
+    }
+
+    fn persist_account_rpm_limit_config(&self, enabled: bool, limit: u32) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，RPM 限流配置仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.account_rpm_limit_enabled = enabled;
+        config.account_rpm_limit = limit;
+        config
+            .save()
+            .with_context(|| format!("持久化 RPM 限流配置失败: {}", config_path.display()))?;
 
         Ok(())
     }
@@ -4287,6 +4583,70 @@ mod tests {
         let ctx = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
+    }
+
+    /// 两个可用凭据：A（priority=1，优先级赢家）、B（priority=2）。
+    /// 都带有效 access_token，不 disabled、不 throttled。
+    fn test_manager_with_two_credentials() -> MultiTokenManager {
+        let config = Config::default();
+
+        let mut cred_a = KiroCredentials::default();
+        cred_a.priority = 1;
+        cred_a.access_token = Some("token-a".to_string());
+        cred_a.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut cred_b = KiroCredentials::default();
+        cred_b.priority = 2;
+        cred_b.access_token = Some("token-b".to_string());
+        cred_b.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        MultiTokenManager::new(config, vec![cred_a, cred_b], None, None, false).unwrap()
+    }
+
+    /// weighted 模式不得像 priority 模式那样命中 current_id 快路径。
+    ///
+    /// 差分设计（不依赖 success_count 轮转、不依赖调用次数，Task 7 引入 dispatcher
+    /// 后依然成立）：
+    /// 1. priority 模式下禁用 A，取号必然选中 B，current_id 被指向 B
+    /// 2. 重新启用 A，仍在 priority 模式下取号 → 应仍返回 B（对照组：证明快路径存在）
+    /// 3. 切到 weighted 模式取号 → 必须返回 A（优先级赢家，证明 weighted 未查 current_id）
+    #[tokio::test]
+    async fn weighted_mode_ignores_current_id_fast_path() {
+        let manager = test_manager_with_two_credentials();
+
+        // A 的 id 是 1（先插入），B 的 id 是 2
+        manager.set_disabled(1, true).unwrap();
+        let first = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(first.id, 2, "A 被禁用时应选中 B");
+
+        manager.set_disabled(1, false).unwrap();
+
+        // 对照组：priority 模式下 current_id 快路径应命中 B，尽管 A 才是优先级赢家
+        let control = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(
+            control.id, 2,
+            "priority 模式下应命中 current_id 快路径（B），而非重新按优先级选 A"
+        );
+
+        // weighted 模式：不应查 current_id，应按优先级重新选出 A
+        manager
+            .set_load_balancing_mode("weighted".to_string())
+            .unwrap();
+        let weighted_pick = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(
+            weighted_pick.id, 1,
+            "weighted 模式被 current_id 快路径绕过：应选出优先级赢家 A，实际选了 {}",
+            weighted_pick.id
+        );
+    }
+
+    #[test]
+    fn weighted_is_accepted_by_mode_validation() {
+        let manager = test_manager_with_two_credentials();
+        assert!(manager
+            .set_load_balancing_mode("weighted".to_string())
+            .is_ok());
+        assert_eq!(manager.get_load_balancing_mode(), "weighted");
     }
 
     #[test]
@@ -5436,5 +5796,110 @@ mod tests {
 
         let set = group_supported_models_from(&creds, Some("own"), &support).unwrap();
         assert!(set.contains("claude-opus-5"));
+    }
+
+    // ========================================================================
+    // 单账号 RPM 主动限流
+    // ========================================================================
+
+    fn rpm_manager(limit: u32, enabled: bool, count: usize) -> MultiTokenManager {
+        let mut config = Config::default();
+        config.account_rpm_limit_enabled = enabled;
+        config.account_rpm_limit = limit;
+        let creds = (0..count)
+            .map(|i| grouped_cred(&format!("tok{i}"), &[]))
+            .collect();
+        MultiTokenManager::new(config, creds, None, None, false).unwrap()
+    }
+
+    /// 默认关闭时，RPM 必须完全不参与调度：记多少次账都不影响选号。
+    /// 这条守的是「升级对存量部署无感」，与 config 层的默认值测试互为两端。
+    #[test]
+    fn rpm_limit_disabled_by_default_never_affects_scheduling() {
+        let manager = rpm_manager(1, false, 1);
+        for _ in 0..50 {
+            assert!(manager.record_request(1), "关闭时记账不应失败");
+        }
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1)
+        );
+        assert!(manager.entries.lock()[0].rpm_window.is_empty(), "关闭时窗口应始终为空");
+    }
+
+    /// 额度耗尽的凭据退出候选，请求故障转移到下一个账号。
+    #[test]
+    fn rpm_exhausted_credential_fails_over_to_next() {
+        let manager = rpm_manager(2, true, 2);
+        // 1 号用满 2 次
+        assert!(manager.record_request(1));
+        assert!(manager.record_request(1));
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(2),
+            "1 号耗尽后应选到 2 号"
+        );
+    }
+
+    /// 记账在同一把锁内完成检查与写入：超过上限的那一次必须返回 false，
+    /// 由调用方重新选号，而不是穿透只读检查后把窗口写爆。
+    #[test]
+    fn rpm_record_request_rejects_over_limit_reservation() {
+        let manager = rpm_manager(2, true, 1);
+        assert!(manager.record_request(1));
+        assert!(manager.record_request(1));
+        assert!(!manager.record_request(1), "第 3 次预留必须失败");
+        assert_eq!(manager.entries.lock()[0].rpm_window.len(), 2, "窗口不应超过上限");
+    }
+
+    /// 所有匹配候选都只是「额度用完」时，给出最早释放时间；
+    /// 只要还有一个有额度就返回 None（失败原因不是 RPM，不能误报 429）。
+    #[test]
+    fn rpm_retry_after_only_when_every_candidate_is_exhausted() {
+        let manager = rpm_manager(1, true, 2);
+        assert!(manager.record_request(1));
+
+        let now = Instant::now();
+        {
+            let entries = manager.entries.lock();
+            assert_eq!(
+                manager.rpm_retry_after_secs(&entries, None, None, now),
+                None,
+                "2 号还有额度时不应报 RPM 耗尽"
+            );
+        }
+
+        assert!(manager.record_request(2));
+        let entries = manager.entries.lock();
+        let retry_after = manager
+            .rpm_retry_after_secs(&entries, None, None, Instant::now())
+            .expect("全部耗尽时应给出 Retry-After");
+        assert!(
+            (1..=RPM_WINDOW_SECS).contains(&retry_after),
+            "Retry-After 应落在 1..={RPM_WINDOW_SECS} 秒内，实际 {retry_after}"
+        );
+    }
+
+    /// 关闭限流时顺带清空窗口，避免再次开启时沿用陈旧时间戳把新窗口一开就卡住。
+    #[test]
+    fn rpm_disabling_clears_existing_windows() {
+        let manager = rpm_manager(2, true, 1);
+        assert!(manager.record_request(1));
+        assert_eq!(manager.entries.lock()[0].rpm_window.len(), 1);
+
+        manager
+            .set_account_rpm_limit_config(Some(false), None)
+            .expect("关闭限流应成功");
+        assert!(manager.entries.lock()[0].rpm_window.is_empty());
+    }
+
+    /// 上限取值范围校验：0 与超大值都必须被拒，且拒绝后内存值不被污染。
+    #[test]
+    fn rpm_limit_rejects_out_of_range_values() {
+        let manager = rpm_manager(60, false, 1);
+        assert!(manager.set_account_rpm_limit_config(Some(true), Some(0)).is_err());
+        assert!(manager.set_account_rpm_limit_config(Some(true), Some(100_001)).is_err());
+        assert_eq!(manager.get_account_rpm_limit(), 60);
+        assert!(!manager.get_account_rpm_limit_enabled(), "校验失败不应改变开关");
     }
 }
