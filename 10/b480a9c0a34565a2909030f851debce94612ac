@@ -1,0 +1,44 @@
+src/admin/balance_cache.rs
+  s_af638f44356950::t_64bb4662ac00ab 1-121
+  s_af638f44356950::t_0b361f1d529f3a 122-158
+src/admin/service.rs
+  s_af638f44356950::t_b6fdc9b306dfdc 922-923,943-949,962
+  s_af638f44356950::t_a16ebf08126144 171
+  s_af638f44356950::t_da3bdc50527e81 4951
+  s_af638f44356950::t_fe5925934cb542 1369
+  s_af638f44356950::t_7e4ba1a2656c11 5104
+  s_af638f44356950::t_a37277f8703a6d 11-13
+  s_af638f44356950::t_b32050e53bda41 735
+  s_af638f44356950::t_1cc5fae6065235 540,547
+  s_af638f44356950::t_cfd1afaea057b9 2626
+  s_af638f44356950::t_2d558739d35328 4689
+  s_af638f44356950::t_80c20c566b1426 825,839-845
+  s_af638f44356950::t_c6a4a646e3da4f 2664
+  s_af638f44356950::t_6217b2cef561d3 4795
+  s_af638f44356950::t_318878c0d257c6 8
+  s_af638f44356950::t_972ac5ffe6fe40 632
+  s_af638f44356950::t_e26ea598811a6c 2586
+src/admin/mod.rs
+  s_af638f44356950::t_73312970c9756b 36
+src/main.rs
+  s_af638f44356950::t_b9756f4346a9c3 175-183
+  s_af638f44356950::t_8a6ae001f0e1ba 503-508
+src/admin/types.rs
+  s_af638f44356950::t_6850719be0acbd 318
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "10b480a9c0a34565a2909030f851debce94612ac",
+  "prompts": {},
+  "sessions": {
+    "s_af638f44356950": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7a349da2-ac5a-4445-b65f-b28b23898997",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
