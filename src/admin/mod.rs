@@ -33,6 +33,7 @@ pub mod usage_store;
 pub mod usage_stats;
 pub mod request_body_store;
 pub mod trace_db;
+pub mod balance_cache;
 
 pub use client_keys::ClientKeyManager;
 pub use groups::GroupManager;

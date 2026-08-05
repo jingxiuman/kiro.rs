@@ -1,14 +1,16 @@
 //! Admin API 业务逻辑服务
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Timelike, Utc};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::admin::balance_cache::{
+    BalanceCache, CachedBalance, SharedBalanceCache, BALANCE_CACHE_TTL_SECS,
+};
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
@@ -40,23 +42,11 @@ use super::types::{
     UpdateRefreshTokenRequest,
 };
 
-/// 余额缓存过期时间（秒），5 分钟
-const BALANCE_CACHE_TTL_SECS: i64 = 300;
-
 /// 在线检查更新结果缓存时间（秒），30 分钟。
 /// 在线检查更新结果缓存时间（秒），30 分钟。
 /// Docker Hub 的 tags 接口对匿名访问有 IP 维度的限流，30 分钟 TTL 既能让用户
 /// 看到红点提醒，又能避免短时间内重复请求被限流。
 const UPDATE_CHECK_TTL_SECS: i64 = 1800;
-
-/// 缓存的余额条目（含时间戳）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CachedBalance {
-    /// 缓存时间（Unix 秒）
-    cached_at: f64,
-    /// 缓存的余额数据
-    data: BalanceResponse,
-}
 
 /// 单条凭据导入结果（服务端内部用，映射为 SSE 事件）
 pub(crate) enum ImportStatus {
@@ -178,8 +168,7 @@ impl ModelSyncSettings {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
-    balance_cache: Mutex<HashMap<u64, CachedBalance>>,
-    cache_path: Option<PathBuf>,
+    balance_cache: SharedBalanceCache,
     /// 余额快照存储（DuckDB 时序），用于余额趋势与消耗速率。未注入时不记录历史。
     balance_store: Option<crate::admin::balance_store::SharedBalanceStore>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
@@ -548,19 +537,14 @@ impl AdminService {
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
         proxy_pool: Arc<ProxyPoolManager>,
+        balance_cache: SharedBalanceCache,
     ) -> Self {
-        let cache_path = token_manager
-            .cache_dir()
-            .map(|d| d.join("kiro_balance_cache.json"));
-
-        let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
         let model_sync = ModelSyncSettings::from_config(token_manager.config());
 
         let svc = Self {
             token_manager,
-            balance_cache: Mutex::new(balance_cache),
-            cache_path,
+            balance_cache,
             balance_store: None,
             known_endpoints: known_endpoints.into_iter().collect(),
             proxy_pool,
@@ -645,10 +629,7 @@ impl AdminService {
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
 
         // 一次性快照余额缓存，避免 N 次加锁
-        let balance_snapshot: HashMap<u64, CachedBalance> = {
-            let cache = self.balance_cache.lock();
-            cache.clone()
-        };
+        let balance_snapshot: HashMap<u64, CachedBalance> = self.balance_cache.snapshot().entries;
         let now_ts = Utc::now().timestamp() as f64;
 
         // balanced 模式下 `current_id` 只是内部调度指针（每次请求重新选号），
@@ -751,10 +732,7 @@ impl AdminService {
         let snapshot = self.token_manager.snapshot();
         let current_id = snapshot.current_id;
 
-        let cache_snapshot: HashMap<u64, CachedBalance> = {
-            let cache = self.balance_cache.lock();
-            cache.clone()
-        };
+        let cache_snapshot: HashMap<u64, CachedBalance> = self.balance_cache.snapshot().entries;
         let now_ts = Utc::now().timestamp() as f64;
 
         let mut disabled_ids: Vec<u64> = Vec::new();
@@ -844,7 +822,7 @@ impl AdminService {
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
         // 先查缓存
         {
-            let cache = self.balance_cache.lock();
+            let cache = self.balance_cache.snapshot().entries;
             if let Some(cached) = cache.get(&id) {
                 let now = Utc::now().timestamp() as f64;
                 if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
@@ -858,17 +836,13 @@ impl AdminService {
         let balance = self.fetch_balance(id).await?;
 
         // 更新缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.insert(
-                id,
-                CachedBalance {
-                    cached_at: Utc::now().timestamp() as f64,
-                    data: balance.clone(),
-                },
-            );
-        }
-        self.save_balance_cache();
+        self.balance_cache.upsert_one(
+            id,
+            CachedBalance {
+                cached_at: Utc::now().timestamp() as f64,
+                data: balance.clone(),
+            },
+        );
 
         Ok(balance)
     }
@@ -945,6 +919,8 @@ impl AdminService {
         let mut failure = 0_usize;
         // 本轮拿到的余额，批量落一次时序库（失败不影响余额刷新本身）
         let mut history: Vec<crate::admin::balance_store::BalanceSnapshot> = Vec::new();
+        // 以现有快照打底：失败的账号沿用旧值，成功的整轮结束后一次性覆盖发布
+        let mut collected: HashMap<u64, CachedBalance> = self.balance_cache.snapshot().entries;
 
         for entry in snapshot.entries.into_iter() {
             if entry.disabled {
@@ -964,16 +940,13 @@ impl AdminService {
                         usage_percentage: balance.usage_percentage,
                         next_reset_at: balance.next_reset_at.map(|v| v as i64),
                     });
-                    {
-                        let mut cache = self.balance_cache.lock();
-                        cache.insert(
-                            entry.id,
-                            CachedBalance {
-                                cached_at: Utc::now().timestamp() as f64,
-                                data: balance,
-                            },
-                        );
-                    }
+                    collected.insert(
+                        entry.id,
+                        CachedBalance {
+                            cached_at: Utc::now().timestamp() as f64,
+                            data: balance,
+                        },
+                    );
                     success += 1;
                 }
                 Err(e) => {
@@ -986,7 +959,7 @@ impl AdminService {
         }
 
         if success > 0 {
-            self.save_balance_cache();
+            self.balance_cache.publish(collected);
             if let Some(store) = &self.balance_store {
                 store.record_batch(&history);
             }
@@ -1393,11 +1366,7 @@ impl AdminService {
             .map_err(|e| self.classify_delete_error(e, id))?;
 
         // 清理已删除凭据的余额缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.remove(&id);
-        }
-        self.save_balance_cache();
+        self.balance_cache.remove(id);
 
         if let Some(trace_store) = &self.trace_store {
             trace_store.delete_for_credential(id);
@@ -2614,10 +2583,7 @@ impl AdminService {
     /// 由上游 setUserPreference 接口本身决定是否成功（不支持的订阅会返回 4xx 失败）。
     pub async fn enable_overage_for_all_capable(&self) -> EnableOverageAllResult {
         let snapshot = self.token_manager.snapshot();
-        let cache_snapshot: HashMap<u64, CachedBalance> = {
-            let cache = self.balance_cache.lock();
-            cache.clone()
-        };
+        let cache_snapshot: HashMap<u64, CachedBalance> = self.balance_cache.snapshot().entries;
         let now_ts = Utc::now().timestamp() as f64;
 
         // 选出需要操作的 ID 列表
@@ -2657,8 +2623,7 @@ impl AdminService {
                 Ok(()) => {
                     enabled_ids.push(id);
                     // 失效本地缓存
-                    let mut cache = self.balance_cache.lock();
-                    cache.remove(&id);
+                    self.balance_cache.remove(id);
                 }
                 Err(e) => {
                     tracing::warn!("一键开启超额：凭据 #{} 失败: {}", id, e);
@@ -2668,10 +2633,6 @@ impl AdminService {
             }
             // 节流
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        }
-
-        if !enabled_ids.is_empty() {
-            self.save_balance_cache();
         }
 
         EnableOverageAllResult {
@@ -2700,11 +2661,7 @@ impl AdminService {
             .map_err(|e| self.classify_balance_error(e, id))?;
 
         // 让本地缓存的 overage 状态失效（下次刷新时重新拉）
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.remove(&id);
-        }
-        self.save_balance_cache();
+        self.balance_cache.remove(id);
 
         // 异步触发一次新的余额查询（不阻塞响应）
         let svc_handle = self.token_manager.clone();
@@ -2715,63 +2672,6 @@ impl AdminService {
         });
 
         Ok(())
-    }
-
-    // ============ 余额缓存持久化 ============
-
-    fn load_balance_cache_from(cache_path: &Option<PathBuf>) -> HashMap<u64, CachedBalance> {
-        let path = match cache_path {
-            Some(p) => p,
-            None => return HashMap::new(),
-        };
-
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return HashMap::new(),
-        };
-
-        // 文件中使用字符串 key 以兼容 JSON 格式
-        let map: HashMap<String, CachedBalance> = match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("解析余额缓存失败，将忽略: {}", e);
-                return HashMap::new();
-            }
-        };
-
-        let now = Utc::now().timestamp() as f64;
-        map.into_iter()
-            .filter_map(|(k, v)| {
-                let id = k.parse::<u64>().ok()?;
-                // 丢弃超过 TTL 的条目
-                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    Some((id, v))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    fn save_balance_cache(&self) {
-        let path = match &self.cache_path {
-            Some(p) => p,
-            None => return,
-        };
-
-        // 持有锁期间完成序列化和写入，防止并发损坏
-        let cache = self.balance_cache.lock();
-        let map: HashMap<String, &CachedBalance> =
-            cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
-
-        match serde_json::to_string_pretty(&map) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
-                    tracing::warn!("保存余额缓存失败: {}", e);
-                }
-            }
-            Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
-        }
     }
 
     // ============ 代理池管理 ============
@@ -4786,7 +4686,7 @@ mod model_registry_tests {
             probe_credential_id: Some(1),
             allow_passthrough: false,
         }));
-        let service = AdminService::new(Arc::clone(&token_manager), Vec::<String>::new(), Arc::new(ProxyPoolManager::new(None, crate::model::config::TlsBackend::Rustls)))
+        let service = AdminService::new(Arc::clone(&token_manager), Vec::<String>::new(), Arc::new(ProxyPoolManager::new(None, crate::model::config::TlsBackend::Rustls)), Arc::new(BalanceCache::new(None)))
             .with_model_registry(Some(Arc::clone(&store)), Some(sync_service))
             .with_model_sync_settings(settings);
 
@@ -4892,7 +4792,7 @@ mod model_registry_tests {
             MultiTokenManager::new(Config::default(), vec![live_cred(1, "tok", 1)], None, None, true)
                 .unwrap(),
         );
-        AdminService::new(token_manager, Vec::<String>::new(), Arc::new(ProxyPoolManager::new(None, crate::model::config::TlsBackend::Rustls)))
+        AdminService::new(token_manager, Vec::<String>::new(), Arc::new(ProxyPoolManager::new(None, crate::model::config::TlsBackend::Rustls)), Arc::new(BalanceCache::new(None)))
     }
 
     /// M1：`PATCH /models/settings` 的未知字段必须明确报错，不能静默丢弃。
@@ -5048,6 +4948,7 @@ mod tests {
                 None,
                 crate::model::config::TlsBackend::Rustls,
             )),
+            Arc::new(BalanceCache::new(None)),
         );
         let raw = "invalid_grant: upstream-private-detail";
         let classified = service.classify_balance_error(
@@ -5200,6 +5101,7 @@ mod tests {
                 None,
                 crate::model::config::TlsBackend::Rustls,
             )),
+            Arc::new(BalanceCache::new(None)),
         )
     }
 

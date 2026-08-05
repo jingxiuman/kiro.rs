@@ -172,6 +172,15 @@ async fn main() {
         config.tls_backend,
     ));
 
+    // 余额缓存提前到 admin 分支之外创建：选路（weighted 模式）需要读余额，
+    // 而 AdminService 单向持有 token_manager，后者看不到 AdminService 私有字段。
+    // 抽成独立 Arc 由 main.rs 双向注入，参照上面 proxy_pool 的共享模式。
+    let balance_cache: admin::balance_cache::SharedBalanceCache = Arc::new(
+        admin::balance_cache::BalanceCache::new(
+            token_manager.cache_dir().map(|d| d.join("kiro_balance_cache.json")),
+        ),
+    );
+
     // kiro.duckdb 路径。usage / trace / ops 三个存储共用此文件（同一进程内 DuckDB
     // 实例上的独立连接），其中 trace 与 ops 必须共享同一「持久化 / 内存兜底」决策：
     // 否则会出现「运维页有历史统计、请求日志页却为空」的错位。
@@ -491,7 +500,12 @@ async fn main() {
                 )
             });
             let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone(), proxy_pool.clone())
+                admin::AdminService::new(
+                    token_manager.clone(),
+                    endpoint_names.clone(),
+                    proxy_pool.clone(),
+                    balance_cache.clone(),
+                )
                     .with_ops(ops_runtime.clone())
                     .with_log_governance(
                         Some(admin_trace_store.clone()),

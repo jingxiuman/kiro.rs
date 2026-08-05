@@ -315,7 +315,7 @@ pub struct BatchImportSummary {
 // ============ 余额查询 ============
 
 /// 余额查询响应
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BalanceResponse {
     /// 凭据 ID
