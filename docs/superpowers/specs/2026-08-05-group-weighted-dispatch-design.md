@@ -78,7 +78,26 @@
   - 状态语义是「自上次余额快照以来消耗了多少」，与候选集无关，账号被冷却期间不产生冻结信用，恢复后无补偿突发；
   - 可复算：能直接回答「为什么选了 A」——A 的有效剩余组内最高。
 
-关键前提（已验证）：`UsageRecordHook::record`（`src/anthropic/handlers.rs:70`）的 `credits: f64` 参数与余额的 `remaining` / `usageLimit` 同量纲（均为 credits，`usageLimit` 为 10000）。因此 `remaining − Σcredits` 是**精确**校正，而非按 token 数做的代理估算。
+关键前提：`UsageRecordHook::record`（`src/anthropic/handlers.rs:70`）的 `credits: f64` 参数与余额的 `remaining` / `usageLimit` 同量纲（均为 credits，`usageLimit` 为 10000）。
+
+### D5' 的量纲验证（2026-08-05，生产数据）
+
+按计费周期（`nextResetAt` = 2026-09-01，周期自 08-01 起）对齐、并截至余额快照时刻，`usage_records.credits` 累计与上游 `currentUsage` 的对比：
+
+| 账号 | 上游 currentUsage | 本地 credits 累计 | 偏差 |
+|---|---|---|---|
+| 1 | 2615.15 | 2617.42 | +0.1% |
+| 2 | 2625.28 | 2615.19 | −0.4% |
+| 10 | 14.08 | 14.35 | +1.9% |
+| 11 | 11.33 | 11.53 | +1.7% |
+
+高频账号误差均在 2% 以内，同量纲成立。
+
+**但本地累计会系统性低估，且必须限定其语义。** 同一批数据里 id4 上游报本周期已用 16.08 而本地零记录，id5 为 66.94 : 11.27，id8 为 49.59 : 2.95。原因是存在**本代理之外的消耗**：账号可能被其他客户端使用，且 admin 探针与 model-sync 走 `acquire_context_pinned`（`src/kiro/token_manager.rs`），不经过 `UsageRecordHook` 因而不计账。
+
+因此本设计对 `consumed` 的定位是：**刷新窗口内的尽力校正，不是账本**。真值始终是周期性刷新回来的 `remaining`；本地低估会在下一次 generation 切换（清空 `consumed`）时自动抹平，误差不累积。这也意味着 `MAX_STALE` 越长、外部消耗越多，调度偏差越大——这是 §9 第 3 项要权衡的量。
+
+`credits` 覆盖率同批数据核查：成功请求 21031 条中 21020 条 `credits > 0`（99.95%），缺失的 11 条 `credential_id = 0`（未分配到凭据）。故不需要按 token 估算替代值。
 
 ## 4. 架构
 
@@ -245,7 +264,8 @@ UsageRecordHook::record(credential_id, ..., credits, status)   (handlers.rs:70)
 | 冷却结束后会话不迁回原号 | 接受，不迁回 | cache 已在新号建立，迁回等于再丢一次 |
 | 组内全部余额 unavailable | 常数 0 + `argmin(consumed)` | 自动退化为最少消耗轮转，不除零、不返回空集 |
 | 组内全部 `remaining <= 0`（月底耗尽） | 仍选出最不负者，请求照常发出 | 由上游返回 402 走既有 quota-exhausted 路径 |
-| `credits` 为 0（上游未回报） | 见 §9，留待确认 | 影响长会话能否被正确计量 |
+| `credits` 为 0（上游未回报） | 按 0 计入，不做估算 | 实测覆盖率 99.95%，缺失者均为未分配凭据的请求，见 §3 量纲验证 |
+| 消耗发生在本代理之外 | 不校正，等下次 generation 切换抹平 | `consumed` 是窗口内尽力校正而非账本，真值是刷新回来的 `remaining` |
 
 ## 7. 测试
 
@@ -300,10 +320,11 @@ UsageRecordHook::record(credential_id, ..., credits, status)   (handlers.rs:70)
 
 ## 9. 待确认（实现前需定）
 
-以下由本人决定，属运营判断而非技术选型：
+~~1. `credits` 为 0 时如何计量。~~ **已由实测关闭**：覆盖率 99.95%，缺失者均为未分配凭据的请求，按 0 计入即可，不需要 token 估算。见 §3 量纲验证。
 
-1. **`credits` 为 0 时如何计量。** `UsageRecordHook::record` 会把非有限或非正的 `credits` 归零（`handlers.rs:92`）。若上游在部分路径不回报 credits，这些请求的消耗将完全不计入，长会话可能借此绕过均衡。需要定：是按 token 数估算一个替代值，还是接受漏计。
-2. **粘滞迁移阈值。** 除 §5 的排除原因外，是否在「粘滞账号的有效剩余低于组内最大值一定比例」时主动迁移。定了阈值就多一条迁移路径，代价是一次 cache 损失。
-3. **`MAX_STALE = 3600s` 是否合适。**
+以下两项由本人决定，属运营判断而非技术选型，实现到对应位置时确认：
+
+1. **粘滞迁移阈值。** 除 §5 的排除原因外，是否在「粘滞账号的有效剩余低于组内最大值一定比例」时主动迁移。定了阈值就多一条迁移路径，代价是一次 cache 损失。
+2. **`MAX_STALE = 3600s` 是否合适。** 权衡见 §3：外部消耗不被本地计入，`MAX_STALE` 越长、外部消耗越多，调度偏差越大。
 
 实现时先搭好 `dispatch.rs` 骨架与签名并留 TODO。
