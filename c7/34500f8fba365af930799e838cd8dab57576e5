@@ -1,0 +1,37 @@
+src/admin/service.rs
+  s_af638f44356950::t_7301fecdd0ee9b 5163-5168,5177-5178
+  s_af638f44356950::t_4db1ec4753dbc5 567
+  s_af638f44356950::t_2041fe89351e38 5162,5169-5176,5179-5183
+  s_af638f44356950::t_5e34ec1ea507da 2398-2400,2402,2416-2418
+  s_af638f44356950::t_4e5bb49e8acdd1 5105,5118,5126
+  s_af638f44356950::t_c251afd316a4b2 208-211
+  s_af638f44356950::t_231a1c0fd5b419 980,982-989
+  s_af638f44356950::t_55059bf6737ea2 2419
+src/main.rs
+  s_af638f44356950::t_b417208a073732 535-542
+admin-ui/src/api/credentials.ts
+  s_af638f44356950::t_ae179159c26208 404-405,410-411
+admin-ui/src/components/topbar-tools.tsx
+  s_af638f44356950::t_0fe86be43fa91b 36-50
+  s_af638f44356950::t_70d5691590e76d 383
+  s_af638f44356950::t_cd1c270607a234 87,89
+  s_af638f44356950::t_c8b0d1a2952a84 51-56
+  s_af638f44356950::t_e2597a5a6eccb8 342
+  s_af638f44356950::t_c31761e053a64d 282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "c734500f8fba365af930799e838cd8dab57576e5",
+  "prompts": {},
+  "sessions": {
+    "s_af638f44356950": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7a349da2-ac5a-4445-b65f-b28b23898997",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
