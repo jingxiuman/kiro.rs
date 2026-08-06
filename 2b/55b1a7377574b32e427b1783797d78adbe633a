@@ -1,0 +1,23 @@
+src/kiro/dispatch.rs
+  s_af638f44356950::t_5c53dd73d4586a 833-865
+src/anthropic/handlers.rs
+  s_af638f44356950::t_6bd6728a4991a2 982,2102
+  s_af638f44356950::t_b751235c766184 56-58,62,69-70
+  s_af638f44356950::t_4206fdce09d51c 115-122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "2b55b1a7377574b32e427b1783797d78adbe633a",
+  "prompts": {},
+  "sessions": {
+    "s_af638f44356950": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7a349da2-ac5a-4445-b65f-b28b23898997",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
