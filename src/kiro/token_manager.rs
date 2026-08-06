@@ -1059,14 +1059,6 @@ impl LoadBalancingMode {
         }
     }
 
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            Self::Priority => "priority",
-            Self::Balanced => "balanced",
-            Self::Weighted => "weighted",
-        }
-    }
-
     /// 动态选号模式：每次请求重新选，不固定 current_id。
     pub(crate) fn is_dynamic(&self) -> bool {
         matches!(self, Self::Balanced | Self::Weighted)
@@ -1877,7 +1869,7 @@ impl MultiTokenManager {
                 drop(entries);
 
                 let r = dispatcher.pick(group, &cands, &excluded_kinds, sticky_key, Instant::now());
-                tracing::debug!(
+                tracing::info!(
                     cred_id = r.cred_id,
                     reason = ?r.reason,
                     effective_remaining = r.effective_remaining,
@@ -4845,6 +4837,28 @@ mod tests {
             "错误应提示所有凭据禁用，实际: {}",
             err
         );
+    }
+
+    /// 契约守卫（M3）：`report_quota_exhausted` 写入的 `DisabledReason::QuotaExceeded`
+    /// 经 `snapshot()` 序列化后必须仍是字面量字符串 `"QuotaExceeded"`——
+    /// `src/admin/service.rs` 里的 quota 自愈探测逻辑（是否继续探测被禁用账号）
+    /// 靠字符串比较这个值，两边今天靠手写 match 对齐，没有共享类型或编译期检查。
+    /// 若日后这里改成 serde 派生（如变成 `quota_exceeded`）或改名，该测试必须先变红。
+    #[test]
+    fn quota_exhausted_snapshot_disabled_reason_is_quota_exceeded_literal() {
+        let config = Config::default();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        // 返回值语义是「禁用后是否还有其它可用凭据」，与本测试无关（此处只有
+        // 一条凭据，禁用后自然无可用，返回值恒为 false）——这里只关心
+        // disabled_reason 落盘后的字面量。
+        manager.report_quota_exhausted(1);
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
     }
 
     #[test]
