@@ -2628,6 +2628,36 @@ impl MultiTokenManager {
         result
     }
 
+    /// 余额刷新发现该账号额度已恢复时，解除 QuotaExceeded 禁用。
+    ///
+    /// 只解除 QuotaExceeded：手动停用、refresh token 失效等原因与额度无关，
+    /// 被余额恢复顺手唤醒会绕过人的意图。
+    pub fn clear_quota_disable_if_replenished(&self, id: u64, remaining: f64) {
+        if remaining <= 0.0 {
+            return;
+        }
+        let reenabled = {
+            let mut entries = self.entries.lock();
+            match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) if e.disabled && e.disabled_reason == Some(DisabledReason::QuotaExceeded) => {
+                    tracing::info!(
+                        "凭据 #{} 额度已恢复（remaining={:.2}），解除 quota 禁用",
+                        id,
+                        remaining
+                    );
+                    e.disabled = false;
+                    e.disabled_reason = None;
+                    e.failure_count = 0;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if reenabled {
+            self.save_stats_debounced();
+        }
+    }
+
     /// 报告指定凭据刷新 Token 失败。
     ///
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
@@ -4861,6 +4891,30 @@ mod tests {
             err
         );
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn quota_disabled_credential_is_reenabled_after_reset() {
+        let manager = test_manager_with_two_credentials();
+        manager.report_quota_exhausted(1);
+        assert!(manager.snapshot().entries.iter().any(|e| e.id == 1 && e.disabled));
+
+        // 上游返回了新周期的余额（remaining 恢复），应自动解除 QuotaExceeded 禁用
+        manager.clear_quota_disable_if_replenished(1, 9000.0);
+        let s = manager.snapshot();
+        let e = s.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!e.disabled, "月度重置后 quota 禁用应自动解除");
+    }
+
+    #[test]
+    fn reenable_does_not_touch_other_disable_reasons() {
+        let manager = test_manager_with_two_credentials();
+        manager.set_disabled(1, true).unwrap();
+        manager.clear_quota_disable_if_replenished(1, 9000.0);
+        assert!(
+            manager.snapshot().entries.iter().any(|e| e.id == 1 && e.disabled),
+            "手动禁用不得被余额恢复解除"
+        );
     }
 
     // ============ 凭据级 Region 优先级测试 ============
