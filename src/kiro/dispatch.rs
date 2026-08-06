@@ -100,6 +100,14 @@ impl GroupDispatcher {
     }
 
     /// candidates 非空。excluded 给出本次不可选者及其原因，sticky_key 为会话粘滞种子。
+    ///
+    /// 契约（I1）：若 `candidates` 中的所有 id 都在 `excluded` 里（例如同组
+    /// 多账号同时 quota 耗尽），本函数**降级放行**而不是 panic 或返回错误——
+    /// 返回值此时**可能仍属于 `excluded` 集合**（与仓库里并发门禁
+    /// `gate_bypass` 的降级语义一致：宁可放行一个不理想的候选，也不要让
+    /// 请求无路可走）。调用方若采用「pick → 失败 → 加入 excluded → 再
+    /// pick」的重试模式，必须自行设置重试上限，不能假设重试后一定会拿到
+    /// 一个不在 excluded 里的新 id。
     pub fn pick(
         &self,
         group: Option<&str>,
@@ -114,10 +122,14 @@ impl GroupDispatcher {
         let skey = sticky_key.map(|s| sticky_key_of(group, s));
 
         let mut st = self.state.lock();
-        if st.generation != snap.generation {
-            st.generation = snap.generation;
-            st.consumed.clear();
-        }
+        // 必须走单调的 sync_generation（`>` 而非 `!=`）：`snap` 的读取
+        // （上面的 `self.balance.snapshot()`）与这里拿到 `state` 锁之间没有
+        // 原子性，其他线程（`pick` 或 `report_consumption`）可能已经把
+        // `st.generation` 推进到比 `snap.generation` 更新的代次并写入了
+        // consumed；若在这里用 `!=` 比较，会把 `st.generation` 错误地
+        // **回退**到本线程手里这个过期的 `snap.generation`，连带清空别的
+        // 线程刚写入的消耗。完整推导见 `sync_generation` 的文档注释。
+        sync_generation(&mut st, snap.generation);
 
         // 本轮不可选者一律从候选池剔除，再参与有效剩余选号；否则平局规则
         // （相等有效剩余按 id 升序）可能把刚排除的那个又选回来。
@@ -205,6 +217,12 @@ fn sync_generation(st: &mut DispatchState, generation: u64) {
 
 /// 粘滞 key 前缀带 group：同一 session 经不同 client key 打到不同组时，
 /// 不应反复覆写同一条记录来回抖动。
+///
+/// M1：用裸 `|` 分隔，group 或 seed 含 `|` 时不同的 (group, seed) 组合可能
+/// 拼出同一个 key（如 `("a|b", "c")` 与 `("a", "b|c")`）。当前 group 是
+/// 运维配置的短名、seed 是 UUID，都不含 `|`，风险不可达，故不引入转义或
+/// 长度前缀——没有当前收益不加复杂度。若日后 group/seed 的取值来源变得不
+/// 可控，需要重新评估。
 fn sticky_key_of(group: Option<&str>, seed: &str) -> String {
     format!("{}|{}", group.unwrap_or(""), seed)
 }
@@ -562,6 +580,65 @@ mod tests {
         // 代次 2），1 的有效剩余仍是满额 5000，argmax 会错误选回 1。修复后
         // 代次不会回退，1 的有效剩余应为 5000 - 4000 = 1000 < 5000，胜者应为 2。
         assert_eq!(pick(&d, &c), 2, "过期代次的 report_consumption 写入不应被后续 pick 清空");
+    }
+
+    #[test]
+    fn pick_does_not_regress_generation_when_state_already_advanced() {
+        // 复现 C1：`pick` 自己的 `self.balance.snapshot()` 读到的代次，可能
+        // 落后于此刻的 `state.generation`——现实中这来自
+        // `report_consumption` 读 `balance.generation()` 与拿到 `state` 锁
+        // 之间的非原子窗口，被另一个线程的 `pick` 抢先推进并写入了消耗。
+        //
+        // 与 `report_consumption_survives_stale_generation_race` 的区别：
+        // 那条测试在最后一次断言前手工调用私有的 `sync_generation`，绕过了
+        // `pick` 自己读取 snapshot 这一步；到它最后调 `pick()` 断言时，
+        // `state.generation` 早已等于当前 `snap.generation`，`!=` 与 `>`
+        // 结果一致，测不出 `pick` 内部若用 `!=` 会不会自己踩坑。这条测试
+        // 直接摆好「state.generation 领先于 pick 即将读到的 balance 代次」
+        // 这个前提，让 `pick()` 走一遍它自己真实的
+        // `snapshot → lock → 判代次` 路径。
+        let cache = std::sync::Arc::new(BalanceCache::new(None));
+        let mk = |r: f64| CachedBalance {
+            cached_at: now_ts(),
+            data: BalanceResponse { remaining: r, next_reset_at: Some(now_ts() + 86400.0), ..Default::default() },
+        };
+        cache.publish(HashMap::from([(1, mk(5000.0)), (2, mk(5000.0))])); // 真实代次 = 1
+        let d = GroupDispatcher::new(cache.clone());
+        let c = cands(&[1, 2]);
+
+        // 手工把 state.generation 摆到领先于当前 balance 真实代次（1）的
+        // 位置，并写入一条已经在这个新代次下记的消耗——代表另一线程已经
+        // 越过 pick 把 state 推到了这个代次。真实并发下这一步由另一线程的
+        // pick/report_consumption 完成；这里直接摆结果，聚焦测 pick 自己
+        // 遇到这个局面时的行为。
+        {
+            let mut st = d.state.lock();
+            st.generation = 99;
+            st.consumed.insert(("".to_string(), 1), 4000.0);
+        }
+
+        // pick() 内部调用 self.balance.snapshot()，读到真实代次 1——低于
+        // state.generation(99)。若用 `!=`，会误判"代次变了"，把
+        // state.generation 回退到 1 并清空刚写入的 consumed：1 的有效剩余
+        // 被错误地重新算成满额 5000，胜者会错误地变回 1。用单调的 `>` 则
+        // 不做任何清空：1 的有效剩余仍是 5000 - 4000 = 1000，胜者应为 2。
+        assert_eq!(
+            pick(&d, &c),
+            2,
+            "state.generation 领先于 pick 本次读到的 balance 代次时，不得回退清空 consumed"
+        );
+    }
+
+    #[test]
+    fn all_candidates_excluded_degrades_to_a_valid_id_not_panic() {
+        // I1 契约：候选全部被排除时降级放行——不 panic，但返回值可能仍属于
+        // excluded 集合。这里只固定"不 panic 且返回合法 id"这一行为，调用方
+        // 若据此重试须自行设置重试上限（见 `pick` 文档注释）。
+        let d = disp(&[(1, 5000.0), (2, 5000.0)]);
+        let c = cands(&[1, 2]);
+        let ex = HashMap::from([(1, ExclusionKind::Durable), (2, ExclusionKind::Transient)]);
+        let r = d.pick(None, &c, &ex, None, Instant::now());
+        assert!(c.iter().any(|cand| cand.id == r.cred_id), "全员排除时仍应返回候选池内的合法 id");
     }
 
     #[test]
