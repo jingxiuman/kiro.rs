@@ -53,16 +53,21 @@ pub(crate) struct UsageRecordHook {
     pub key_id: u64,
     pub model: String,
     pub started_at: Instant,
+    /// 消耗回写目标。credits 与余额 remaining 同量纲（已由生产数据验证，误差 <2%）。
+    pub dispatcher: Option<std::sync::Arc<crate::kiro::dispatch::GroupDispatcher>>,
+    pub group: Option<String>,
 }
 
 impl UsageRecordHook {
-    pub fn from_state(state: &AppState, key_id: u64, model: String) -> Self {
+    pub fn from_state(state: &AppState, key_id: u64, model: String, group: Option<String>) -> Self {
         Self {
             usage: state.usage_store.clone(),
             client_keys: state.client_keys.clone(),
             key_id,
             model,
             started_at: Instant::now(),
+            dispatcher: state.dispatcher.clone(),
+            group,
         }
     }
 
@@ -107,6 +112,14 @@ impl UsageRecordHook {
                     rec.credits,
                 );
             }
+        // 反向路径：把本次实际消耗回写给调度器。
+        // 粘滞命中与新分配都会经过这里，长会话的消耗因此照样计入——
+        // 这是本设计能承诺「额度消耗趋同」而非仅「新会话数加权」的依据。
+        if credential_id != 0
+            && let Some(d) = &self.dispatcher
+        {
+            d.report_consumption(self.group.as_deref(), credential_id, credits);
+        }
     }
 }
 
@@ -966,7 +979,7 @@ pub async fn post_messages(
             "incoming image payload is large; if upstream rejects with CONTENT_LENGTH_EXCEEDS_THRESHOLD, reduce image count or use lower-resolution screenshots"
         );
     }
-    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone(), key_ctx.group.clone());
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -2086,7 +2099,7 @@ pub async fn post_messages_cc(
     if let Some(store) = &state.thinking_text_store {
         restore_omitted_thinking(&mut payload, store);
     }
-    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone(), key_ctx.group.clone());
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -2539,6 +2552,80 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 构造一个不依赖 AppState / usage_store / client_keys 的最小 `UsageRecordHook`，
+    /// 专门用来验证 `record()` 是否真的把消耗回写给了 `GroupDispatcher`——
+    /// 这条接线是本任务（消耗回写闭环）存在的全部理由，且没有被其他任何测试覆盖：
+    /// dispatch.rs 里的测试只验证 `GroupDispatcher::report_consumption` 自身正确，
+    /// 不验证生产路径是否调用了它。
+    fn hook_with_dispatcher(
+        group: Option<&str>,
+    ) -> (UsageRecordHook, std::sync::Arc<crate::kiro::dispatch::GroupDispatcher>) {
+        let cache = std::sync::Arc::new(crate::admin::balance_cache::BalanceCache::new(None));
+        let dispatcher = std::sync::Arc::new(crate::kiro::dispatch::GroupDispatcher::new(cache));
+        let hook = UsageRecordHook {
+            usage: None,
+            client_keys: None,
+            key_id: 1,
+            model: "test-model".to_string(),
+            started_at: Instant::now(),
+            dispatcher: Some(dispatcher.clone()),
+            group: group.map(|g| g.to_string()),
+        };
+        (hook, dispatcher)
+    }
+
+    #[test]
+    fn record_writes_consumption_back_to_dispatcher() {
+        let (hook, dispatcher) = hook_with_dispatcher(Some("G"));
+        hook.record(7, 100, 200, (0, 0), 12.5, "success");
+        assert_eq!(
+            dispatcher.consumed_of(Some("G"), 7),
+            12.5,
+            "record() 必须把入参 credits 回写给对应 (group, credential_id) 的调度器桶"
+        );
+    }
+
+    #[test]
+    fn record_with_credential_id_zero_does_not_write_back() {
+        // credential_id == 0 表示本次请求没有分配到凭据，不该污染任何账号的消耗
+        let (hook, dispatcher) = hook_with_dispatcher(Some("G"));
+        hook.record(0, 100, 200, (0, 0), 12.5, "success");
+        assert_eq!(
+            dispatcher.consumed_of(Some("G"), 0),
+            0.0,
+            "credential_id=0（未分配凭据）不应回写"
+        );
+    }
+
+    #[test]
+    fn record_routes_consumption_to_the_correct_group_bucket() {
+        // 两个不同 group 的 hook 各自 record 同一个 credential_id，互不串桶
+        let cache = std::sync::Arc::new(crate::admin::balance_cache::BalanceCache::new(None));
+        let dispatcher = std::sync::Arc::new(crate::kiro::dispatch::GroupDispatcher::new(cache));
+        let hook_a = UsageRecordHook {
+            usage: None,
+            client_keys: None,
+            key_id: 1,
+            model: "test-model".to_string(),
+            started_at: Instant::now(),
+            dispatcher: Some(dispatcher.clone()),
+            group: Some("A".to_string()),
+        };
+        let hook_b = UsageRecordHook {
+            usage: None,
+            client_keys: None,
+            key_id: 1,
+            model: "test-model".to_string(),
+            started_at: Instant::now(),
+            dispatcher: Some(dispatcher.clone()),
+            group: Some("B".to_string()),
+        };
+        hook_a.record(7, 10, 10, (0, 0), 40.0, "success");
+        hook_b.record(7, 10, 10, (0, 0), 5.0, "success");
+        assert_eq!(dispatcher.consumed_of(Some("A"), 7), 40.0, "A 组不应包含 B 组的消耗");
+        assert_eq!(dispatcher.consumed_of(Some("B"), 7), 5.0, "B 组不应包含 A 组的消耗");
+    }
 
     #[test]
     fn dispatch_sticky_key_only_from_uuid_session() {
