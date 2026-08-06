@@ -532,10 +532,14 @@ async fn main() {
                 request_body_store.clone(),
             );
 
-            // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
-            admin_state
-                .service
-                .start_balance_refresher(std::time::Duration::from_secs(300));
+            // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）。
+            // 只有 weighted 模式需要读余额——priority/balanced 不读余额，
+            // 无条件启动会让默认部署凭空多出周期性上游余额请求。
+            if token_manager.get_load_balancing_mode() == "weighted" {
+                admin_state
+                    .service
+                    .start_balance_refresher(std::time::Duration::from_secs(300));
+            }
 
             // 启动代理池健康检查调度器（每 5 分钟一次）
             admin_state

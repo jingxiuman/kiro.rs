@@ -205,6 +205,10 @@ pub struct AdminService {
     /// 走同一个 provider（同一份账号池 / 代理 / 端点解析），否则测出来的
     /// 不是「本代理实际会发生什么」。未注入时该端点返回明确的未配置错误。
     kiro_provider: Option<Arc<crate::kiro::provider::KiroProvider>>,
+    /// 余额后台刷新调度器是否已启动。只有 weighted 模式需要读余额；
+    /// priority/balanced 下无条件启动会凭空多出周期性上游请求。
+    /// `compare_exchange` 防止模式来回切换时重复启动多个循环任务。
+    balance_refresher_running: std::sync::atomic::AtomicBool,
 }
 
 /// Social 登录会话状态
@@ -560,6 +564,7 @@ impl AdminService {
             model_registry_store: None,
             model_sync_service: None,
             kiro_provider: None,
+            balance_refresher_running: std::sync::atomic::AtomicBool::new(false),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -972,7 +977,16 @@ impl AdminService {
     /// - 启动后立刻执行一次刷新
     /// - 之后按 `interval` 周期循环刷新
     /// - 调用方持有 `Arc<Self>` 即可，任务在后台 tokio runtime 上运行
+    /// - 幂等：重复调用（例如模式来回切换）不会启动第二个循环任务
     pub fn start_balance_refresher(self: &Arc<Self>, interval: std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        if self
+            .balance_refresher_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
         let svc = Arc::clone(self);
         tokio::spawn(async move {
             // 启动后稍等片刻，让上游/Token Manager 准备就绪
@@ -2381,8 +2395,11 @@ impl AdminService {
     }
 
     /// 设置负载均衡模式
+    ///
+    /// 切到 `weighted` 时启动余额后台刷新（该模式靠余额选号）；切走时不停——
+    /// 已启动的任务留着代价极小，且切回来无需重启。
     pub fn set_load_balancing_mode(
-        &self,
+        self: &Arc<Self>,
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
         // 验证模式值
@@ -2395,6 +2412,10 @@ impl AdminService {
         self.token_manager
             .set_load_balancing_mode(req.mode.clone())
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        if req.mode == "weighted" {
+            self.start_balance_refresher(std::time::Duration::from_secs(300));
+        }
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
     }
@@ -5081,7 +5102,7 @@ mod tests {
     }
 
     /// 两条凭据（priority 0 / 1），负载均衡模式由参数决定。
-    fn service_with_balancing_mode(mode: &str) -> AdminService {
+    fn service_with_balancing_mode(mode: &str) -> Arc<AdminService> {
         let mut config = Config::default();
         config.load_balancing_mode = mode.to_string();
         let manager = Arc::new(
@@ -5094,7 +5115,7 @@ mod tests {
             )
             .unwrap(),
         );
-        AdminService::new(
+        Arc::new(AdminService::new(
             manager,
             Vec::<String>::new(),
             Arc::new(ProxyPoolManager::new(
@@ -5102,7 +5123,7 @@ mod tests {
                 crate::model::config::TlsBackend::Rustls,
             )),
             Arc::new(BalanceCache::new(None)),
-        )
+        ))
     }
 
     /// balanced 模式下 `current_id` 只是内部调度指针（每次请求都重新选号），
@@ -5137,5 +5158,27 @@ mod tests {
             response.credentials[1..].iter().all(|item| !item.is_current),
             "当前凭据必须唯一"
         );
+    }
+
+    // 注：brief 里写的是 `#[test]`，但 AdminService::new 在构造函数内 `tokio::spawn`
+    // 了会话清理任务（见上面的 idc/social 后台任务），脱离 tokio 运行时会直接 panic
+    // 「there is no reactor running」。本文件里所有构造 AdminService 的测试都用
+    // `#[tokio::test]`（见 balanced_mode_exposes_no_current_credential 等），这里保持一致。
+    #[tokio::test]
+    async fn weighted_mode_is_accepted_by_admin_api() {
+        let service = service_with_balancing_mode("priority");
+        let r = service.set_load_balancing_mode(SetLoadBalancingModeRequest {
+            mode: "weighted".to_string(),
+        });
+        assert!(r.is_ok(), "admin API 必须接受 weighted");
+        assert_eq!(service.token_manager.get_load_balancing_mode(), "weighted");
+    }
+
+    #[tokio::test]
+    async fn invalid_mode_still_rejected() {
+        let service = service_with_balancing_mode("priority");
+        assert!(service
+            .set_load_balancing_mode(SetLoadBalancingModeRequest { mode: "nonsense".into() })
+            .is_err());
     }
 }
