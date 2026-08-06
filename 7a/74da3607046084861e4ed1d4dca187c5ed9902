@@ -1,0 +1,22 @@
+src/kiro/token_manager.rs
+  s_af638f44356950::t_0f7128b5896763 4854-4857
+  s_af638f44356950::t_908280b627c984 1872
+  s_af638f44356950::t_daaefe4bf3e21f 4842-4853,4858-4861
+  s_af638f44356950::t_42250688fed46e 4862-4863
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "7a74da3607046084861e4ed1d4dca187c5ed9902",
+  "prompts": {},
+  "sessions": {
+    "s_af638f44356950": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7a349da2-ac5a-4445-b65f-b28b23898997",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
