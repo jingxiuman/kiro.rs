@@ -1,0 +1,28 @@
+src/kiro/provider.rs
+  s_6e30e06a2f0f7c::t_6ac300a636306b 382,396-398
+  s_6e30e06a2f0f7c::t_f80d7f79a44adf 399
+src/anthropic/websearch_loop.rs
+  s_6e30e06a2f0f7c::t_465e53872ce522 443
+  s_6e30e06a2f0f7c::t_f8479db52f23e1 763-769,772-775
+  s_6e30e06a2f0f7c::t_801c3c83808d65 639
+  s_6e30e06a2f0f7c::t_5daacef39f7308 811-817,820-825
+  s_6e30e06a2f0f7c::t_ca2a6078828b31 1088-1131
+  s_6e30e06a2f0f7c::t_9e270074f4676a 86-138,140-148
+  s_6e30e06a2f0f7c::t_2f81d489b734fc 1132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "d469789ce3946e59f8a81f80f439109da47000a9",
+  "prompts": {},
+  "sessions": {
+    "s_6e30e06a2f0f7c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c6b54644-04aa-4961-98f0-47b3945cc4ab",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
