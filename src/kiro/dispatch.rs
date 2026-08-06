@@ -28,6 +28,7 @@ pub const STICKY_IDLE_SECS: u64 = 30 * 60;
 /// 粘滞表容量上限。防止刷 UUID 的客户端打爆内存，正常负载远用不满。
 pub const STICKY_CAPACITY: usize = 10_000;
 
+#[derive(Clone, Copy)]
 pub struct Candidate {
     pub id: u64,
     pub priority: i32,
@@ -98,52 +99,77 @@ impl GroupDispatcher {
         *slot += credits;
     }
 
-    /// candidates 非空。excluded 给出本次不可选者及其原因（Task 4 用于粘滞判定）。
+    /// candidates 非空。excluded 给出本次不可选者及其原因，sticky_key 为会话粘滞种子。
     pub fn pick(
         &self,
         group: Option<&str>,
         candidates: &[Candidate],
-        _excluded: &HashMap<u64, ExclusionKind>,
-        _sticky_key: Option<&str>,
-        _now: Instant,
+        excluded: &HashMap<u64, ExclusionKind>,
+        sticky_key: Option<&str>,
+        now: Instant,
     ) -> PickResult {
         debug_assert!(!candidates.is_empty(), "调用方须保证候选非空");
         let snap = self.balance.snapshot();
         let g = group.unwrap_or("").to_string();
+        let skey = sticky_key.map(|s| sticky_key_of(group, s));
 
         let mut st = self.state.lock();
-        sync_generation(&mut st, snap.generation);
+        if st.generation != snap.generation {
+            st.generation = snap.generation;
+            st.consumed.clear();
+        }
 
-        let now_ts = chrono::Utc::now().timestamp() as f64;
-        let balances = resolve_balances(candidates, &snap.entries, now_ts);
+        // 本轮不可选者一律从候选池剔除，再参与有效剩余选号；否则平局规则
+        // （相等有效剩余按 id 升序）可能把刚排除的那个又选回来。
+        // 若剔除后候选池为空（全员本轮不可用），退化为不剔除——好过 panic
+        // 或返回空结果，调用方仍能拿到一个可重试的候选。
+        let available = filter_excluded(candidates, excluded);
 
-        let winner = candidates
-            .iter()
-            .map(|c| {
-                let consumed = st.consumed.get(&(g.clone(), c.id)).copied().unwrap_or(0.0);
-                (c, balances[&c.id] - consumed)
-            })
-            .max_by(|(ca, ea), (cb, eb)| {
-                // 有效剩余降序 → priority 升序 → id 升序，保证可复算。
-                //
-                // `Iterator::max_by` 在比较器返回 Equal 时保留**后遇到的**元素
-                // （"取最后一个最大值"）；本闭包对 priority/id 特意反过来比较
-                // （`cb` 减 `ca`）正是利用这个语义：当 ea == eb 时，只有
-                // priority 更小（或 id 更小）的候选让整体比较结果为
-                // Greater，才会被 max_by 判定为"更大"从而在平局中胜出。
-                // 这个方向依赖 max_by 的"后者优先"这一不那么广为人知的规则——
-                // 若日后有人改成看似等价的 `sort_by` + 取首元素，排序是稳定的
-                // （相等元素保持原相对顺序，取最小/第一个），平局方向会静默
-                // 反转，务必保持用 max_by 或显式反转比较逻辑。
-                ea.partial_cmp(eb)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| cb.priority.cmp(&ca.priority))
-                    .then_with(|| cb.id.cmp(&ca.id))
-            })
-            .map(|(c, _)| c.id)
-            .expect("candidates 非空");
+        // 1. 查粘滞
+        if let Some(k) = &skey {
+            let hit = st.sticky.get(k).and_then(|e| {
+                if now.duration_since(e.last_seen).as_secs() > STICKY_IDLE_SECS {
+                    None
+                } else {
+                    Some(e.cred_id)
+                }
+            });
+            if let Some(cred_id) = hit {
+                match excluded.get(&cred_id) {
+                    // 1a. 目标可用：命中，刷新 last_seen
+                    None if candidates.iter().any(|c| c.id == cred_id) => {
+                        if let Some(e) = st.sticky.get_mut(k) {
+                            e.last_seen = now;
+                        }
+                        return PickResult { cred_id, reason: PickReason::StickyHit };
+                    }
+                    // 1b. 临时排除：本次换号，但保留粘滞记录
+                    Some(ExclusionKind::Transient) => {
+                        let alt = select_by_effective_remaining(&available, &st, &g, &snap);
+                        return PickResult { cred_id: alt, reason: PickReason::TransientFallback };
+                    }
+                    // 1c. 长期排除或已不在候选池：迁移
+                    _ => {
+                        let alt = select_by_effective_remaining(&available, &st, &g, &snap);
+                        st.sticky.insert(k.clone(), StickyEntry { cred_id: alt, last_seen: now });
+                        return PickResult { cred_id: alt, reason: PickReason::StickyMigrated };
+                    }
+                }
+            }
+        }
 
+        // 2. 无粘滞或已过期：重新选号
+        let winner = select_by_effective_remaining(&available, &st, &g, &snap);
+        if let Some(k) = skey {
+            evict_if_full(&mut st.sticky, now);
+            st.sticky.insert(k, StickyEntry { cred_id: winner, last_seen: now });
+        }
         PickResult { cred_id: winner, reason: PickReason::FreshSelect }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sticky_len(&self) -> usize {
+        self.state.lock().sticky.len()
     }
 }
 
@@ -174,6 +200,79 @@ fn sync_generation(st: &mut DispatchState, generation: u64) {
     if generation > st.generation {
         st.generation = generation;
         st.consumed.clear();
+    }
+}
+
+/// 粘滞 key 前缀带 group：同一 session 经不同 client key 打到不同组时，
+/// 不应反复覆写同一条记录来回抖动。
+fn sticky_key_of(group: Option<&str>, seed: &str) -> String {
+    format!("{}|{}", group.unwrap_or(""), seed)
+}
+
+/// 剔除本轮不可选者（无论 Transient 还是 Durable）。
+///
+/// 不剔除的话，平局规则（有效剩余相等按 id 升序）可能把刚被排除的候选又
+/// 选回来——两账号余额相同时尤其容易触发。全员本轮不可用则退化为不剔除，
+/// 好过返回空集或 panic：调用方至少能拿到一个可重试的候选。
+fn filter_excluded(candidates: &[Candidate], excluded: &HashMap<u64, ExclusionKind>) -> Vec<Candidate> {
+    if excluded.is_empty() {
+        return candidates.to_vec();
+    }
+    let filtered: Vec<Candidate> = candidates.iter().copied().filter(|c| !excluded.contains_key(&c.id)).collect();
+    if filtered.is_empty() { candidates.to_vec() } else { filtered }
+}
+
+fn select_by_effective_remaining(
+    candidates: &[Candidate],
+    st: &DispatchState,
+    g: &str,
+    snap: &crate::admin::balance_cache::BalanceSnapshotView,
+) -> u64 {
+    let now_ts = chrono::Utc::now().timestamp() as f64;
+    let balances = resolve_balances(candidates, &snap.entries, now_ts);
+    candidates
+        .iter()
+        .map(|c| {
+            let consumed = st.consumed.get(&(g.to_string(), c.id)).copied().unwrap_or(0.0);
+            (c, balances[&c.id] - consumed)
+        })
+        .max_by(|(ca, ea), (cb, eb)| {
+            // 有效剩余降序 → priority 升序 → id 升序，保证可复算。
+            //
+            // `Iterator::max_by` 在比较器返回 Equal 时保留**后遇到的**元素
+            // （"取最后一个最大值"）；本闭包对 priority/id 特意反过来比较
+            // （`cb` 减 `ca`）正是利用这个语义：当 ea == eb 时，只有
+            // priority 更小（或 id 更小）的候选让整体比较结果为
+            // Greater，才会被 max_by 判定为"更大"从而在平局中胜出。
+            // 这个方向依赖 max_by 的"后者优先"这一不那么广为人知的规则——
+            // 若日后有人改成看似等价的 `sort_by` + 取首元素，排序是稳定的
+            // （相等元素保持原相对顺序，取最小/第一个），平局方向会静默
+            // 反转，务必保持用 max_by 或显式反转比较逻辑。
+            ea.partial_cmp(eb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| cb.priority.cmp(&ca.priority))
+                .then_with(|| cb.id.cmp(&ca.id))
+        })
+        .map(|(c, _)| c.id)
+        .expect("candidates 非空")
+}
+
+/// 到量时先清全部过期条目，仍满则 O(n) 淘汰 last_seen 最早的一条。
+/// 不引入 lru 依赖：正常负载下 30min 过期会让表远小于上限，O(n) 基本不触发。
+fn evict_if_full(sticky: &mut HashMap<String, StickyEntry>, now: Instant) {
+    if sticky.len() < STICKY_CAPACITY {
+        return;
+    }
+    sticky.retain(|_, e| now.duration_since(e.last_seen).as_secs() <= STICKY_IDLE_SECS);
+    while sticky.len() >= STICKY_CAPACITY {
+        let Some(oldest) = sticky
+            .iter()
+            .min_by_key(|(_, e)| e.last_seen)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        sticky.remove(&oldest);
     }
 }
 
@@ -480,5 +579,118 @@ mod tests {
             Candidate { id: 3, priority: 1 },
         ];
         assert_eq!(pick(&d, &c2), 3, "priority 也相同则按 id 升序");
+    }
+
+    fn pick_sticky(d: &GroupDispatcher, c: &[Candidate], key: &str, now: Instant) -> PickResult {
+        d.pick(None, c, &HashMap::new(), Some(key), now)
+    }
+
+    #[test]
+    fn sticky_key_returns_same_credential() {
+        let d = disp(&[(1, 5000.0), (2, 5000.0)]);
+        let c = cands(&[1, 2]);
+        let now = Instant::now();
+        let first = pick_sticky(&d, &c, "sess-a", now).cred_id;
+        for _ in 0..5 {
+            let r = pick_sticky(&d, &c, "sess-a", now);
+            assert_eq!(r.cred_id, first);
+            assert_eq!(r.reason, PickReason::StickyHit);
+        }
+    }
+
+    #[test]
+    fn transient_exclusion_does_not_migrate_sticky() {
+        let d = disp(&[(1, 5000.0), (2, 5000.0)]);
+        let c = cands(&[1, 2]);
+        let now = Instant::now();
+        let pinned = pick_sticky(&d, &c, "sess-a", now).cred_id;
+        let other = if pinned == 1 { 2 } else { 1 };
+
+        // 目标被临时排除（队满/RPM 竞争）：本次换号但不得改写粘滞
+        let ex = HashMap::from([(pinned, ExclusionKind::Transient)]);
+        let r = d.pick(None, &c, &ex, Some("sess-a"), now);
+        assert_eq!(r.cred_id, other);
+        assert_eq!(r.reason, PickReason::TransientFallback);
+
+        // 排除解除后必须回到原号
+        let back = pick_sticky(&d, &c, "sess-a", now);
+        assert_eq!(back.cred_id, pinned, "临时拥塞不应永久迁移会话");
+        assert_eq!(back.reason, PickReason::StickyHit);
+    }
+
+    #[test]
+    fn durable_exclusion_migrates_sticky() {
+        let d = disp(&[(1, 5000.0), (2, 5000.0)]);
+        let c = cands(&[1, 2]);
+        let now = Instant::now();
+        let pinned = pick_sticky(&d, &c, "sess-a", now).cred_id;
+        let other = if pinned == 1 { 2 } else { 1 };
+
+        let ex = HashMap::from([(pinned, ExclusionKind::Durable)]);
+        let r = d.pick(None, &c, &ex, Some("sess-a"), now);
+        assert_eq!(r.cred_id, other);
+        assert_eq!(r.reason, PickReason::StickyMigrated);
+
+        // 已迁移：即使原号恢复，也应留在新号上
+        let after = pick_sticky(&d, &c, "sess-a", now);
+        assert_eq!(after.cred_id, other);
+    }
+
+    #[test]
+    fn sticky_expires_after_idle() {
+        let d = disp(&[(1, 5000.0), (2, 5000.0)]);
+        let c = cands(&[1, 2]);
+        let t0 = Instant::now();
+        let first = pick_sticky(&d, &c, "sess-a", t0).cred_id;
+        // 把 first 的消耗打高，过期后重选必然换号
+        d.report_consumption(None, first, 4000.0);
+
+        let t1 = t0 + std::time::Duration::from_secs(STICKY_IDLE_SECS + 60);
+        let r = pick_sticky(&d, &c, "sess-a", t1);
+        assert_eq!(r.reason, PickReason::FreshSelect, "超过空闲期应重新分配");
+        assert_ne!(r.cred_id, first);
+    }
+
+    #[test]
+    fn sticky_table_is_capacity_bounded() {
+        let d = disp(&[(1, 5000.0)]);
+        let c = cands(&[1]);
+        let now = Instant::now();
+        for i in 0..(STICKY_CAPACITY + 100) {
+            pick_sticky(&d, &c, &format!("sess-{i}"), now);
+        }
+        assert!(d.sticky_len() <= STICKY_CAPACITY, "粘滞表必须有界");
+    }
+
+    #[test]
+    fn groups_have_isolated_consumption() {
+        let d = disp(&[(1, 5000.0), (2, 5000.0)]);
+        let c = cands(&[1, 2]);
+        d.report_consumption(Some("A"), 1, 4900.0);
+        // B 组不受 A 组消耗影响：1 在 B 组仍是满额，与 2 平局按 priority 选 1
+        assert_eq!(d.pick(Some("B"), &c, &HashMap::new(), None, Instant::now()).cred_id, 1);
+        // A 组里 1 已被打低，应选 2
+        assert_eq!(d.pick(Some("A"), &c, &HashMap::new(), None, Instant::now()).cred_id, 2);
+    }
+
+    #[test]
+    fn distinct_sessions_do_not_share_entry() {
+        let d = disp(&[(1, 5000.0), (2, 5000.0)]);
+        let c = cands(&[1, 2]);
+        let now = Instant::now();
+        let a = pick_sticky(&d, &c, "sess-a", now).cred_id;
+        d.report_consumption(None, a, 4900.0);
+        // 不同 session 必须独立分配，不得继承 sess-a 的粘滞
+        let b = pick_sticky(&d, &c, "sess-b", now);
+        assert_eq!(b.reason, PickReason::FreshSelect);
+        assert_ne!(b.cred_id, a);
+    }
+
+    #[test]
+    fn none_sticky_key_writes_nothing() {
+        let d = disp(&[(1, 5000.0), (2, 5000.0)]);
+        let c = cands(&[1, 2]);
+        d.pick(None, &c, &HashMap::new(), None, Instant::now());
+        assert_eq!(d.sticky_len(), 0, "sticky_key=None 不得写表");
     }
 }
