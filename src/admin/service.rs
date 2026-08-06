@@ -8,9 +8,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::admin::balance_cache::{
-    BalanceCache, CachedBalance, SharedBalanceCache, BALANCE_CACHE_TTL_SECS,
-};
+use crate::admin::balance_cache::{CachedBalance, SharedBalanceCache, BALANCE_CACHE_TTL_SECS};
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
@@ -980,23 +978,16 @@ impl AdminService {
         (success, failure)
     }
 
-    /// 余额后台刷新循环每轮开头的守卫条件：只在 `weighted` 模式下才真正刷新。
-    ///
-    /// 抽成独立函数是为了能在不启动 tokio 任务、不打真实网络请求的前提下
-    /// 单元测试这条判断——循环体本身只是把结果接到 sleep/continue 上。
-    fn should_refresh_balances_this_round(mode: &str) -> bool {
-        mode == "weighted"
-    }
-
     /// 启动余额后台刷新调度器
     ///
     /// - 启动后立刻执行一次刷新
     /// - 之后按 `interval` 周期循环刷新
     /// - 调用方持有 `Arc<Self>` 即可，任务在后台 tokio runtime 上运行
-    /// - 幂等：重复调用（例如模式来回切换）不会启动第二个循环任务
-    /// - 每轮开头检查当前模式：非 `weighted` 时跳过本轮刷新（继续 sleep，不退出循环）。
-    ///   切走模式不停止任务本身（避免任务取消机制的复杂度），但没有额外代价——
-    ///   误触发一次 `weighted` 不会导致该进程生命周期内持续产生上游请求。
+    /// - 幂等：重复调用不会启动第二个循环任务
+    /// - 无条件按模式刷新：priority/balanced 模式虽然选号不读余额，但面板余额列、
+    ///   余额趋势（/api/admin/stats/balance-history）与 quota 耗尽后的自愈探测
+    ///   （clear_quota_disable_if_replenished）都依赖这条链路持续运行，与选号
+    ///   算法是否读余额无关。
     pub fn start_balance_refresher(self: &Arc<Self>, interval: std::time::Duration) {
         use std::sync::atomic::Ordering;
         if self
@@ -1011,11 +1002,6 @@ impl AdminService {
             // 启动后稍等片刻，让上游/Token Manager 准备就绪
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             loop {
-                if !Self::should_refresh_balances_this_round(&svc.token_manager.get_load_balancing_mode())
-                {
-                    tokio::time::sleep(interval).await;
-                    continue;
-                }
                 let started = std::time::Instant::now();
                 let (ok, err) = svc.refresh_all_balances().await;
                 tracing::info!(
@@ -2420,9 +2406,8 @@ impl AdminService {
 
     /// 设置负载均衡模式
     ///
-    /// 切到 `weighted` 时启动余额后台刷新（该模式靠余额选号）；切走时不停任务——
-    /// 循环体每轮开头会检查当前模式，非 `weighted` 时跳过刷新本身，只留一个
-    /// 空转的 sleep 循环，代价可忽略；好处是切回来无需重启即可继续刷新。
+    /// 余额后台刷新调度器在进程启动时已无条件启动，这里不需要也不应该按模式
+    /// 再启动一次——见 `start_balance_refresher` 的文档。
     pub fn set_load_balancing_mode(
         self: &Arc<Self>,
         req: SetLoadBalancingModeRequest,
@@ -2437,10 +2422,6 @@ impl AdminService {
         self.token_manager
             .set_load_balancing_mode(req.mode.clone())
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-
-        if req.mode == "weighted" {
-            self.start_balance_refresher(std::time::Duration::from_secs(300));
-        }
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
     }
@@ -4162,6 +4143,7 @@ fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
 #[cfg(test)]
 mod model_registry_tests {
     use super::*;
+    use crate::admin::balance_cache::BalanceCache;
     use crate::admin::types::{CreateModelRequest, PatchModelRequest, UpsertAliasRequest};
     use crate::anthropic::model_registry::{
         builtin_rows, ModelAlias, ModelOrigin, ModelRegistry, ModelRegistryFile, ModelStatus,
@@ -4968,6 +4950,7 @@ mod model_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::balance_cache::BalanceCache;
 
     #[test]
     fn typed_upstream_rate_limit_is_classified_without_losing_retry_after() {
@@ -5207,13 +5190,26 @@ mod tests {
             .is_err());
     }
 
-    /// 余额后台刷新循环的每轮守卫：误触发/连点经过 weighted 后切回其它模式，
-    /// 循环必须停止真正刷新（只留空转 sleep），否则会留下一个不可逆的周期性
-    /// 上游请求任务直到进程重启。
-    #[test]
-    fn balance_refresh_round_only_runs_in_weighted_mode() {
-        assert!(AdminService::should_refresh_balances_this_round("weighted"));
-        assert!(!AdminService::should_refresh_balances_this_round("priority"));
-        assert!(!AdminService::should_refresh_balances_this_round("balanced"));
+    /// 回归守卫（M1）：默认 `priority` 模式下余额刷新链路必须仍然可用。
+    ///
+    /// 之前的实现把 `refresh_all_balances` 的调用门控在
+    /// `mode == "weighted"` 后面（无论是进程启动时是否调用
+    /// `start_balance_refresher`，还是刷新循环每轮开头的检查），导致默认
+    /// 部署下余额永不刷新：面板余额列永久为空、余额趋势断更、quota 耗尽账号
+    /// 的自愈探测退化为盲试。`refresh_all_balances` 本身不应该也不需要按
+    /// 模式跳过任何条目——它必须处理快照里的每一条未禁用（或
+    /// QuotaExceeded 待自愈）凭据。
+    #[tokio::test]
+    async fn refresh_all_balances_runs_regardless_of_mode() {
+        for mode in ["priority", "balanced", "weighted"] {
+            let service = service_with_balancing_mode(mode);
+            let (success, failure) = service.refresh_all_balances().await;
+            assert_eq!(
+                success + failure,
+                2,
+                "mode={mode}: refresh_all_balances 必须尝试全部 2 条未禁用凭据，\
+                 不能因为负载均衡模式而跳过（success={success}, failure={failure}）"
+            );
+        }
     }
 }

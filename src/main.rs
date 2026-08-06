@@ -538,13 +538,14 @@ async fn main() {
             );
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）。
-            // 只有 weighted 模式需要读余额——priority/balanced 不读余额，
-            // 无条件启动会让默认部署凭空多出周期性上游余额请求。
-            if token_manager.get_load_balancing_mode() == "weighted" {
-                admin_state
-                    .service
-                    .start_balance_refresher(std::time::Duration::from_secs(300));
-            }
+            // 无条件启动：priority/balanced 模式虽然选号不读余额，但面板的余额列、
+            // 余额趋势图（/api/admin/stats/balance-history）以及 quota 耗尽后的
+            // 自愈探测（clear_quota_disable_if_replenished）都依赖这条刷新链路，
+            // 与选号是否读余额无关。之前按 weighted 门控是回归：默认部署下余额
+            // 永久不刷新。
+            admin_state
+                .service
+                .start_balance_refresher(std::time::Duration::from_secs(300));
 
             // 启动代理池健康检查调度器（每 5 分钟一次）
             admin_state
