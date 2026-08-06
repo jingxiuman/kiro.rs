@@ -11,6 +11,12 @@
 ## Global Constraints
 
 - **分支**：全部在当前分支 `feat/absorb-upstream-0.7.5` 上开发提交。
+- **计划文本会过时（Task 4 已踩过一次）**：本计划里凡是「把某函数整体替换成以下代码」的步骤，都是**写计划时**的代码快照。若前序任务的修复轮改动过同一区域，照抄替换块会**静默回滚那次修复**，而且 diff 看起来像是正常实现了 brief 要求的功能，只读 `+` 行的审查抓不到。
+
+  Task 4 就因此把 Task 3 修复轮刚改好的 `sync_generation` 调用点覆盖回了不安全的内联 `!=`，重新引入并发竞态。
+
+  **执行任何「整体替换」步骤前，先读一遍当前代码**，与替换块逐段比对；发现替换块会删掉当前代码里已有的东西，停下来报告，不要直接覆盖。
+
 - **提交卫生（Task 1 已踩过一次，务必照做）**：每次提交必须 `git add` 显式列出本任务改动的文件，禁止 `git add -A` / `git add .`。
 
   **但这还不够。** `git add <file>` 是**文件粒度**的，无法排除同一文件里他人未提交的 hunk。Task 1 就因此把整个 RPM 限流特性的后端半截卷进了提交 `6497355`，导致该提交无法独立构建（`service.rs` import 了当时尚未提交的 `types.rs` 里的类型）。已由 `75339ad` 补齐收尾。
@@ -1060,10 +1066,11 @@ Expected: 编译失败（`sticky_len` 未定义）与断言失败（`reason` 恒
         let skey = sticky_key.map(|s| sticky_key_of(group, s));
 
         let mut st = self.state.lock();
-        if st.generation != snap.generation {
-            st.generation = snap.generation;
-            st.consumed.clear();
-        }
+        // 必须调用 sync_generation（单调 >），不要内联成 `!=` 比较。
+        // snapshot() 与 state.lock() 是两次独立加锁，中间无原子性；`!=` 会让
+        // 过期的 snap.generation 把 st.generation 回退，清空另一线程刚写入的
+        // consumed。详见 sync_generation 的文档注释。
+        sync_generation(&mut st, snap.generation);
 
         // 1. 查粘滞
         if let Some(k) = &skey {
