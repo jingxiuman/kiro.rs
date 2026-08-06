@@ -830,4 +830,37 @@ mod tests {
         d.pick(None, &c, &HashMap::new(), None, Instant::now());
         assert_eq!(d.sticky_len(), 0, "sticky_key=None 不得写表");
     }
+
+    #[test]
+    fn report_consumption_ignores_non_positive_and_non_finite() {
+        let d = disp(&[(1, 5000.0), (2, 5000.0)]);
+        let c = cands(&[1, 2]);
+        // 这些都不应改变选择结果（平局按 priority 选 1）
+        d.report_consumption(None, 1, 0.0);
+        d.report_consumption(None, 1, -100.0);
+        d.report_consumption(None, 1, f64::NAN);
+        d.report_consumption(None, 1, f64::INFINITY);
+        assert_eq!(pick(&d, &c), 1);
+
+        // 正常值才生效
+        d.report_consumption(None, 1, 4900.0);
+        assert_eq!(pick(&d, &c), 2);
+    }
+
+    #[test]
+    fn sticky_hit_consumption_still_counted() {
+        // 长会话粘在一个号上，其消耗必须照样计入，否则控制不了额度倾斜
+        let d = disp(&[(1, 5000.0), (2, 5000.0)]);
+        let c = cands(&[1, 2]);
+        let now = Instant::now();
+        let pinned = pick_sticky(&d, &c, "long", now).cred_id;
+        for _ in 0..50 {
+            let r = pick_sticky(&d, &c, "long", now);
+            assert_eq!(r.cred_id, pinned);
+            d.report_consumption(None, r.cred_id, 100.0);
+        }
+        // 新会话不应再流向被打爆的账号
+        let fresh = pick_sticky(&d, &c, "new", now);
+        assert_ne!(fresh.cred_id, pinned, "长会话的消耗必须影响新会话的分配");
+    }
 }
