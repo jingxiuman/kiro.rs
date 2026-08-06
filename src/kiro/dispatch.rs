@@ -54,6 +54,17 @@ pub enum PickReason {
 pub struct PickResult {
     pub cred_id: u64,
     pub reason: PickReason,
+    /// 被选中账号的有效剩余额度（缓存余额 − 本代次已消耗）。用于事后复算
+    /// 「为什么选了它」，区分是余额确实领先，还是粘滞/降级把请求钉在了别处。
+    pub effective_remaining: f64,
+    /// 被选中账号余额快照的陈旧秒数（`now - cached_at`）。缺失条目取
+    /// `f64::INFINITY`——表示调度当时对该账号的余额一无所知。
+    pub balance_age_secs: f64,
+    /// 本次选号所处的余额代次（`BalanceCache::generation`）。
+    pub generation: u64,
+    /// 硬过滤（disabled/throttled/RPM/excluded）之后本轮参与竞争的候选数。
+    /// 上线后若发现流量倾斜，用它区分是「候选被过滤剩很少」还是权重算法本身的问题。
+    pub candidate_count: usize,
 }
 
 struct StickyEntry {
@@ -120,6 +131,7 @@ impl GroupDispatcher {
         let snap = self.balance.snapshot();
         let g = group.unwrap_or("").to_string();
         let skey = sticky_key.map(|s| sticky_key_of(group, s));
+        let now_ts = chrono::Utc::now().timestamp() as f64;
 
         let mut st = self.state.lock();
         // 必须走单调的 sync_generation（`>` 而非 `!=`）：`snap` 的读取
@@ -136,6 +148,8 @@ impl GroupDispatcher {
         // 若剔除后候选池为空（全员本轮不可用），退化为不剔除——好过 panic
         // 或返回空结果，调用方仍能拿到一个可重试的候选。
         let available = filter_excluded(candidates, excluded);
+        let candidate_count = available.len();
+        let generation = st.generation;
 
         // 1. 查粘滞
         if let Some(k) = &skey {
@@ -153,30 +167,65 @@ impl GroupDispatcher {
                         if let Some(e) = st.sticky.get_mut(k) {
                             e.last_seen = now;
                         }
-                        return PickResult { cred_id, reason: PickReason::StickyHit };
+                        let balances = resolve_balances(&available, &snap.entries, now_ts);
+                        let consumed = st.consumed.get(&(g.clone(), cred_id)).copied().unwrap_or(0.0);
+                        let effective_remaining =
+                            balances.get(&cred_id).copied().unwrap_or(0.0) - consumed;
+                        return PickResult {
+                            cred_id,
+                            reason: PickReason::StickyHit,
+                            effective_remaining,
+                            balance_age_secs: balance_age_secs(&snap.entries, cred_id, now_ts),
+                            generation,
+                            candidate_count,
+                        };
                     }
                     // 1b. 临时排除：本次换号，但保留粘滞记录
                     Some(ExclusionKind::Transient) => {
-                        let alt = select_by_effective_remaining(&available, &st, &g, &snap);
-                        return PickResult { cred_id: alt, reason: PickReason::TransientFallback };
+                        let (alt, effective_remaining) =
+                            select_by_effective_remaining(&available, &st, &g, &snap, now_ts);
+                        return PickResult {
+                            cred_id: alt,
+                            reason: PickReason::TransientFallback,
+                            effective_remaining,
+                            balance_age_secs: balance_age_secs(&snap.entries, alt, now_ts),
+                            generation,
+                            candidate_count,
+                        };
                     }
                     // 1c. 长期排除或已不在候选池：迁移
                     _ => {
-                        let alt = select_by_effective_remaining(&available, &st, &g, &snap);
+                        let (alt, effective_remaining) =
+                            select_by_effective_remaining(&available, &st, &g, &snap, now_ts);
                         st.sticky.insert(k.clone(), StickyEntry { cred_id: alt, last_seen: now });
-                        return PickResult { cred_id: alt, reason: PickReason::StickyMigrated };
+                        return PickResult {
+                            cred_id: alt,
+                            reason: PickReason::StickyMigrated,
+                            effective_remaining,
+                            balance_age_secs: balance_age_secs(&snap.entries, alt, now_ts),
+                            generation,
+                            candidate_count,
+                        };
                     }
                 }
             }
         }
 
         // 2. 无粘滞或已过期：重新选号
-        let winner = select_by_effective_remaining(&available, &st, &g, &snap);
+        let (winner, effective_remaining) =
+            select_by_effective_remaining(&available, &st, &g, &snap, now_ts);
         if let Some(k) = skey {
             evict_if_full(&mut st.sticky, now);
             st.sticky.insert(k, StickyEntry { cred_id: winner, last_seen: now });
         }
-        PickResult { cred_id: winner, reason: PickReason::FreshSelect }
+        PickResult {
+            cred_id: winner,
+            reason: PickReason::FreshSelect,
+            effective_remaining,
+            balance_age_secs: balance_age_secs(&snap.entries, winner, now_ts),
+            generation,
+            candidate_count,
+        }
     }
 
     #[cfg(test)]
@@ -240,13 +289,14 @@ fn filter_excluded(candidates: &[Candidate], excluded: &HashMap<u64, ExclusionKi
     if filtered.is_empty() { candidates.to_vec() } else { filtered }
 }
 
+/// 返回胜出候选的 id 与其有效剩余额度（供 [`PickResult`] 归因字段回填）。
 fn select_by_effective_remaining(
     candidates: &[Candidate],
     st: &DispatchState,
     g: &str,
     snap: &crate::admin::balance_cache::BalanceSnapshotView,
-) -> u64 {
-    let now_ts = chrono::Utc::now().timestamp() as f64;
+    now_ts: f64,
+) -> (u64, f64) {
     let balances = resolve_balances(candidates, &snap.entries, now_ts);
     candidates
         .iter()
@@ -271,8 +321,18 @@ fn select_by_effective_remaining(
                 .then_with(|| cb.priority.cmp(&ca.priority))
                 .then_with(|| cb.id.cmp(&ca.id))
         })
-        .map(|(c, _)| c.id)
+        .map(|(c, eff)| (c.id, eff))
         .expect("candidates 非空")
+}
+
+/// 某账号余额快照的陈旧秒数（`now_ts - cached_at`）。条目缺失（余额从未
+/// 采集到过该账号）取 `f64::INFINITY`，与「已知但极旧」区分开。
+fn balance_age_secs(
+    entries: &HashMap<u64, crate::admin::balance_cache::CachedBalance>,
+    id: u64,
+    now_ts: f64,
+) -> f64 {
+    entries.get(&id).map(|e| now_ts - e.cached_at).unwrap_or(f64::INFINITY)
 }
 
 /// 到量时先清全部过期条目，仍满则 O(n) 淘汰 last_seen 最早的一条。

@@ -1118,6 +1118,10 @@ pub struct MultiTokenManager {
     credential_support: parking_lot::RwLock<std::collections::HashMap<String, Vec<String>>>,
     /// 内部上游请求复用请求日志存储；启动后由 main 注入。
     trace_store: RwLock<Option<SharedTraceStore>>,
+    /// weighted 模式的选号委托目标。用 `RwLock<Option<_>>` 而非构造参数，
+    /// 避免改动所有既有构造点；启动后由 main.rs 通过 [`Self::with_dispatcher`] 注入。
+    /// 未注入时 weighted 模式退化为 priority（见 [`Self::select_next_credential_excluding`]）。
+    dispatcher: parking_lot::RwLock<Option<std::sync::Arc<crate::kiro::dispatch::GroupDispatcher>>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1372,6 +1376,7 @@ impl MultiTokenManager {
             stats_dirty: AtomicBool::new(false),
             credential_support: parking_lot::RwLock::new(std::collections::HashMap::new()),
             trace_store: RwLock::new(None),
+            dispatcher: parking_lot::RwLock::new(None),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1581,6 +1586,13 @@ impl MultiTokenManager {
         self.credential_support.read().clone()
     }
 
+    /// 注入 weighted 模式的选号委托目标。builder 风格（消耗并返回 `self`），
+    /// 用于 `main.rs` 在构造后立即链式调用；不注入时 weighted 退化为 priority。
+    pub fn with_dispatcher(self, d: std::sync::Arc<crate::kiro::dispatch::GroupDispatcher>) -> Self {
+        *self.dispatcher.write() = Some(d);
+        self
+    }
+
     /// 见 [`group_supported_models_from`]。entries 快照 + credential_support 缓存。
     pub fn group_supported_models(
         &self,
@@ -1755,16 +1767,18 @@ impl MultiTokenManager {
     /// 无排除集的便捷入口（仅测试使用；生产路径统一走 `_excluding` 变体）
     #[cfg(test)]
     fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
-        self.select_next_credential_excluding(model, group, &std::collections::HashSet::new())
+        self.select_next_credential_excluding(model, group, &std::collections::HashMap::new(), None)
     }
 
-    /// 同 [`Self::select_next_credential`]，额外跳过 `excluded` 里的凭据。
+    /// 同 [`Self::select_next_credential`]，额外跳过 `excluded` 里的凭据、
+    /// 并透传 `sticky_key`（weighted 模式下交给 dispatcher 做会话粘滞）。
     /// 用于并发门禁排队失败后的换凭证重选（见 provider 的 credential_gate 接线）。
     fn select_next_credential_excluding(
         &self,
         model: Option<&str>,
         group: Option<&str>,
-        excluded: &std::collections::HashSet<u64>,
+        excluded: &std::collections::HashMap<u64, crate::kiro::dispatch::ExclusionKind>,
+        sticky_key: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
@@ -1777,7 +1791,7 @@ impl MultiTokenManager {
                 if e.disabled {
                     return false;
                 }
-                if excluded.contains(&e.id) {
+                if excluded.contains_key(&e.id) {
                     return false;
                 }
                 // 临时冷却中（账号级 429 风控）：跳过
@@ -1803,9 +1817,7 @@ impl MultiTokenManager {
         let mode = self.load_balancing_mode.lock().clone();
 
         match LoadBalancingMode::parse(&mode) {
-            // Weighted 在 Task 7 接入 dispatcher；在此之前与 Balanced 同行为，
-            // 以便 Task 1 的集成测试能独立锁住「不被 current_id 绕过」这一条。
-            LoadBalancingMode::Balanced | LoadBalancingMode::Weighted => {
+            LoadBalancingMode::Balanced => {
                 // Least-Used 策略：选择成功次数最少的凭据
                 // 平局时按优先级排序（数字越小优先级越高）
                 let entry = available
@@ -1813,6 +1825,68 @@ impl MultiTokenManager {
                     .min_by_key(|e| (e.success_count, e.credentials.priority))?;
 
                 Some((entry.id, entry.credentials.clone()))
+            }
+            LoadBalancingMode::Weighted => {
+                let Some(dispatcher) = self.dispatcher.read().clone() else {
+                    // 未注入 dispatcher（如单测老用例）：退化为 priority，不 panic
+                    let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
+                    return Some((entry.id, entry.credentials.clone()));
+                };
+
+                // 构造候选快照并把凭据 clone 出来，随后释放 entries 与
+                // credential_support 两把锁再调 pick——pick 内部只持有它自己
+                // 的 DispatchState 一把锁，全程不做 IO、不 await、不回调
+                // token_manager，与 entries 之间不构成锁环（见 available_count
+                // 附近的死锁警告：那是「持有 entries 时再取 entries」的场景，
+                // 这里不会发生，因为下面 drop 之后已经不再碰 entries）。
+                let cands: Vec<crate::kiro::dispatch::Candidate> = available
+                    .iter()
+                    .map(|e| crate::kiro::dispatch::Candidate {
+                        id: e.id,
+                        priority: e.credentials.priority as i32,
+                    })
+                    .collect();
+                let creds: std::collections::HashMap<u64, KiroCredentials> = available
+                    .iter()
+                    .map(|e| (e.id, e.credentials.clone()))
+                    .collect();
+
+                // 硬过滤剔除（disabled/throttled/RPM/上游门禁排除）的账号按原因
+                // 分类，供 pick 内部的粘滞判定使用。优先沿用调用方已给出的分类
+                // （如并发门禁 queue_excluded 恒为 Transient——队满/超时是短暂
+                // 拥塞）；调用方未分类的（本函数内部因 disabled/throttled/RPM
+                // 过滤掉的）按 disabled 与否推断：只有 disabled（含 quota 耗尽）
+                // 才是长期不可用应触发会话迁移，throttled_until 冷却与 RPM
+                // 窗口超限都是几十秒到半小时自愈的临时状态，不应迁移会话丢掉
+                // prompt cache。
+                let excluded_kinds: std::collections::HashMap<u64, crate::kiro::dispatch::ExclusionKind> =
+                    entries
+                        .iter()
+                        .filter(|e| !cands.iter().any(|c| c.id == e.id))
+                        .map(|e| {
+                            let kind = excluded.get(&e.id).copied().unwrap_or(if e.disabled {
+                                crate::kiro::dispatch::ExclusionKind::Durable
+                            } else {
+                                crate::kiro::dispatch::ExclusionKind::Transient
+                            });
+                            (e.id, kind)
+                        })
+                        .collect();
+
+                drop(credential_support);
+                drop(entries);
+
+                let r = dispatcher.pick(group, &cands, &excluded_kinds, sticky_key, Instant::now());
+                tracing::debug!(
+                    cred_id = r.cred_id,
+                    reason = ?r.reason,
+                    effective_remaining = r.effective_remaining,
+                    balance_age_secs = r.balance_age_secs,
+                    generation = r.generation,
+                    candidate_count = r.candidate_count,
+                    "weighted 选号"
+                );
+                creds.get(&r.cred_id).map(|c| (r.cred_id, c.clone()))
             }
             LoadBalancingMode::Priority => {
                 // priority 模式（默认）：选择优先级最高的
@@ -1833,23 +1907,23 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
-        self.acquire_context_excluding(model, group, &std::collections::HashSet::new(), None)
+        self.acquire_context_excluding(model, group, &std::collections::HashMap::new(), None)
             .await
     }
 
     /// 同 [`Self::acquire_context`]，额外跳过 `excluded` 里的凭据（含 current_id 命中路径）。
     /// 用于并发门禁排队失败后的换凭证重选。
     ///
-    /// `sticky_key` 为会话粘滞种子，本任务（Task 5）仅透传参数，粘滞选号逻辑
-    /// 由后续任务接入 dispatcher。
+    /// `sticky_key` 为会话粘滞种子；weighted 模式下透传给
+    /// [`Self::select_next_credential_excluding`] 再转交 `GroupDispatcher::pick`
+    /// 做会话粘滞判定。priority / balanced 模式不使用它。
     pub async fn acquire_context_excluding(
         &self,
         model: Option<&str>,
         group: Option<&str>,
-        excluded: &std::collections::HashSet<u64>,
+        excluded: &std::collections::HashMap<u64, crate::kiro::dispatch::ExclusionKind>,
         sticky_key: Option<&str>,
     ) -> anyhow::Result<CallContext> {
-        let _ = sticky_key;
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1880,7 +1954,7 @@ impl MultiTokenManager {
                         .find(|e| {
                             e.id == current_id
                                 && !e.disabled
-                                && !excluded.contains(&e.id)
+                                && !excluded.contains_key(&e.id)
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                                 && !self.rpm_exceeded(e, now)
                                 && credential_matches_request(&e.credentials, e.id, model, group, &credential_support)
@@ -1892,7 +1966,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential_excluding(model, group, excluded);
+                    let mut best = self.select_next_credential_excluding(model, group, excluded, sticky_key);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1911,7 +1985,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential_excluding(model, group, excluded);
+                            best = self.select_next_credential_excluding(model, group, excluded, sticky_key);
                         }
                     }
 
@@ -4654,6 +4728,42 @@ mod tests {
         assert_eq!(manager.get_load_balancing_mode(), "weighted");
     }
 
+    /// weighted 模式接入 dispatcher 后：余额高的账号必须被优先选中，
+    /// 证明 acquire_context 真的委托给了 GroupDispatcher::pick，而不是
+    /// 回落到 priority / balanced 的旧同码径。
+    #[tokio::test]
+    async fn weighted_prefers_higher_remaining_balance() {
+        let manager = test_manager_with_two_credentials(); // id 1、2
+        let cache = std::sync::Arc::new(crate::admin::balance_cache::BalanceCache::new(None));
+        let now_ts = chrono::Utc::now().timestamp() as f64;
+        let mk = |r: f64| crate::admin::balance_cache::CachedBalance {
+            cached_at: now_ts,
+            data: crate::admin::types::BalanceResponse {
+                remaining: r,
+                next_reset_at: Some(now_ts + 86400.0),
+                ..Default::default()
+            },
+        };
+        cache.publish(std::collections::HashMap::from([(1, mk(1000.0)), (2, mk(9000.0))]));
+
+        let manager = manager.with_dispatcher(std::sync::Arc::new(
+            crate::kiro::dispatch::GroupDispatcher::new(cache),
+        ));
+        manager.set_load_balancing_mode("weighted".to_string()).unwrap();
+
+        // 余额高的（id=2）应被优先选中，而 id=1 是 priority 赢家——
+        // 若接线失败回落到 priority，本断言会失败在 id=1 上。
+        assert_eq!(manager.acquire_context(None, None).await.unwrap().id, 2);
+    }
+
+    /// 规格 §7 第 17 条：MAX_TOTAL_RETRIES = 4。7 个账号的组里，若前 4 个高有效
+    /// 剩余账号全部失败，请求会失败而非继续尝试剩余健康账号。本测试锁定该行为，
+    /// 避免日后误以为重试预算会随账号数增长、穷举整组。
+    #[test]
+    fn weighted_retry_budget_is_capped_at_four() {
+        assert_eq!(crate::kiro::provider::KiroProvider::retry_budget(7, None), 4);
+    }
+
     #[test]
     fn test_multi_token_manager_report_refresh_failure() {
         let config = Config::default();
@@ -5419,12 +5529,18 @@ mod tests {
         let first = manager.select_next_credential(None, None);
         assert_eq!(first.map(|(id, _)| id), Some(1));
         // 排除 1 → 选到 2
-        let excluded: std::collections::HashSet<u64> = [1u64].into_iter().collect();
-        let second = manager.select_next_credential_excluding(None, None, &excluded);
+        let excluded: std::collections::HashMap<u64, crate::kiro::dispatch::ExclusionKind> =
+            [(1u64, crate::kiro::dispatch::ExclusionKind::Transient)].into_iter().collect();
+        let second = manager.select_next_credential_excluding(None, None, &excluded, None);
         assert_eq!(second.map(|(id, _)| id), Some(2));
         // 全部排除 → 无候选
-        let all: std::collections::HashSet<u64> = [1u64, 2u64].into_iter().collect();
-        assert!(manager.select_next_credential_excluding(None, None, &all).is_none());
+        let all: std::collections::HashMap<u64, crate::kiro::dispatch::ExclusionKind> = [
+            (1u64, crate::kiro::dispatch::ExclusionKind::Transient),
+            (2u64, crate::kiro::dispatch::ExclusionKind::Transient),
+        ]
+        .into_iter()
+        .collect();
+        assert!(manager.select_next_credential_excluding(None, None, &all, None).is_none());
     }
 
     #[tokio::test]

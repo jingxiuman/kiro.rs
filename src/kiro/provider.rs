@@ -550,7 +550,7 @@ impl KiroProvider {
     ///   过多无效重试），再压到全局硬上限。
     /// - pinned：只有一张凭据可用，跨凭据故障转移不存在，预算降为单凭据额度；
     ///   否则会对同一张凭据白打 MAX_TOTAL_RETRIES 次。
-    fn retry_budget(total_credentials: usize, pinned: Option<u64>) -> usize {
+    pub(crate) fn retry_budget(total_credentials: usize, pinned: Option<u64>) -> usize {
         if pinned.is_some() {
             MAX_RETRIES_PER_CREDENTIAL
         } else {
@@ -599,9 +599,8 @@ impl KiroProvider {
             let acquired = match pinned {
                 Some(id) => self.token_manager.acquire_context_pinned(id).await,
                 None => {
-                    let excluded_ids: HashSet<u64> = queue_excluded.keys().copied().collect();
                     self.token_manager
-                        .acquire_context_excluding(model.as_deref(), group, &excluded_ids, sticky_key)
+                        .acquire_context_excluding(model.as_deref(), group, &queue_excluded, sticky_key)
                         .await
                 }
             };

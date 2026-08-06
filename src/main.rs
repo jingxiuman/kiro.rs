@@ -162,6 +162,19 @@ async fn main() {
         tracing::error!("创建 Token 管理器失败: {}", e);
         std::process::exit(1);
     });
+
+    // 余额缓存与选号 dispatcher 必须在 token_manager 被 Arc 化之前构造并注入：
+    // `with_dispatcher` 是消耗 `self` 的 builder，只能在 `Arc::new` 之前链式调用。
+    // 提前到 admin 分支之外创建：选路（weighted 模式）需要读余额，而
+    // AdminService 单向持有 token_manager，后者看不到 AdminService 私有字段。
+    // 抽成独立 Arc 由 main.rs 双向注入，参照下面 proxy_pool 的共享模式。
+    let balance_cache: admin::balance_cache::SharedBalanceCache = Arc::new(
+        admin::balance_cache::BalanceCache::new(
+            token_manager.cache_dir().map(|d| d.join("kiro_balance_cache.json")),
+        ),
+    );
+    let dispatcher = Arc::new(kiro::dispatch::GroupDispatcher::new(balance_cache.clone()));
+    let token_manager = token_manager.with_dispatcher(dispatcher.clone());
     let token_manager = Arc::new(token_manager);
 
     // 代理池提前到 admin 分支之外创建：请求级反馈（网络错误/流中断 → 自动禁用+换绑）
@@ -171,15 +184,6 @@ async fn main() {
         proxy_pool_path,
         config.tls_backend,
     ));
-
-    // 余额缓存提前到 admin 分支之外创建：选路（weighted 模式）需要读余额，
-    // 而 AdminService 单向持有 token_manager，后者看不到 AdminService 私有字段。
-    // 抽成独立 Arc 由 main.rs 双向注入，参照上面 proxy_pool 的共享模式。
-    let balance_cache: admin::balance_cache::SharedBalanceCache = Arc::new(
-        admin::balance_cache::BalanceCache::new(
-            token_manager.cache_dir().map(|d| d.join("kiro_balance_cache.json")),
-        ),
-    );
 
     // kiro.duckdb 路径。usage / trace / ops 三个存储共用此文件（同一进程内 DuckDB
     // 实例上的独立连接），其中 trace 与 ops 必须共享同一「持久化 / 内存兜底」决策：
@@ -483,6 +487,7 @@ async fn main() {
         trace_store.clone(),
         request_body_store.clone(),
         thinking_text_store.clone(),
+        Some(dispatcher.clone()),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
