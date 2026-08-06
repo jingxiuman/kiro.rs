@@ -1,0 +1,29 @@
+src/kiro/token_manager.rs
+  s_af638f44356950::t_0e0d5f399acdde 4896-4919
+  s_af638f44356950::t_f0f27908c99641 2639-2653,2655-2657
+  s_af638f44356950::t_95572471c9c3d6 2631-2638,2654,2658-2660
+src/admin/service.rs
+  s_af638f44356950::t_ea579aff602598 5209-5218
+  s_af638f44356950::t_47358b750c00ef 934-937,954-955
+  s_af638f44356950::t_ea8be77dd7aeeb 997-999,1016-1018
+  s_af638f44356950::t_24e2c53e363a64 2423-2425
+  s_af638f44356950::t_9b872455d5ab63 1014-1015
+  s_af638f44356950::t_ebc778339d39e3 917-920
+  s_af638f44356950::t_987d6e6a804b7a 983-990
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "9f501c2ed5531824b4e81c5bff227286b0e2ce56",
+  "prompts": {},
+  "sessions": {
+    "s_af638f44356950": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7a349da2-ac5a-4445-b65f-b28b23898997",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
