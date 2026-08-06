@@ -2553,6 +2553,80 @@ fn create_buffered_sse_stream(
 mod tests {
     use super::*;
 
+    /// 构造一个不依赖 AppState / usage_store / client_keys 的最小 `UsageRecordHook`，
+    /// 专门用来验证 `record()` 是否真的把消耗回写给了 `GroupDispatcher`——
+    /// 这条接线是本任务（消耗回写闭环）存在的全部理由，且没有被其他任何测试覆盖：
+    /// dispatch.rs 里的测试只验证 `GroupDispatcher::report_consumption` 自身正确，
+    /// 不验证生产路径是否调用了它。
+    fn hook_with_dispatcher(
+        group: Option<&str>,
+    ) -> (UsageRecordHook, std::sync::Arc<crate::kiro::dispatch::GroupDispatcher>) {
+        let cache = std::sync::Arc::new(crate::admin::balance_cache::BalanceCache::new(None));
+        let dispatcher = std::sync::Arc::new(crate::kiro::dispatch::GroupDispatcher::new(cache));
+        let hook = UsageRecordHook {
+            usage: None,
+            client_keys: None,
+            key_id: 1,
+            model: "test-model".to_string(),
+            started_at: Instant::now(),
+            dispatcher: Some(dispatcher.clone()),
+            group: group.map(|g| g.to_string()),
+        };
+        (hook, dispatcher)
+    }
+
+    #[test]
+    fn record_writes_consumption_back_to_dispatcher() {
+        let (hook, dispatcher) = hook_with_dispatcher(Some("G"));
+        hook.record(7, 100, 200, (0, 0), 12.5, "success");
+        assert_eq!(
+            dispatcher.consumed_of(Some("G"), 7),
+            12.5,
+            "record() 必须把入参 credits 回写给对应 (group, credential_id) 的调度器桶"
+        );
+    }
+
+    #[test]
+    fn record_with_credential_id_zero_does_not_write_back() {
+        // credential_id == 0 表示本次请求没有分配到凭据，不该污染任何账号的消耗
+        let (hook, dispatcher) = hook_with_dispatcher(Some("G"));
+        hook.record(0, 100, 200, (0, 0), 12.5, "success");
+        assert_eq!(
+            dispatcher.consumed_of(Some("G"), 0),
+            0.0,
+            "credential_id=0（未分配凭据）不应回写"
+        );
+    }
+
+    #[test]
+    fn record_routes_consumption_to_the_correct_group_bucket() {
+        // 两个不同 group 的 hook 各自 record 同一个 credential_id，互不串桶
+        let cache = std::sync::Arc::new(crate::admin::balance_cache::BalanceCache::new(None));
+        let dispatcher = std::sync::Arc::new(crate::kiro::dispatch::GroupDispatcher::new(cache));
+        let hook_a = UsageRecordHook {
+            usage: None,
+            client_keys: None,
+            key_id: 1,
+            model: "test-model".to_string(),
+            started_at: Instant::now(),
+            dispatcher: Some(dispatcher.clone()),
+            group: Some("A".to_string()),
+        };
+        let hook_b = UsageRecordHook {
+            usage: None,
+            client_keys: None,
+            key_id: 1,
+            model: "test-model".to_string(),
+            started_at: Instant::now(),
+            dispatcher: Some(dispatcher.clone()),
+            group: Some("B".to_string()),
+        };
+        hook_a.record(7, 10, 10, (0, 0), 40.0, "success");
+        hook_b.record(7, 10, 10, (0, 0), 5.0, "success");
+        assert_eq!(dispatcher.consumed_of(Some("A"), 7), 40.0, "A 组不应包含 B 组的消耗");
+        assert_eq!(dispatcher.consumed_of(Some("B"), 7), 5.0, "B 组不应包含 A 组的消耗");
+    }
+
     #[test]
     fn dispatch_sticky_key_only_from_uuid_session() {
         // Claude Code 形态：metadata.user_id 内含 session uuid

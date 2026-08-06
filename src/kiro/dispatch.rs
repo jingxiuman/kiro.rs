@@ -232,6 +232,14 @@ impl GroupDispatcher {
     pub(crate) fn sticky_len(&self) -> usize {
         self.state.lock().sticky.len()
     }
+
+    /// 读取 `(group, cred_id)` 桶内已累计的消耗。仅测试用，用于验证
+    /// 生产路径（`UsageRecordHook::record`）是否真的调用了 `report_consumption`。
+    #[cfg(test)]
+    pub(crate) fn consumed_of(&self, group: Option<&str>, cred_id: u64) -> f64 {
+        let key = (group.unwrap_or("").to_string(), cred_id);
+        self.state.lock().consumed.get(&key).copied().unwrap_or(0.0)
+    }
 }
 
 /// 对齐余额代次：换代即清空本地消耗累计。
