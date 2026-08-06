@@ -33,6 +33,27 @@ import { ModelMappingDialog } from '@/components/model-mapping-dialog'
  * 与原 Dashboard 中的工具按钮等价，但全局 Tab 都可访问。刷新按钮会失效
  * 凭据/客户端 Key/统计三类查询，覆盖三个 Tab 的主要数据源。
  */
+type LoadBalancingMode = 'priority' | 'balanced' | 'weighted'
+
+/** 三种模式循环切换：优先级 → 均衡负载 → 按余额加权 → 优先级…… */
+const LOAD_BALANCING_NEXT_MODE: Record<LoadBalancingMode, LoadBalancingMode> = {
+  priority: 'balanced',
+  balanced: 'weighted',
+  weighted: 'priority',
+}
+
+const LOAD_BALANCING_MODE_LABEL: Record<LoadBalancingMode, string> = {
+  priority: '优先级模式',
+  balanced: '均衡负载模式',
+  weighted: '按余额加权模式',
+}
+
+const CURRENT_MODE_SHORT_LABEL: Record<LoadBalancingMode, string> = {
+  priority: '优先级',
+  balanced: '均衡负载',
+  weighted: '按余额加权',
+}
+
 interface TopbarToolsProps {
   compact?: boolean
 }
@@ -63,9 +84,9 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
 
   const handleToggleLoadBalancing = () => {
     const cur = loadBalancingData?.mode || 'priority'
-    const next = cur === 'priority' ? 'balanced' : 'priority'
+    const next = LOAD_BALANCING_NEXT_MODE[cur]
     setLoadBalancingMode(next, {
-      onSuccess: () => toast.success(`已切换到${next === 'priority' ? '优先级模式' : '均衡负载模式'}`),
+      onSuccess: () => toast.success(`已切换到${LOAD_BALANCING_MODE_LABEL[next]}`),
       onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     })
   }
@@ -258,7 +279,7 @@ interface ToolControls {
   isSettingRpm: boolean
   rpmConfig?: { enabled: boolean; limit: number }
   updateRpmLimit: (limit: number) => void
-  loadBalancingMode?: 'priority' | 'balanced'
+  loadBalancingMode?: LoadBalancingMode
   openImageUpdate: () => void
   openKeyDialog: () => void
   openModelMapping: () => void
@@ -318,9 +339,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
           <Activity />
           {controls.isLoadingMode
             ? '负载均衡加载中'
-            : controls.loadBalancingMode === 'priority'
-              ? '切换到均衡负载'
-              : '切换到优先级'}
+            : `切换到${LOAD_BALANCING_MODE_LABEL[LOAD_BALANCING_NEXT_MODE[controls.loadBalancingMode || 'priority']]}`}
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={controls.handleRefresh}>
           <RefreshCw />刷新数据
@@ -361,9 +380,7 @@ function LoadBalancingButton({ controls }: { controls: ToolControls }) {
       <span className="hidden md:inline">
         {controls.isLoadingMode
           ? '加载中…'
-          : controls.loadBalancingMode === 'priority'
-            ? '优先级'
-            : '均衡负载'}
+          : CURRENT_MODE_SHORT_LABEL[controls.loadBalancingMode || 'priority']}
       </span>
     </Button>
   )
