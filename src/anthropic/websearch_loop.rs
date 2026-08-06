@@ -383,7 +383,7 @@ async fn run_round(
         }
     };
 
-    let call_result = match provider.call_api_stream(&request_body, None, group).await {
+    let call_result = match provider.call_api_stream(&request_body, None, group, None).await {
         Ok(r) => r,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, (0, 0), 0.0, "error");

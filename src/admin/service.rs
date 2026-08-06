@@ -1513,7 +1513,7 @@ impl AdminService {
             async {
                 let call = match pinned {
                     Some(id) => provider.call_api_pinned(id, &body).await?,
-                    None => provider.call_api(&body, None, None).await?,
+                    None => provider.call_api(&body, None, None, None).await?,
                 };
                 let credential_id = call.credential_id;
                 let bytes = call.response.bytes().await?;

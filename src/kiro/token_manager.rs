@@ -1833,18 +1833,23 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
-        self.acquire_context_excluding(model, group, &std::collections::HashSet::new())
+        self.acquire_context_excluding(model, group, &std::collections::HashSet::new(), None)
             .await
     }
 
     /// 同 [`Self::acquire_context`]，额外跳过 `excluded` 里的凭据（含 current_id 命中路径）。
     /// 用于并发门禁排队失败后的换凭证重选。
+    ///
+    /// `sticky_key` 为会话粘滞种子，本任务（Task 5）仅透传参数，粘滞选号逻辑
+    /// 由后续任务接入 dispatcher。
     pub async fn acquire_context_excluding(
         &self,
         model: Option<&str>,
         group: Option<&str>,
         excluded: &std::collections::HashSet<u64>,
+        sticky_key: Option<&str>,
     ) -> anyhow::Result<CallContext> {
+        let _ = sticky_key;
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;

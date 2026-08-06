@@ -175,6 +175,7 @@ struct ResponseProcessingConfig {
     cache_usage: super::cache_metering::CacheUsage,
     group: Option<String>,
     context_window: i32,
+    sticky_key: Option<String>,
 }
 
 /// 从请求 metadata.user_id 提取 Claude Code 会话 id。
@@ -182,6 +183,18 @@ struct ResponseProcessingConfig {
 fn session_id_of(payload: &super::types::MessagesRequest) -> Option<String> {
     payload
         .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .and_then(super::metadata::extract_session_id)
+}
+
+/// 会话粘滞 key。**只在能解析出 UUID session 时启用**。
+///
+/// 刻意不复用 cache_metering::isolation_seed：那个函数只在 key_id == 0 时走
+/// cc 级降级，普通 client key 直接返回 key:<key_id>，会让同一 client key 下
+/// 的所有会话共享一条粘滞记录，流量被永久钉死在一个账号——正是本功能要修的病。
+fn dispatch_sticky_key(req: &MessagesRequest) -> Option<String> {
+    req.metadata
         .as_ref()
         .and_then(|m| m.user_id.as_deref())
         .and_then(super::metadata::extract_session_id)
@@ -1113,6 +1126,7 @@ pub async fn post_messages(
                 cache_usage,
                 group: key_ctx.group.clone(),
                 context_window,
+                sticky_key: dispatch_sticky_key(&payload),
             },
         )
         .await
@@ -1145,6 +1159,7 @@ pub async fn post_messages(
                 cache_usage,
                 group: key_ctx.group.clone(),
                 context_window,
+                sticky_key: dispatch_sticky_key(&payload),
             },
         )
         .await
@@ -1170,9 +1185,10 @@ async fn handle_stream_request(
         cache_usage,
         group,
         context_window,
+        sticky_key,
     } = config;
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref(), sticky_key.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, (0, 0), 0.0, "error");
@@ -1585,9 +1601,10 @@ async fn handle_non_stream_request(
         group,
         // 请求入口只取一次窗口快照，避免响应阶段读取热重载后的新注册表。
         context_window,
+        sticky_key,
     } = config;
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref(), sticky_key.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, (0, 0), 0.0, "error");
@@ -2228,6 +2245,7 @@ pub async fn post_messages_cc(
                 cache_usage,
                 group: key_ctx.group.clone(),
                 context_window,
+                sticky_key: dispatch_sticky_key(&payload),
             },
         )
         .await
@@ -2260,6 +2278,7 @@ pub async fn post_messages_cc(
                 cache_usage,
                 group: key_ctx.group.clone(),
                 context_window,
+                sticky_key: dispatch_sticky_key(&payload),
             },
         )
         .await
@@ -2288,9 +2307,10 @@ async fn handle_stream_request_buffered(
         cache_usage,
         group,
         context_window,
+        sticky_key,
     } = config;
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref(), sticky_key.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, (0, 0), 0.0, "error");
@@ -2519,6 +2539,36 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_sticky_key_only_from_uuid_session() {
+        // Claude Code 形态：metadata.user_id 内含 session uuid
+        let with_session: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": "{\"device_id\":\"d\",\"session_id\":\"0b4445e1-1111-4222-8333-444455556666\"}"}
+        })).unwrap();
+        assert_eq!(
+            dispatch_sticky_key(&with_session).as_deref(),
+            Some("0b4445e1-1111-4222-8333-444455556666")
+        );
+
+        // 无 metadata：必须返回 None 而不是降级到 key_id。
+        // 降级会让同一 client key 下的所有会话共享一条粘滞记录被永久钉死。
+        let without: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role": "user", "content": "hi"}]
+        })).unwrap();
+        assert_eq!(dispatch_sticky_key(&without), None);
+
+        // metadata 存在但不含合法 uuid：同样返回 None
+        let bad: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": "not-a-session"}
+        })).unwrap();
+        assert_eq!(dispatch_sticky_key(&bad), None);
+    }
 
     #[test]
     fn restore_omitted_thinking_refills_text_from_store() {
