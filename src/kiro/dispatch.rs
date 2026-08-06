@@ -16,7 +16,6 @@ use std::time::Instant;
 use parking_lot::Mutex;
 
 use crate::admin::balance_cache::SharedBalanceCache;
-use crate::admin::types::BalanceResponse;
 
 /// 余额最长可被调度使用的陈旧期（秒）。超过即视为 unavailable。
 /// 取 12 个刷新周期：外部消耗不进本地计数，陈旧期越长调度偏差越大。
@@ -457,6 +456,7 @@ fn median_or_zero(values: impl Iterator<Item = f64>) -> f64 {
 mod tests {
     use super::*;
     use crate::admin::balance_cache::{BalanceCache, CachedBalance};
+    use crate::admin::types::BalanceResponse;
     use std::collections::HashMap;
 
     fn now_ts() -> f64 { chrono::Utc::now().timestamp() as f64 }
