@@ -329,8 +329,9 @@ impl KiroProvider {
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        sticky_key: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group, None).await
+        self.call_api_with_retry(request_body, false, sink, group, None, sticky_key).await
     }
 
     /// 发送流式 API 请求
@@ -339,8 +340,9 @@ impl KiroProvider {
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        sticky_key: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group, None).await
+        self.call_api_with_retry(request_body, true, sink, group, None, sticky_key).await
     }
 
     /// 发送非流式 API 请求，**钉死在指定凭据**上（Admin 模型测试用）
@@ -353,7 +355,7 @@ impl KiroProvider {
         credential_id: u64,
         request_body: &str,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, None, None, Some(credential_id))
+        self.call_api_with_retry(request_body, false, None, None, Some(credential_id), None)
             .await
     }
 
@@ -572,6 +574,7 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
         pinned: Option<u64>,
+        sticky_key: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
         let total_credentials = self.token_manager.total_count_in_group(group);
         let max_retries = Self::retry_budget(total_credentials, pinned);
@@ -584,7 +587,10 @@ impl KiroProvider {
 
         // 并发门禁排队失败（队满/超时）的凭据：本次请求内不再选它。
         // 所有候选都被排除时清空并置 gate_bypass 兜底放行——门禁只平滑速率，不拒绝请求。
-        let mut queue_excluded: HashSet<u64> = HashSet::new();
+        // 该集合的来源只有并发门禁队满/超时，本就是短暂拥塞，一律标 Transient：
+        // 不应触发粘滞迁移（临时排队不该永久毁掉会话的 prompt cache）。
+        let mut queue_excluded: std::collections::HashMap<u64, crate::kiro::dispatch::ExclusionKind> =
+            std::collections::HashMap::new();
         let mut gate_bypass = false;
 
         for attempt in 0..max_retries {
@@ -593,8 +599,9 @@ impl KiroProvider {
             let acquired = match pinned {
                 Some(id) => self.token_manager.acquire_context_pinned(id).await,
                 None => {
+                    let excluded_ids: HashSet<u64> = queue_excluded.keys().copied().collect();
                     self.token_manager
-                        .acquire_context_excluding(model.as_deref(), group, &queue_excluded)
+                        .acquire_context_excluding(model.as_deref(), group, &excluded_ids, sticky_key)
                         .await
                 }
             };
@@ -657,7 +664,7 @@ impl KiroProvider {
                             s.on_queue_wait(ctx.id, waited_ms, label);
                         }
                         tracing::warn!("凭据 #{} 并发门禁 {}，换凭证重试", ctx.id, label);
-                        queue_excluded.insert(ctx.id);
+                        queue_excluded.insert(ctx.id, crate::kiro::dispatch::ExclusionKind::Transient);
                         last_error =
                             Some(anyhow::anyhow!("凭据 #{} 并发已满（{}）", ctx.id, label));
                         continue;
