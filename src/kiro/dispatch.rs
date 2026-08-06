@@ -124,7 +124,17 @@ impl GroupDispatcher {
                 (c, balances[&c.id] - consumed)
             })
             .max_by(|(ca, ea), (cb, eb)| {
-                // 有效剩余降序 → priority 升序 → id 升序，保证可复算
+                // 有效剩余降序 → priority 升序 → id 升序，保证可复算。
+                //
+                // `Iterator::max_by` 在比较器返回 Equal 时保留**后遇到的**元素
+                // （"取最后一个最大值"）；本闭包对 priority/id 特意反过来比较
+                // （`cb` 减 `ca`）正是利用这个语义：当 ea == eb 时，只有
+                // priority 更小（或 id 更小）的候选让整体比较结果为
+                // Greater，才会被 max_by 判定为"更大"从而在平局中胜出。
+                // 这个方向依赖 max_by 的"后者优先"这一不那么广为人知的规则——
+                // 若日后有人改成看似等价的 `sort_by` + 取首元素，排序是稳定的
+                // （相等元素保持原相对顺序，取最小/第一个），平局方向会静默
+                // 反转，务必保持用 max_by 或显式反转比较逻辑。
                 ea.partial_cmp(eb)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| cb.priority.cmp(&ca.priority))
@@ -142,8 +152,26 @@ impl GroupDispatcher {
 /// 新一代 `remaining` 已经包含了上一代期间的全部消耗，若不清零会重复扣减。
 /// 由 `pick` 与 `report_consumption` 两侧共同调用——哪一侧先遇到新代次都要
 /// 完成同步，否则先到的那一侧会被后到的一侧清掉。
+///
+/// 必须用单调比较（`generation > st.generation`），不能用 `!=`：调用方
+/// （`report_consumption`）读取 `balance.generation()` 与拿到 `state` 锁是
+/// 两次独立加锁，中间无原子性，读到的代次可能在真正上锁前就已过期。用 `!=`
+/// 会在如下交错下把代次**回退**、丢弃已经写入的消耗：
+///   1. `state.generation = G`
+///   2. 线程 A 进入 `report_consumption`，读到 `balance.generation() = G`
+///   3. 缓存发布新代次，`balance.generation` 变为 `G+1`
+///   4. 线程 B 进入 `pick`，`sync_generation(st, G+1)` → 清空 consumed，
+///      `state.generation = G+1`
+///   5. 线程 A 才拿到 state 锁，用第 2 步的过期值调 `sync_generation(st, G)`
+///      → 若用 `!=`，`G != G+1` 成立 → 再次清空，并把 `state.generation`
+///      **回退为 G**
+///   6. 线程 A 写入 `consumed += credits`
+///   7. 之后任意一次 `pick`（balance 仍是 G+1）→ `G != G+1` → 再清一次，
+///      吞掉第 6 步写入的消耗
+/// 用单调比较时，第 5 步 `G > G+1` 为假，不会回退、不会清空，线程 A 的写入
+/// 在第 6 步正常落到当前代次上，不会被后续 `pick` 吞掉。
 fn sync_generation(st: &mut DispatchState, generation: u64) {
-    if st.generation != generation {
+    if generation > st.generation {
         st.generation = generation;
         st.consumed.clear();
     }
@@ -151,9 +179,11 @@ fn sync_generation(st: &mut DispatchState, generation: u64) {
 
 /// 解析每个候选的「可用于调度的余额」，返回 id → 余额 的完整映射（候选必全覆盖）。
 ///
-/// 三态判定（规格 §4.4）：
-/// - fresh：`now_ts - cached_at < BALANCE_CACHE_TTL_SECS` → 用 `remaining` 原值
-/// - stale：`< MAX_STALE_SECS` → 仍用 `remaining` 原值
+/// 三态判定（规格 §4.4）：fresh（`< BALANCE_CACHE_TTL_SECS`）与 stale
+/// （`< MAX_STALE_SECS`）取值相同——都是 `remaining` 原值，二者的区别只在
+/// 可观测性，不影响选号——因此实现里合并为单一 `MAX_STALE_SECS` 判定，不
+/// 单独引用 `BALANCE_CACHE_TTL_SECS`：
+/// - 可用（fresh ∪ stale）：`now_ts - cached_at < MAX_STALE_SECS` → 用 `remaining` 原值
 /// - unavailable：超过 MAX_STALE_SECS / 条目缺失 / `remaining` 非有限 /
 ///   `next_reset_at` 为 `Some(t)` 且 `now_ts >= t`（跨月重置后旧值必然失效，
 ///   此条**优先于** TTL 判定）
@@ -385,6 +415,54 @@ mod tests {
         cache.publish(HashMap::from([(1, mk(1000.0)), (2, mk(5000.0))]));
         d.report_consumption(None, 2, 4500.0);   // 2 降到 500
         assert_eq!(pick(&d, &c), 1, "generation 切换后旧消耗不得残留");
+    }
+
+    #[test]
+    fn report_consumption_survives_stale_generation_race() {
+        // 复现 C1 竞态：report_consumption 读 balance.generation() 与拿到
+        // state 锁是两次独立加锁，中间可能被另一线程的 pick 抢先推进代次。
+        // 若 sync_generation 用 `!=` 判断，携带过期代次姗姗来迟的一方会把
+        // state.generation **回退**、连带清空刚写入的 consumed；下一次 pick
+        // 见到 state 代次又落后于 balance，再清一次，静默丢失消耗。
+        //
+        // 不需要真实多线程也能确定性复现：手工按交错顺序调用 pick 与私有的
+        // sync_generation（同模块内可见），模拟"线程 A 携带过期代次姗姗来迟
+        // 才拿到 state 锁"这一步，避免真多线程测试的计时不确定性。
+        let cache = std::sync::Arc::new(BalanceCache::new(None));
+        let mk = |r: f64| CachedBalance {
+            cached_at: now_ts(),
+            data: BalanceResponse { remaining: r, next_reset_at: Some(now_ts() + 86400.0), ..Default::default() },
+        };
+        cache.publish(HashMap::from([(1, mk(5000.0)), (2, mk(5000.0))])); // generation = 1
+        let d = GroupDispatcher::new(cache.clone());
+        let c = cands(&[1, 2]);
+
+        // 先跑一次 pick，把 state.generation 同步到当前代次 1——对应线程 A
+        // 在缓存推进之前读到的旧代次。
+        let _ = pick(&d, &c);
+        let stale_generation = cache.generation(); // == 1，线程 A 捕获的过期值
+
+        // 缓存推进到新代次 2；线程 B 的 pick 先一步跑到，把 state 同步到 2
+        // 并清空 consumed。
+        cache.publish(HashMap::from([(1, mk(5000.0)), (2, mk(5000.0))])); // generation = 2
+        let _ = pick(&d, &c);
+        assert_eq!(d.state.lock().generation, 2, "前置条件：state 应已同步到最新代次");
+
+        // 线程 A 此刻才拿到 state 锁：先用过期代次调用 sync_generation
+        // （对应 report_consumption 内部先行调用），再写入消耗——完整重放
+        // report_consumption 的函数体，只是把两次加锁之间人为插入的推进
+        // 显式摆在中间。
+        {
+            let mut st = d.state.lock();
+            sync_generation(&mut st, stale_generation);
+            st.consumed.insert(("".to_string(), 1), 4000.0);
+        }
+
+        // 断言落到具体胜负而非"不 panic"：若代次被错误回退，下一次 pick 会
+        // 先把 consumed 清空（因为 state.generation 又落后于当前 balance
+        // 代次 2），1 的有效剩余仍是满额 5000，argmax 会错误选回 1。修复后
+        // 代次不会回退，1 的有效剩余应为 5000 - 4000 = 1000 < 5000，胜者应为 2。
+        assert_eq!(pick(&d, &c), 2, "过期代次的 report_consumption 写入不应被后续 pick 清空");
     }
 
     #[test]
