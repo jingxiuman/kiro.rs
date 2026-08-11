@@ -1455,6 +1455,8 @@ pub struct StreamContext {
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
+    /// contextUsageEvent 报告过 ≥100%（会话已顶满，流结束时据此记 ops 告警）
+    pub context_exhausted: bool,
     /// 本次请求的输入上下文窗口。由请求入口的 `ConversionResult.context_window`
     /// 经构造函数**必填参数**传入，响应处理阶段不再回头查全局注册表（避免热重载
     /// 导致「用旧表映射、用新表计量」，见 spec §3.3）。
@@ -1581,6 +1583,7 @@ impl StreamContext {
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
             context_input_tokens: None,
+            context_exhausted: false,
             context_window,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
@@ -1679,14 +1682,14 @@ impl StreamContext {
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::ContextUsage(context_usage) => {
-                // 从上下文使用百分比计算实际的 input_tokens
+                // 从上下文使用百分比计算实际的 input_tokens（统一走带安全系数的换算）
                 // 窗口值由请求入口随 ConversionResult 传入，不再回头查全局注册表
-                let window_size = self.context_window;
                 let actual_input_tokens =
-                    (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
+                    context_usage.input_tokens_with_margin(self.context_window);
                 self.context_input_tokens = Some(actual_input_tokens);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                if context_usage.context_usage_percentage >= 100.0 {
+                if context_usage.is_exhausted() {
+                    self.context_exhausted = true;
                     self.state_manager
                         .set_stop_reason("model_context_window_exceeded");
                 }
@@ -5266,7 +5269,8 @@ mod tests {
         assert!(delta_usage.get("cache_read_input_tokens").is_none());
 
         let (input, creation, read) = ctx.resolved_usage();
-        assert_eq!(input + creation + read, 100_000);
+        // 10% × 1M × 1.08 安全系数 = 108k（见 ContextUsageEvent::input_tokens_with_margin）
+        assert_eq!(input + creation + read, 108_000);
     }
 
     #[test]
@@ -5300,7 +5304,8 @@ mod tests {
         let start_total = start_usage["input_tokens"].as_i64().unwrap()
             + start_usage["cache_creation_input_tokens"].as_i64().unwrap()
             + start_usage["cache_read_input_tokens"].as_i64().unwrap();
-        assert_eq!(start_total, 100_000);
+        // 10% × 1M × 1.08 安全系数 = 108k（见 ContextUsageEvent::input_tokens_with_margin）
+        assert_eq!(start_total, 108_000);
 
         let delta_usage = &events
             .iter()

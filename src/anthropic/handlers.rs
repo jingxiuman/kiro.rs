@@ -699,8 +699,20 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     }
 }
 
-/// 将 KiroProvider 错误映射为 HTTP 响应
+/// 将 KiroProvider 错误映射为 HTTP 响应。
+///
+/// 无请求上下文的调用方（web-search 等）用这个薄封装；主链路应走
+/// [`map_provider_error_with_prompt`] 以便超限错误带上 token 数字。
 pub(super) fn map_provider_error(err: Error) -> Response {
+    map_provider_error_with_prompt(err, None)
+}
+
+/// 同 [`map_provider_error`]，附带请求侧信息 `(入口估算 input_tokens, 窗口)`，
+/// 用于把上游超限错误组装成 Anthropic 原生 "prompt is too long: X > Y" 文案。
+pub(super) fn map_provider_error_with_prompt(
+    err: Error,
+    prompt_ctx: Option<(i32, i32)>,
+) -> Response {
     if let Some(rate_limit) = err.downcast_ref::<crate::kiro::error::UpstreamRateLimitError>() {
         tracing::warn!(error = %err, "上游限流（映射为 429）");
         let mut response = (
@@ -722,28 +734,26 @@ pub(super) fn map_provider_error(err: Error) -> Response {
 
     let err_str = err.to_string();
 
-    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
-    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+    // 上下文窗口满了 / 单次输入太长：统一映射为 Anthropic 原生 "prompt is too long"
+    // 格式。文案格式是客户端行为的一部分：Claude Code 等客户端靠识别该前缀走
+    // 「上下文超限」的降级路径（提示压缩 / 截断重试）；自定义文案会让客户端只能
+    // 原样报错（2026-08-10 /compact 三连 400 实例）。
+    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") || err_str.contains("Input is too long")
+    {
+        tracing::warn!(error = %err, "上游拒绝请求：输入超出上下文窗口（不应重试）");
+        // 上游只报「超限」这个事实、不给数字：X 取「估算值与 窗口+1 的较大者」，
+        // 是真实值的下界（上游既已拒绝，真实值必 > 窗口）；窗口未知时省略数字。
+        let message = match prompt_ctx {
+            Some((est_tokens, window)) => format!(
+                "prompt is too long: {} tokens > {} maximum",
+                est_tokens.max(window + 1),
+                window
+            ),
+            None => "prompt is too long".to_string(),
+        };
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )),
-        )
-            .into_response();
-    }
-
-    // 单次输入太长（请求体本身超出上游限制）
-    if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
-            )),
+            Json(ErrorResponse::new("invalid_request_error", &message)),
         )
             .into_response();
     }
@@ -1207,7 +1217,7 @@ async fn handle_stream_request(
             hook.record(0, input_tokens, 0, (0, 0), 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
             tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
-            return map_provider_error(e);
+            return map_provider_error_with_prompt(e, Some((input_tokens, context_window)));
         }
     };
     let response = call_result.response;
@@ -1280,6 +1290,18 @@ impl StreamOpsFeedback {
     /// 请求完整送达：提交一次代理成功（清零请求级失败计数）
     fn report_success(&self) {
         self.ops.report_proxy_success(self.proxy_url.as_deref());
+    }
+
+    /// contextUsage 顶满（≥100%）：记 ops 告警。这是「会话已进入压缩死区」的
+    /// 明确信号——继续对话可能还能过，但携带全量历史的压缩请求大概率被上游
+    /// CONTENT_LENGTH_EXCEEDS_THRESHOLD 拒绝（2026-08-10 session f2f77a4b 实例）。
+    fn report_context_exhausted(&self, model: &str) {
+        self.ops.events().record_event(
+            "context_exhausted",
+            "warn",
+            model,
+            "contextUsageEvent 报告 100%：会话上下文已顶满，压缩请求可能无法通过上游阈值",
+        );
     }
 
     /// 传输链路失败（连接已建立但响应未完整送达：流断开 / 上游截断）：
@@ -1452,6 +1474,11 @@ fn create_sse_stream(
                                 record_stream_usage(&hook, &ctx, credential_id, "success");
                                 // 请求完整送达：提交一次代理成功（清零请求级失败计数）
                                 report_stream_outcome(&ops_feedback, false, "");
+                                if ctx.context_exhausted
+                                    && let Some(fb) = &ops_feedback
+                                {
+                                    fb.report_context_exhausted(&ctx.model);
+                                }
                                 tracer.finalize(
                                     "success",
                                     None,
@@ -1622,7 +1649,7 @@ async fn handle_non_stream_request(
         Err(e) => {
             hook.record(0, input_tokens, 0, (0, 0), 0.0, "error");
             tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
-            return map_provider_error(e);
+            return map_provider_error_with_prompt(e, Some((input_tokens, context_window)));
         }
     };
     let response = call_result.response;
@@ -1680,6 +1707,8 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    // contextUsageEvent 报告过 ≥100%（响应组装后据此记 ops 告警）
+    let mut context_exhausted = false;
     // meteringEvent 上报的 credit 计费量（上游真实下发）；
     // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
@@ -1727,15 +1756,14 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
+                            // 从上下文使用百分比计算实际的 input_tokens（统一走带安全系数的换算）
                             // 窗口值由请求入口随 ConversionResult 传入，不再回头查全局注册表
-                            let window_size = context_window;
                             let actual_input_tokens =
-                                (context_usage.context_usage_percentage * (window_size as f64)
-                                    / 100.0) as i32;
+                                context_usage.input_tokens_with_margin(context_window);
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                            if context_usage.context_usage_percentage >= 100.0 {
+                            if context_usage.is_exhausted() {
+                                context_exhausted = true;
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
                             tracing::debug!(
@@ -1828,6 +1856,16 @@ async fn handle_non_stream_request(
     }
 
     tracer.open_phase(phase::ASSEMBLE);
+
+    // contextUsage 顶满：记 ops 告警（与流式路径同一信号，见 report_context_exhausted）
+    if context_exhausted && let Some(ops) = provider.ops_runtime() {
+        ops.events().record_event(
+            "context_exhausted",
+            "warn",
+            model,
+            "contextUsageEvent 报告 100%：会话上下文已顶满，压缩请求可能无法通过上游阈值",
+        );
+    }
 
     // 确定 stop_reason
     if has_tool_use && stop_reason == "end_turn" {
@@ -2328,7 +2366,7 @@ async fn handle_stream_request_buffered(
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, (0, 0), 0.0, "error");
             tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
-            return map_provider_error(e);
+            return map_provider_error_with_prompt(e, Some((fallback_input_tokens, context_window)));
         }
     };
     let response = call_result.response;
@@ -2552,6 +2590,34 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 上游超限错误必须映射为 Anthropic 原生 "prompt is too long: X > Y" 文案：
+    /// Claude Code 等客户端靠该前缀识别上下文超限并走降级路径（提示压缩），
+    /// 自定义文案会让客户端只能原样报错（2026-08-10 /compact 三连 400 根因之一）。
+    #[tokio::test]
+    async fn content_length_exceeded_maps_to_native_prompt_too_long() {
+        let err = anyhow::anyhow!(
+            "非流式 API 请求失败: 400 Bad Request {{\"message\":\"Input content length exceeds threshold; reason=CONTENT_LENGTH_EXCEEDS_THRESHOLD\"}}"
+        );
+        let resp = map_provider_error_with_prompt(err, Some((700_000, 1_000_000)));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let msg = json["error"]["message"].as_str().unwrap();
+        // X 是真实值下界：估算 70 万 < 窗口，取 窗口+1
+        assert_eq!(msg, "prompt is too long: 1000001 tokens > 1000000 maximum");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+    }
+
+    /// 无请求上下文（web-search 等旁路）时省略数字，但前缀必须保留。
+    #[tokio::test]
+    async fn content_length_exceeded_without_ctx_keeps_prefix() {
+        let err = anyhow::anyhow!("CONTENT_LENGTH_EXCEEDS_THRESHOLD");
+        let resp = map_provider_error(err);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["message"], "prompt is too long");
+    }
 
     /// 构造一个不依赖 AppState / usage_store / client_keys 的最小 `UsageRecordHook`，
     /// 专门用来验证 `record()` 是否真的把消耗回写给了 `GroupDispatcher`——

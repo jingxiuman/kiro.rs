@@ -264,10 +264,9 @@ async fn decode_round(
                 }
                 Event::ContextUsage(cu) => {
                     // 窗口值由请求入口随 ConversionResult 传入，不再回头查全局注册表
-                    let window = context_window;
-                    let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
-                    context_input_tokens = Some(actual);
-                    if cu.context_usage_percentage >= 100.0 {
+                    // （统一走带安全系数的换算，与流式 / 非流式同一口径）
+                    context_input_tokens = Some(cu.input_tokens_with_margin(context_window));
+                    if cu.is_exhausted() {
                         stop_reason_override = Some("model_context_window_exceeded".to_string());
                     }
                 }
