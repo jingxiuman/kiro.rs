@@ -1,0 +1,42 @@
+src/anthropic/stream.rs
+  s_e64356302bad1d::t_906a888019d387 1685,1688,1691-1692
+  s_e64356302bad1d::t_6436afd949e158 1458-1459
+  s_e64356302bad1d::t_ed7f06b10468a4 1586
+  s_e64356302bad1d::t_9a828079b715c0 5272-5273
+  s_e64356302bad1d::t_8517b82f9c0736 5307-5308
+src/anthropic/websearch_loop.rs
+  s_e64356302bad1d::t_fdb76eb646c2ba 267-269
+src/anthropic/handlers.rs
+  s_e64356302bad1d::t_66b38e181453ff 1295-1306
+  s_e64356302bad1d::t_2194b7f750f271 737-753,756
+  s_e64356302bad1d::t_efc9591c86a97d 1477-1481
+  s_e64356302bad1d::t_c7afd87547d23f 1710-1711
+  s_e64356302bad1d::t_dc210866e34dc4 1759,1762,1765-1766
+  s_e64356302bad1d::t_62eb3b3fa60209 2594-2621
+  s_e64356302bad1d::t_8d14b877a3aa88 702-705,707-715
+  s_e64356302bad1d::t_0e7059903b9c8f 1860-1869
+  s_e64356302bad1d::t_c9f582d4b3089d 1220,1652,2369
+src/kiro/model/events/context_usage.rs
+  s_e64356302bad1d::t_e7bef72144eef7 29-39,45-59
+  s_e64356302bad1d::t_6ebde0dcaff875 60,68-100
+Cargo.toml
+  s_e64356302bad1d::t_ef8806bf2542b3 3
+Cargo.lock
+  s_e64356302bad1d::t_3d5f4b432dd90e 1354
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "ee603f9fae325e3f2c525b6dedea799d655a0d22",
+  "prompts": {},
+  "sessions": {
+    "s_e64356302bad1d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0df0f728-aa1a-4657-9204-449390fe2450",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
