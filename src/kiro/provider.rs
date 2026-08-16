@@ -833,6 +833,16 @@ impl KiroProvider {
                             sink, attempt, ctx.id, endpoint_name, Some(400),
                             outcome::BAD_REQUEST, Some(&body), attempt_start, proxy_url.as_deref(),
                         );
+                        // 循环可能在这次剥字段重试恰好用尽重试预算时结束（单凭据场景很容易
+                        // 撞上 attempt + 1 == max_retries）。必须把这次 400 记进 last_error，
+                        // 否则调用方只会拿到"已达到最大重试次数"，丢失上游拒绝该字段的
+                        // 唯一证据——而这份证据正是本次改动要保留的取证通道。
+                        last_error = Some(anyhow::anyhow!(
+                            "{} API 请求失败: {} {}",
+                            api_type,
+                            status,
+                            body
+                        ));
                         continue;
                     }
                 }
