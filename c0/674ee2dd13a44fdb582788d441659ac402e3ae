@@ -1,0 +1,19 @@
+src/anthropic/openai.rs
+  s_eb5706c585b36a::t_cdbed8e3026e0f 66-73,724,732-742
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "c0674ee2dd13a44fdb582788d441659ac402e3ae",
+  "prompts": {},
+  "sessions": {
+    "s_eb5706c585b36a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a00a46-6661-7ca3-9141-da886886a473",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
