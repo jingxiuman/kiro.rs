@@ -206,11 +206,20 @@ fn session_id_of(payload: &super::types::MessagesRequest) -> Option<String> {
 /// 刻意不复用 cache_metering::isolation_seed：那个函数只在 key_id == 0 时走
 /// cc 级降级，普通 client key 直接返回 key:<key_id>，会让同一 client key 下
 /// 的所有会话共享一条粘滞记录，流量被永久钉死在一个账号——正是本功能要修的病。
-fn dispatch_sticky_key(req: &MessagesRequest) -> Option<String> {
-    req.metadata
-        .as_ref()
-        .and_then(|m| m.user_id.as_deref())
-        .and_then(super::metadata::extract_session_id)
+///
+/// OpenAI 来源的 session 额外按 `key_id` 加命名空间：`prompt_cache_key` 是
+/// OpenAI 文档化的公开字段，值可能是人手写的固定串，跨 Key 碰撞是现实风险
+/// （与 commit 29114f3 给缓存计量种子加 key 命名空间同一个威胁模型，那次只
+/// 修了三个消费方里的一个）。Claude Code 来源维持原样，避免动到已在生产
+/// 运行的粘滞记录。
+fn dispatch_sticky_key(req: &MessagesRequest, key_id: u64) -> Option<String> {
+    let user_id = req.metadata.as_ref().and_then(|m| m.user_id.as_deref())?;
+    let session = super::metadata::extract_session_id(user_id)?;
+    if super::metadata::is_openai_client_session(user_id) {
+        Some(format!("{key_id}:{session}"))
+    } else {
+        Some(session)
+    }
 }
 
 /// omitted 轻量往返的回程恢复：历史 assistant 消息里「空正文 + kiro-thinking-v1 恢复键」
@@ -1149,7 +1158,7 @@ pub async fn post_messages(
                 cache_usage,
                 group: key_ctx.group.clone(),
                 context_window,
-                sticky_key: dispatch_sticky_key(&payload),
+                sticky_key: dispatch_sticky_key(&payload, key_ctx.key_id),
             },
         )
         .await
@@ -1182,7 +1191,7 @@ pub async fn post_messages(
                 cache_usage,
                 group: key_ctx.group.clone(),
                 context_window,
-                sticky_key: dispatch_sticky_key(&payload),
+                sticky_key: dispatch_sticky_key(&payload, key_ctx.key_id),
             },
         )
         .await
@@ -2296,7 +2305,7 @@ pub async fn post_messages_cc(
                 cache_usage,
                 group: key_ctx.group.clone(),
                 context_window,
-                sticky_key: dispatch_sticky_key(&payload),
+                sticky_key: dispatch_sticky_key(&payload, key_ctx.key_id),
             },
         )
         .await
@@ -2329,7 +2338,7 @@ pub async fn post_messages_cc(
                 cache_usage,
                 group: key_ctx.group.clone(),
                 context_window,
-                sticky_key: dispatch_sticky_key(&payload),
+                sticky_key: dispatch_sticky_key(&payload, key_ctx.key_id),
             },
         )
         .await
@@ -2702,7 +2711,7 @@ mod tests {
             "metadata": {"user_id": "{\"device_id\":\"d\",\"session_id\":\"0b4445e1-1111-4222-8333-444455556666\"}"}
         })).unwrap();
         assert_eq!(
-            dispatch_sticky_key(&with_session).as_deref(),
+            dispatch_sticky_key(&with_session, 7).as_deref(),
             Some("0b4445e1-1111-4222-8333-444455556666")
         );
 
@@ -2712,7 +2721,7 @@ mod tests {
             "model": "claude-sonnet-5",
             "messages": [{"role": "user", "content": "hi"}]
         })).unwrap();
-        assert_eq!(dispatch_sticky_key(&without), None);
+        assert_eq!(dispatch_sticky_key(&without, 7), None);
 
         // metadata 存在但不含合法 uuid：同样返回 None
         let bad: MessagesRequest = serde_json::from_value(serde_json::json!({
@@ -2720,7 +2729,41 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "metadata": {"user_id": "not-a-session"}
         })).unwrap();
-        assert_eq!(dispatch_sticky_key(&bad), None);
+        assert_eq!(dispatch_sticky_key(&bad, 7), None);
+    }
+
+    /// OpenAI 来源的粘滞种子要按 key_id 加命名空间，防止不同客户端 Key 用同一个
+    /// `prompt_cache_key`（人手写的固定串是现实风险）撞到同一条粘滞记录；
+    /// Claude Code 来源必须维持原样，不能动到已在生产运行的粘滞记录。
+    #[test]
+    fn dispatch_sticky_key_namespaces_openai_source_by_key_id_only() {
+        let session = "0b4445e1-1111-4222-8333-444455556666";
+
+        // OpenAI 来源：同一 session，不同 key_id 必须产出不同的粘滞键。
+        let openai_req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": format!("openai_client__session_{session}")}
+        }))
+        .unwrap();
+        let key_a = dispatch_sticky_key(&openai_req, 1);
+        let key_b = dispatch_sticky_key(&openai_req, 2);
+        assert_ne!(key_a, key_b, "不同 key_id 的 OpenAI 会话不应共享粘滞记录");
+        assert_eq!(key_a.as_deref(), Some(format!("1:{session}").as_str()));
+        assert_eq!(key_b.as_deref(), Some(format!("2:{session}").as_str()));
+
+        // Claude Code 来源：同一 session，不同 key_id 必须产出**相同**粘滞键
+        // （防回归：生产已在用不带命名空间的粘滞记录，不能被本次改动打散）。
+        let cc_req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": format!("{{\"device_id\":\"d\",\"session_id\":\"{session}\"}}")}
+        }))
+        .unwrap();
+        let cc_key_a = dispatch_sticky_key(&cc_req, 1);
+        let cc_key_b = dispatch_sticky_key(&cc_req, 2);
+        assert_eq!(cc_key_a, cc_key_b, "Claude Code 会话的粘滞键不应随 key_id 变化");
+        assert_eq!(cc_key_a.as_deref(), Some(session));
     }
 
     #[test]
