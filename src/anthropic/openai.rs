@@ -63,9 +63,14 @@ pub struct ChatCompletionRequest {
 
 /// 从 OpenAI 请求体或会话亲和请求头中提取并规范化会话 UUID。
 ///
-/// 取值顺序：`prompt_cache_key` → `x-session-affinity` → `x-client-request-id`
-/// → `session_id`。值可带 `session_` 前缀。解析不出 UUID 时返回 `None`，
-/// 保持无状态语义（conversationId 随机，与改动前一致）。
+/// 取值顺序：`prompt_cache_key` → `x-session-affinity` → `session_id`。
+/// 值可带 `session_` 前缀。解析不出 UUID 时返回 `None`，保持无状态语义
+/// （conversationId 随机，与改动前一致）。
+///
+/// 刻意不收 `x-client-request-id`：按业界惯例（Azure `x-ms-client-request-id`
+/// 等）这个头是「每个 HTTP 请求一个新 UUID」，不是会话标识。若纳入候选链，
+/// 发了该头但没发 `prompt_cache_key` 的客户端会在每个请求上拿到不同的
+/// isolation seed，模拟缓存计量的 cache_read 会被打散到恒为 0——不要"补全"回去。
 pub(super) fn resolve_session_metadata(
     prompt_cache_key: Option<&str>,
     headers: &HeaderMap,
@@ -73,7 +78,6 @@ pub(super) fn resolve_session_metadata(
     let candidates = [
         prompt_cache_key,
         headers.get("x-session-affinity").and_then(|v| v.to_str().ok()),
-        headers.get("x-client-request-id").and_then(|v| v.to_str().ok()),
         headers.get("session_id").and_then(|v| v.to_str().ok()),
     ];
 
@@ -717,12 +721,23 @@ mod tests {
     #[test]
     fn session_metadata_falls_through_header_chain() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-client-request-id", UUID_B.parse().unwrap());
+        headers.insert("session_id", UUID_B.parse().unwrap());
         let md = resolve_session_metadata(None, &headers).unwrap();
         assert_eq!(
             md.user_id.as_deref(),
             Some(format!("openai_client__session_{UUID_B}").as_str())
         );
+    }
+
+    /// `x-client-request-id` 约定俗成是「每个 HTTP 请求一个新 UUID」（Azure 等
+    /// 网关的 x-ms-client-request-id 惯例），绝不能被当成会话标识收进候选链——
+    /// 否则每个请求都会解析出不同的 seed，模拟缓存计量会被打散到 cache_read
+    /// 恒为 0。这里显式断言：即便只发这一个头，也必须落回无状态（None）。
+    #[test]
+    fn session_metadata_ignores_client_request_id_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-client-request-id", UUID_A.parse().unwrap());
+        assert!(resolve_session_metadata(None, &headers).is_none());
     }
 
     #[test]
