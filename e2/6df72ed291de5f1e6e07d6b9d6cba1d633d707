@@ -1,0 +1,19 @@
+src/anthropic/model_sync.rs
+  s_31249f6bfa0ec3::t_c64ad7105aab68 839-841,844,854-855,1473-1474,1493-1496,1528,1535,1555-1559,1571-1573,1578-1581,1592
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "e26df72ed291de5f1e6e07d6b9d6cba1d633d707",
+  "prompts": {},
+  "sessions": {
+    "s_31249f6bfa0ec3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aaf0a1e2fb50dd520",
+        "model": "unknown"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
