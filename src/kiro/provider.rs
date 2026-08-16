@@ -585,6 +585,10 @@ impl KiroProvider {
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 
+        // effort 字段被上游拒绝时会就地剥掉并重试；用 Cow 避免正常路径的拷贝。
+        let mut effective_body: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(request_body);
+        let mut effort_field_stripped = false;
+
         // 并发门禁排队失败（队满/超时）的凭据：本次请求内不再选它。
         // 所有候选都被排除时清空并置 gate_bypass 兜底放行——门禁只平滑速率，不拒绝请求。
         // 该集合的来源只有并发门禁队满/超时，本就是短暂拥塞，一律标 Transient：
@@ -700,7 +704,7 @@ impl KiroProvider {
             };
 
             let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+            let body = endpoint.transform_api_body(effective_body.as_ref(), &rctx);
 
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
             tracing::debug!("实际发送请求体: {}", body);
@@ -812,6 +816,26 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                // effort 字段本身被拒：剥掉重试一次。该字段只是档位优化，
+                // 失败语义应当是「退化到不带 effort 的现状」，而不是打死请求。
+                if !effort_field_stripped && endpoint.is_effort_field_rejected(&body) {
+                    if let Some(retry_body) =
+                        Self::strip_additional_model_request_fields(effective_body.as_ref())
+                    {
+                        tracing::warn!(
+                            model = ?model,
+                            "上游拒绝 additionalModelRequestFields，剥掉该字段重试一次: {}",
+                            body
+                        );
+                        effective_body = std::borrow::Cow::Owned(retry_body);
+                        effort_field_stripped = true;
+                        Self::emit_attempt(
+                            sink, attempt, ctx.id, endpoint_name, Some(400),
+                            outcome::BAD_REQUEST, Some(&body), attempt_start, proxy_url.as_deref(),
+                        );
+                        continue;
+                    }
+                }
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(400),
                     outcome::BAD_REQUEST, Some(&body), attempt_start, proxy_url.as_deref(),
@@ -1093,6 +1117,17 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
+    /// 从已序列化的请求体里剥掉 `additionalModelRequestFields`。
+    ///
+    /// 返回 `None` 表示报文里本来就没有该字段（或不是合法 JSON），调用方据此
+    /// 判断「剥了也没用，别重试」。
+    fn strip_additional_model_request_fields(request_body: &str) -> Option<String> {
+        let mut json: serde_json::Value = serde_json::from_str(request_body).ok()?;
+        let obj = json.as_object_mut()?;
+        obj.remove("additionalModelRequestFields")?;
+        serde_json::to_string(&json).ok()
+    }
+
     fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
@@ -1259,6 +1294,24 @@ mod rate_limit_tests {
     fn current_acquire_rate_limit_is_detected_before_outer_retry() {
         let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
         assert!(is_rate_limit_error(&error));
+    }
+
+    #[test]
+    fn strip_additional_model_request_fields_removes_only_that_key() {
+        let body = r#"{"conversationState":{"conversationId":"c1"},"additionalModelRequestFields":{"reasoning":{"effort":"high"}}}"#;
+        let stripped = KiroProvider::strip_additional_model_request_fields(body)
+            .expect("含该字段时必须返回剥离后的报文");
+        let v: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert!(v.get("additionalModelRequestFields").is_none());
+        assert_eq!(v["conversationState"]["conversationId"], "c1");
+    }
+
+    #[test]
+    fn strip_additional_model_request_fields_returns_none_when_absent() {
+        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
+        assert!(KiroProvider::strip_additional_model_request_fields(body).is_none());
+        // 非 JSON 报文不得 panic
+        assert!(KiroProvider::strip_additional_model_request_fields("not json").is_none());
     }
 }
 

@@ -88,6 +88,11 @@ pub trait KiroEndpoint: Send + Sync {
     fn is_gateway_timeout(&self, body: &str) -> bool {
         default_is_gateway_timeout(body)
     }
+
+    /// 上游是否因 `additionalModelRequestFields` 本身而 400。
+    fn is_effort_field_rejected(&self, body: &str) -> bool {
+        default_is_effort_field_rejected(body)
+    }
 }
 
 /// 装饰请求时可用的上下文
@@ -209,6 +214,15 @@ pub fn default_is_client_validation_error(body: &str) -> bool {
         .any(|m| body.contains(m))
 }
 
+/// 上游是否因 `additionalModelRequestFields` 本身而拒绝请求。
+///
+/// 该字段是纯优化项（effort 档位），命中时调用方应剥掉它重试一次，而不是把
+/// 请求打死。判据用字段名裸子串即可——这是我们自己发出的 key 名，只会出现在
+/// 针对它的错误报文里，不会与正常内容冲突。
+pub fn default_is_effort_field_rejected(body: &str) -> bool {
+    body.contains("additionalModelRequestFields")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +334,20 @@ mod tests {
         // 宽泛的 ValidationException 不再单独命中（无精确 reason / 无特异短语时）
         assert!(!default_is_client_validation_error(
             r#"{"__type":"ValidationException","message":"some other validation"}"#
+        ));
+    }
+
+    #[test]
+    fn test_effort_field_rejection_detected() {
+        assert!(default_is_effort_field_rejected(
+            r#"{"__type":"ValidationException","message":"Invalid additionalModelRequestFields"}"#
+        ));
+        assert!(default_is_effort_field_rejected(
+            r#"{"message":"additionalModelRequestFields is not supported for this model"}"#
+        ));
+        // 与 effort 无关的 400 不得命中
+        assert!(!default_is_effort_field_rejected(
+            r#"{"__type":"ValidationException","message":"Improperly formed request."}"#
         ));
     }
 }
