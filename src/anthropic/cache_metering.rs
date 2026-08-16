@@ -566,12 +566,16 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
 /// 种子只参与哈希、不计入 token 估算，因此不影响 cache_creation/read 的数值口径。
 /// 返回 `None` 表示本次请求不应模拟缓存（调用方据此产出全 input、零缓存）。
 fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
-    if let Some(session) = req
-        .metadata
-        .as_ref()
-        .and_then(|m| m.user_id.as_deref())
-        .and_then(extract_session_id)
+    if let Some(user_id) = req.metadata.as_ref().and_then(|m| m.user_id.as_deref())
+        && let Some(session) = extract_session_id(user_id)
     {
+        // OpenAI 协议侧的 session 来自客户端可控的 prompt_cache_key / 亲和头，
+        // 值可能是人手写的固定串（如 "my-app-v1" 风格的 UUID 复用），跨 Key
+        // 碰撞是现实风险 → 按 key 命名空间隔离。Claude Code 的 session 是客户端
+        // 自生成的随机 UUID，维持跨 Key 共享，不改既有命中率。
+        if super::metadata::is_openai_client_session(user_id) {
+            return Some(format!("sess:{key_id}:{session}"));
+        }
         return Some(format!("sess:{session}"));
     }
     if key_id == 0 {
@@ -1925,5 +1929,40 @@ mod tests {
         let mut buf = Vec::new();
         img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png).unwrap();
         B64.encode(&buf)
+    }
+
+    /// OpenAI 来源的 session 必须按 key 命名空间隔离：
+    /// 同一个 prompt_cache_key 落到不同客户端 Key 不得互相命中。
+    #[test]
+    fn openai_session_seed_is_namespaced_by_key() {
+        use super::super::types::{Message, MessagesRequest, Metadata};
+        let session = "550e8400-e29b-41d4-a716-446655440000";
+        let base_request = |user_id: &str| MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 64,
+            messages: vec![Message {
+                role: "user".into(),
+                content: serde_json::json!([{"type":"text","text":"hi"}]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata { user_id: Some(user_id.to_string()) }),
+        };
+        let openai = format!("openai_client__session_{session}");
+        let a = isolation_seed(&base_request(&openai), 7);
+        let b = isolation_seed(&base_request(&openai), 9);
+        assert!(a.is_some());
+        assert_ne!(a, b, "不同客户端 Key 不得共享 OpenAI 来源的种子");
+
+        // Claude Code 来源维持原样：跨 Key 共享同一会话
+        let cc = format!("user_xxx_account__session_{session}");
+        assert_eq!(
+            isolation_seed(&base_request(&cc), 7),
+            isolation_seed(&base_request(&cc), 9)
+        );
     }
 }
