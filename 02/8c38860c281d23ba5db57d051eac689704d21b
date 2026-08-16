@@ -1,0 +1,29 @@
+src/kiro/endpoint/mod.rs
+  s_a4069f46ba4df4::t_3bd4d83bb95dae 91-95,217-225,339-352
+src/kiro/provider.rs
+  s_d10524fdd08a12::t_b6b10824f842cc 588-591,707,819-838,1120-1130,1298-1315
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "028c38860c281d23ba5db57d051eac689704d21b",
+  "prompts": {},
+  "sessions": {
+    "s_a4069f46ba4df4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a50e8cee6584d41e5",
+        "model": "unknown"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    },
+    "s_d10524fdd08a12": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a834c3313b2223afa",
+        "model": "unknown"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
