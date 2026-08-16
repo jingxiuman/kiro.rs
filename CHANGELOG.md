@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.13] - 2026-08-16
+
+主题：**吸收上游 [ZyphrZero/kiro.rs v0.7.6](https://github.com/ZyphrZero/kiro.rs) 的四项改动，并配套三处本项目独有的加固**。上游 v0.7.6 带来 GPT 家族 reasoning effort 原生字段、OpenAI 入口会话亲和、上游未知事件取证、`claude-opus-5` 内置 1M 上下文行；吸收过程中发现并修补了三处本项目自身链路（非上游原有问题）的隔离缺口。
+
+### ✨ 吸收上游 v0.7.6
+
+- **GPT 家族 effort 走 `reasoning.effort` 原生 wire 字段**：GPT-5 系列请求的 reasoning effort 不再塞进 `additionalModelRequestFields`，改走上游原生 `reasoning.effort` 字段。**与上游的刻意偏离**：判定「是否 GPT 家族」用 `starts_with("gpt-")` 前缀匹配，而非上游硬编码的三个具体型号名——新增 GPT 型号无需再改这段判定代码。上游拒绝 effort 字段时剥字段重试一次（`028c388`），重试路径的 `continue` 补上了 `last_error` 赋值，避免吞掉真实失败原因（`996030f`）。
+- **OpenAI 入口会话亲和**：会话亲和标识透传到 `conversationId`，让同一会话尽量落到同一上游账号（`4fd3cdd`）。**与上游的刻意偏离**：`metadata.user_id` 写成 `openai_client__session_<uuid>`，而非上游裸 `session_<uuid>`——本项目 `extract_session_id` 用 `split_once("_session_")` 解析取值，裸形式没有该分隔符前缀，解析不出来。会话亲和候选链剔除了 `x-client-request-id`，避免它把同一会话的缓存计量拆散归零（`c0674ee`）。
+- **未知上游事件 warn-once 取证**：`Event::from_frame` 遇到不认识的上游事件类型时，按事件名去重、进程内只 warn 一次，日志里落的是真实事件名（如 `metadataEvent`），用于判断上游是否在发精确 token 用量事件（`d8c0e86`）。
+- **`claude-opus-5` 内置 1M 上下文行**：内置默认模型表补上 `claude-opus-5`，`context_window` 为 `1_000_000`，`expose_thinking_variant` 为 `true`（`05661a6`）；`model_sync` 相关测试同步改为派生内置行数，不再硬编码 `13`（`e26df72`）。
+
+### 🔧 本项目独有加固（上游没有）
+
+- **剥字段兜底覆盖任意非 2xx**：`additionalModelRequestFields` 被上游拒绝后的剥字段重试，判定条件从「仅 400」放宽到「任意非 2xx」，避免上游用其它状态码拒绝时兜底失效（`9081c10`）。
+- **计量隔离种子按 key_id 命名空间**：OpenAI 来源的 session 计量种子按调用方 key 加命名空间隔离，防止不同 key 的会话互相污染计量归属（`29114f3`）。
+- **dispatch 粘滞键按 key_id 命名空间**：OpenAI 来源的粘滞分流键同样按 key_id 加命名空间，语义与计量隔离对齐（`04fbd8d`）。
+
+### ✅ 测试
+
+- 补 `Event::from_frame` Unknown 分支的取证覆盖：此前只测过 `note_unknown_event` 这个 helper，`from_frame` 里真正调用它的分支从未被验证过是否登记了「原始事件名」而非固定字符串 `"unknown"`（`e336088`）。
+- 消除本轮新引入的两条 clippy `identical-blocks` / `collapsible-if` 告警（`9fc9993`）。
+
 ## [0.7.2] - 2026-07-26
 
 主题：**新增 `config.json` 配置驱动的自定义模型映射，并把上游 meteringEvent 的 credit 计费字段透传到 Anthropic / OpenAI 响应的 usage 对象**。本次为兼容性补丁版本：自定义模型默认空数组、完全向后兼容，credit 字段仅在收到 meteringEvent 时才追加，不影响任何既有响应结构。
