@@ -95,6 +95,23 @@ pub enum Event {
     },
 }
 
+/// 已上报过的未知事件名。只在 Unknown 分支访问，不在热路径上。
+static SEEN_UNKNOWN_EVENTS: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// 登记一个未知事件名，返回 `true` 表示本进程内首次见到（调用方据此只 warn 一次）。
+fn note_unknown_event(name: &str) -> bool {
+    SEEN_UNKNOWN_EVENTS
+        .get_or_init(Default::default)
+        .lock()
+        .insert(name.to_string())
+}
+
+#[cfg(test)]
+fn reset_seen_unknown_events_for_test() {
+    SEEN_UNKNOWN_EVENTS.get_or_init(Default::default).lock().clear();
+}
+
 impl Event {
     /// 从帧解析事件
     pub fn from_frame(frame: Frame) -> ParseResult<Self> {
@@ -134,7 +151,16 @@ impl Event {
                 let payload = super::ReasoningContentEvent::from_frame(&frame)?;
                 Ok(Self::ReasoningContent(payload))
             }
-            EventType::Unknown => Ok(Self::Unknown {}),
+            EventType::Unknown => {
+                // 上游新增事件不会自己冒头——这里是唯一能看见它的地方。
+                // 按事件名去重，避免流式高频刷屏。
+                if let Some(name) = frame.event_type()
+                    && note_unknown_event(name)
+                {
+                    tracing::warn!(event_type = %name, "上游返回了未识别的事件类型（本进程首次）");
+                }
+                Ok(Self::Unknown {})
+            }
         }
     }
 
@@ -199,5 +225,14 @@ mod tests {
             "assistantResponseEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+    }
+
+    /// 未知事件仍解析为 Unknown（形状不变），但事件名会被记录一次。
+    #[test]
+    fn unknown_event_name_is_recorded_once() {
+        super::reset_seen_unknown_events_for_test();
+        assert!(super::note_unknown_event("metadataEvent"), "首次出现必须上报");
+        assert!(!super::note_unknown_event("metadataEvent"), "同名不得重复上报");
+        assert!(super::note_unknown_event("someOtherEvent"), "新名字仍要上报");
     }
 }
