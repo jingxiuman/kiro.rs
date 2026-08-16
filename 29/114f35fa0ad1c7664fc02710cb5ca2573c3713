@@ -1,0 +1,19 @@
+src/anthropic/cache_metering.rs
+  s_838b2a2d364f1a::t_ff84fadf79a776 569-570,572-578,1933-1967
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "29114f35fa0ad1c7664fc02710cb5ca2573c3713",
+  "prompts": {},
+  "sessions": {
+    "s_838b2a2d364f1a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad95c6914d6f490ad",
+        "model": "unknown"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
