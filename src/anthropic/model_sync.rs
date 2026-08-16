@@ -836,9 +836,12 @@ mod tests {
         let _registry_guard =
             crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("add");
+        // 用一个必然不在内置默认里的名字：claude-opus-5 现在已经是内置行
+        // （对齐上游 v0.7.6，见 model_registry.rs），若继续用它构造"新模型"
+        // 场景，sync 会把它当成既有行更新而不是新增，added 就不再是 1。
         let fetcher = Arc::new(FakeFetcher::new(vec![(
             3,
-            Ok(vec![upstream("claude-opus-5", Some(1_000_000))]),
+            Ok(vec![upstream("claude-brand-new", Some(1_000_000))]),
         )]));
         let svc = ModelSyncService::new(store.clone(), fetcher);
 
@@ -848,8 +851,8 @@ mod tests {
         assert_eq!(summary.added, 1);
 
         let out = store.load();
-        let row = out.registry.rows().iter().find(|r| r.upstream_id == "claude-opus-5").unwrap();
-        assert_eq!(row.exposed_id, "claude-opus-5");
+        let row = out.registry.rows().iter().find(|r| r.upstream_id == "claude-brand-new").unwrap();
+        assert_eq!(row.exposed_id, "claude-brand-new");
         assert_eq!(row.context_window, 1_000_000);
         assert!(row.expose_thinking_variant, "claude-* 应派生 thinking 变体");
     }
@@ -1467,8 +1470,8 @@ mod tests {
 
     /// N6 语义边界：护栏码路要区分**两种缺失比例相同、结论相反**的场景。
     ///
-    /// 两个场景的「原始缺失比例」都是 8/13 = 62%，但：
-    /// - 场景 A「探针不具代表性」：13 行全是 Active，探针只返回 5 个 → 必须拦。
+    /// 两个场景的「原始缺失比例」相同（8 个内置模型缺失，占比超过 50%），但：
+    /// - 场景 A「探针不具代表性」：内置行全是 Active，探针只返回其中一部分 → 必须拦。
     ///   探针看不到的那 8 个模型在上游是存在的，把它们标 deprecated 就是误报。
     /// - 场景 B「上游合法批量退役」：其中 4 个早已 Deprecated（上一批正常退役），
     ///   本轮真正新消失的只有 4 个 → 必须放行。已经不在上游的行不该再参与
@@ -1487,12 +1490,14 @@ mod tests {
             ["claude-opus-4.6", "claude-sonnet-4.6", "claude-opus-4.7", "gpt-5.6-terra"];
         let all_missing: Vec<&str> =
             FIRST_WAVE.iter().chain(SECOND_WAVE.iter()).copied().collect();
-        // 前置检查：两个场景的原始缺失比例确实相同，否则这条对照就不成立
+        // 前置检查：两个场景的原始缺失比例确实相同，否则这条对照就不成立。
+        // 行数本身不是本测试要验证的东西（那是 model_registry.rs 自己的职责），
+        // 这里只从 builtin_rows() 派生，不写死具体数字，免得每次内置表加行
+        // 都得回来改这一处。
         let exact_rows = crate::anthropic::model_registry::builtin_rows()
             .into_iter()
             .filter(|r| r.match_kind != MatchKind::Prefix)
             .count();
-        assert_eq!(exact_rows, 13);
         assert!(all_missing.len() * 2 > exact_rows, "两个场景的原始缺失比例都应超过 50%");
 
         let probe = |missing: Vec<&str>| {
@@ -1520,14 +1525,14 @@ mod tests {
         // ---- 场景 B：上游合法批量退役 → 放行 ----
         {
             let store = tmp_store("n6-boundary-bulk-retirement");
-            // 先让 FIRST_WAVE 正常退役（4/13 = 31%，护栏不触发）
+            // 先让 FIRST_WAVE 正常退役（4 个，占比不到一半，护栏不触发）
             for _ in 0..2 {
                 ModelSyncService::new(store.clone(), probe(FIRST_WAVE.to_vec()))
                     .sync_once(Some(3), now())
                     .await
                     .unwrap();
             }
-            // 此刻缺失集与场景 A 完全相同（8/13），但 4 个已 Deprecated
+            // 此刻缺失集与场景 A 完全相同（8 个），但 4 个已 Deprecated
             for _ in 0..2 {
                 ModelSyncService::new(store.clone(), probe(all_missing.clone()))
                     .sync_once(Some(3), now())
@@ -1547,11 +1552,11 @@ mod tests {
         }
     }
 
-    /// C1（spec §6.3 终版）症状复现：探针稳定只保留 5/13（缺失比例 62%，
-    /// 远超 50% 护栏阈值），连跑 20 个权威轮。因为护栏每轮都触发，消失判定
-    /// 被暂停，**计数器必须一次都不递增**——这是设计意图，不是缺陷：分不清
-    /// 「探针误配」与「上游真退役」时，任何悄悄推进计数的做法都等于在第
-    /// 21 轮突然、无人知晓地把 8 个模型标记为 Deprecated。
+    /// C1（spec §6.3 终版）症状复现：探针稳定只保留内置行里的 5 个
+    /// （缺失比例远超 50% 护栏阈值），连跑 20 个权威轮。因为护栏每轮都触发，
+    /// 消失判定被暂停，**计数器必须一次都不递增**——这是设计意图，不是缺陷：
+    /// 分不清「探针误配」与「上游真退役」时，任何悄悄推进计数的做法都等于
+    /// 在第 21 轮突然、无人知晓地把缺失的那些模型标记为 Deprecated。
     ///
     /// 随后运维显式带 `force=true` 确认「探针没配错」。force 只绕过比例护栏，
     /// **不绕过** `MISSING_ROUNDS_THRESHOLD=2`（见 `SyncOptions` 上的注释：
@@ -1563,12 +1568,17 @@ mod tests {
             crate::anthropic::model_registry::MODEL_GLOBALS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let store = tmp_store("c1-force-override");
 
+        // 具体行数不是本测试要验证的东西（那是 model_registry.rs 自己的职责），
+        // 这里只从 builtin_upstream_models() 派生 kept/missing，不写死具体数字。
+        // 只要求「留 5 个、其余全部缺失」的比例够高，能稳定触发下面的护栏。
         let all_builtin = builtin_upstream_models();
-        assert_eq!(all_builtin.len(), 13, "前置条件：内置 exact 行应为 13 个");
         let kept: Vec<UpstreamModel> = all_builtin.iter().take(5).cloned().collect();
         let missing_ids: Vec<String> =
             all_builtin[5..].iter().map(|m| m.model_id.clone()).collect();
-        assert_eq!(missing_ids.len(), 8);
+        assert!(
+            missing_ids.len() * 2 > all_builtin.len(),
+            "缺失比例应超过 50%，护栏才会稳定触发"
+        );
 
         let fetcher = || Arc::new(FakeFetcher::new(vec![(3, Ok(kept.clone()))]));
 
@@ -1579,7 +1589,7 @@ mod tests {
                 .unwrap();
             assert!(
                 summary.disappearance_check_skipped,
-                "第 {} 轮缺失比例 8/13=62% 应触发护栏、暂停消失判定",
+                "第 {} 轮缺失比例超过 50% 应触发护栏、暂停消失判定",
                 round
             );
             assert!(summary.missing_ratio > 0.5);
