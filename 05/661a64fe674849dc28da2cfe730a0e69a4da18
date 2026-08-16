@@ -1,0 +1,19 @@
+src/anthropic/model_registry.rs
+  s_31249f6bfa0ec3::t_938d238d9cecae 177-179,213,1225-1226,1281-1297
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "05661a64fe674849dc28da2cfe730a0e69a4da18",
+  "prompts": {},
+  "sessions": {
+    "s_31249f6bfa0ec3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aaf0a1e2fb50dd520",
+        "model": "unknown"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
