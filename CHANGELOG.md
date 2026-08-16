@@ -10,14 +10,14 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### ✨ 吸收上游 v0.7.6
 
-- **GPT 家族 effort 走 `reasoning.effort` 原生 wire 字段**：GPT-5 系列请求的 reasoning effort 不再塞进 `additionalModelRequestFields`，改走上游原生 `reasoning.effort` 字段。**与上游的刻意偏离**：判定「是否 GPT 家族」用 `starts_with("gpt-")` 前缀匹配，而非上游硬编码的三个具体型号名——新增 GPT 型号无需再改这段判定代码。上游拒绝 effort 字段时剥字段重试一次（`028c388`），重试路径的 `continue` 补上了 `last_error` 赋值，避免吞掉真实失败原因（`996030f`）。
+- **GPT 家族 effort 走 `reasoning.effort` 原生 wire 字段**：GPT 家族请求的 reasoning effort 从 `additionalModelRequestFields.output_config.effort`（Claude 家族的字段）改为同一容器下的 `additionalModelRequestFields.reasoning.effort`；两个字段互斥，按模型家族二选一。此前 GPT 家族在 `model_supports_native_reasoning` 里一律判为不支持，客户端传的 effort 被静默丢弃。**与上游的刻意偏离**：判定「是否 GPT 家族」用 `starts_with("gpt-")` 前缀匹配，而非上游硬编码的三个具体型号名——新增 GPT 型号无需再改这段判定代码。上游拒绝 effort 字段时剥字段重试一次（`028c388`），重试路径的 `continue` 补上了 `last_error` 赋值，避免吞掉真实失败原因（`996030f`）。
 - **OpenAI 入口会话亲和**：会话亲和标识透传到 `conversationId`，让同一会话尽量落到同一上游账号（`4fd3cdd`）。**与上游的刻意偏离**：`metadata.user_id` 写成 `openai_client__session_<uuid>`，而非上游裸 `session_<uuid>`——本项目 `extract_session_id` 用 `split_once("_session_")` 解析取值，裸形式没有该分隔符前缀，解析不出来。会话亲和候选链剔除了 `x-client-request-id`，避免它把同一会话的缓存计量拆散归零（`c0674ee`）。
 - **未知上游事件 warn-once 取证**：`Event::from_frame` 遇到不认识的上游事件类型时，按事件名去重、进程内只 warn 一次，日志里落的是真实事件名（如 `metadataEvent`），用于判断上游是否在发精确 token 用量事件（`d8c0e86`）。
 - **`claude-opus-5` 内置 1M 上下文行**：内置默认模型表补上 `claude-opus-5`，`context_window` 为 `1_000_000`，`expose_thinking_variant` 为 `true`（`05661a6`）；`model_sync` 相关测试同步改为派生内置行数，不再硬编码 `13`（`e26df72`）。
 
 ### 🔧 本项目独有加固（上游没有）
 
-- **剥字段兜底覆盖任意非 2xx**：`additionalModelRequestFields` 被上游拒绝后的剥字段重试，判定条件从「仅 400」放宽到「任意非 2xx」，避免上游用其它状态码拒绝时兜底失效（`9081c10`）。
+- **剥字段兜底不再只认 400**：`additionalModelRequestFields` 被上游拒绝后的剥字段重试，判定条件从「仅 400」放宽到「402 之外的任意状态码」（402 是配额用尽，有凭据记账副作用，必须留给它自己的分支先处理）。本项目自己的注释记录了上游常把客户端级校验错误包成 5xx 返回，只认 400 会让兜底在那条路径上完全失效——而 `starts_with("gpt-")` 这个宽家族判定的安全性正是押在这个兜底上（`9081c10`）。
 - **计量隔离种子按 key_id 命名空间**：OpenAI 来源的 session 计量种子按调用方 key 加命名空间隔离，防止不同 key 的会话互相污染计量归属（`29114f3`）。
 - **dispatch 粘滞键按 key_id 命名空间**：OpenAI 来源的粘滞分流键同样按 key_id 加命名空间，语义与计量隔离对齐（`04fbd8d`）。
 
