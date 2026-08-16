@@ -11,7 +11,9 @@ use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
-use crate::kiro::model::requests::kiro::{AdditionalModelRequestFields, KiroOutputConfig};
+use crate::kiro::model::requests::kiro::{
+    AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig,
+};
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
@@ -277,6 +279,16 @@ fn model_supports_native_reasoning(model_id: &str) -> bool {
     model_supports_native_reasoning_builtin(model_id)
 }
 
+/// 该模型是否用 GPT 家族的 `reasoning.effort` 而非 Claude 的 `output_config.effort`。
+///
+/// 用前缀而非硬编码型号名：模型注册表本就用 `gpt-5` 前缀伪行做家族通配
+/// （见 `model_registry::builtin_rows`），逐个列名字会和那套设计打架，且每出
+/// 一个新型号都要改代码。判错的代价由 provider 层的「剥字段重试一次」兜底
+/// （见 `KiroProvider::call_api_with_retry` 的 400 分支）。
+fn model_uses_gpt_reasoning_effort(model_id: &str) -> bool {
+    model_id.to_ascii_lowercase().starts_with("gpt-")
+}
+
 /// 硬编码的内置判断，`model_supports_native_reasoning` 在注册表未显式声明时
 /// 的回落逻辑。
 ///
@@ -286,6 +298,9 @@ fn model_supports_native_reasoning(model_id: &str) -> bool {
 /// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
 /// 若后续实测某模型 400，从这里去除即可。
 fn model_supports_native_reasoning_builtin(model_id: &str) -> bool {
+    if model_uses_gpt_reasoning_effort(model_id) {
+        return true;
+    }
     let m = model_id.to_ascii_lowercase();
     matches!(
         m.as_str(),
@@ -350,6 +365,7 @@ fn select_native_reasoning_effort(req: &MessagesRequest, model_id: &str) -> Stri
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffortTier {
+    None,
     Low,
     Medium,
     High,
@@ -360,6 +376,7 @@ enum EffortTier {
 impl EffortTier {
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
@@ -371,6 +388,7 @@ impl EffortTier {
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -403,7 +421,11 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
     // it with `Invalid additionalModelRequestFields`, so map to the nearest
     // lower tier instead of failing the request. Unknown/future models keep
     // recognized values intact to avoid maintaining a brittle full allow-list.
-    let normalized = if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
+    // `none` 只有 GPT 家族接受；Claude 侧收到会 400，降级到 high。
+    let normalized = if requested == EffortTier::None && !model_uses_gpt_reasoning_effort(model_id)
+    {
+        EffortTier::High
+    } else if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
         EffortTier::High
     } else {
         requested
@@ -477,9 +499,17 @@ fn build_additional_model_request_fields(
     }
 
     let effort = select_native_reasoning_effort(req, model_id);
-    Some(AdditionalModelRequestFields {
-        output_config: Some(KiroOutputConfig { effort }),
-    })
+    if model_uses_gpt_reasoning_effort(model_id) {
+        Some(AdditionalModelRequestFields {
+            output_config: None,
+            reasoning: Some(KiroReasoningConfig { effort }),
+        })
+    } else {
+        Some(AdditionalModelRequestFields {
+            output_config: Some(KiroOutputConfig { effort }),
+            reasoning: None,
+        })
+    }
 }
 
 /// 转换结果
@@ -1786,6 +1816,75 @@ fn merge_assistant_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn req_with_effort(model: &str, effort: &str) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 64,
+            messages: vec![crate::anthropic::types::Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("hi".to_string()),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: Some(crate::anthropic::types::OutputConfig {
+                effort: effort.to_string(),
+            }),
+            metadata: None,
+        }
+    }
+
+    /// GPT 家族走 reasoning.effort，Claude 家族走 output_config.effort，互斥。
+    #[test]
+    fn gpt_family_uses_reasoning_effort_field() {
+        let f = build_additional_model_request_fields(&req_with_effort("gpt-5.6-sol", "high"), "gpt-5.6-sol")
+            .expect("GPT 显式 effort 必须下发");
+        assert_eq!(f.reasoning.as_ref().unwrap().effort, "high");
+        assert!(f.output_config.is_none());
+
+        let f = build_additional_model_request_fields(
+            &req_with_effort("claude-opus-4.7", "high"),
+            "claude-opus-4.7",
+        )
+        .expect("Claude 显式 effort 必须下发");
+        assert_eq!(f.output_config.as_ref().unwrap().effort, "high");
+        assert!(f.reasoning.is_none());
+    }
+
+    /// 前缀判定覆盖未来型号，且不误伤 claude。
+    #[test]
+    fn gpt_family_detection_is_prefix_based() {
+        assert!(model_uses_gpt_reasoning_effort("gpt-5.6-terra"));
+        assert!(model_uses_gpt_reasoning_effort("gpt-5.9-nova"));
+        assert!(model_uses_gpt_reasoning_effort("GPT-5.6-Luna"));
+        assert!(!model_uses_gpt_reasoning_effort("claude-opus-5"));
+    }
+
+    /// `none` 档只对 GPT 有意义；Claude 侧降级为 high，避免上游 400。
+    #[test]
+    fn none_effort_only_survives_on_gpt_family() {
+        let f = build_additional_model_request_fields(&req_with_effort("gpt-5.6-sol", "none"), "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(f.reasoning.as_ref().unwrap().effort, "none");
+
+        let f = build_additional_model_request_fields(
+            &req_with_effort("claude-opus-4.7", "none"),
+            "claude-opus-4.7",
+        )
+        .unwrap();
+        assert_eq!(f.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    /// 没显式要 reasoning 的 GPT 请求维持现状：一个字段都不下发。
+    #[test]
+    fn gpt_without_explicit_effort_sends_nothing() {
+        let mut req = req_with_effort("gpt-5.6-sol", "high");
+        req.output_config = None;
+        assert!(build_additional_model_request_fields(&req, "gpt-5.6-sol").is_none());
+    }
 
     #[test]
     fn test_map_model_sonnet() {

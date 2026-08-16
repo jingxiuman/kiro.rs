@@ -57,9 +57,15 @@ pub struct KiroRequest {
 /// so this struct **must not** inherit `rename_all = "camelCase"`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdditionalModelRequestFields {
-    /// Output configuration (including reasoning effort)
+    /// Claude 家族的 effort 开关（`output_config.effort`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<KiroOutputConfig>,
+    /// GPT 家族的 effort 开关（`reasoning.effort`）。
+    ///
+    /// 两个字段互斥：同一请求按模型家族只填其一，填错家族会被上游以
+    /// `Invalid additionalModelRequestFields` 400 掉（provider 层有剥字段兜底）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<KiroReasoningConfig>,
 }
 
 /// The effort control field recognized by the AWS Q backend
@@ -75,6 +81,15 @@ pub struct AdditionalModelRequestFields {
 pub struct KiroOutputConfig {
     pub effort: String,
 }
+
+/// GPT 家族（Kiro 侧 Mantle 后端）接受的 effort 控制字段。
+///
+/// 与 `KiroOutputConfig` 同为 snake_case 内层键，不继承外层的 camelCase。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroReasoningConfig {
+    pub effort: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,12 +134,30 @@ mod tests {
             output_config: Some(KiroOutputConfig {
                 effort: "max".to_string(),
             }),
+            reasoning: None,
         };
         let v = serde_json::to_value(&fields).unwrap();
         assert_eq!(v["output_config"]["effort"], "max");
         assert!(
             v.get("outputConfig").is_none(),
             "inner key must stay snake_case output_config, got {v}"
+        );
+        assert!(v.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn test_gpt_reasoning_effort_wire_format() {
+        let fields = AdditionalModelRequestFields {
+            output_config: None,
+            reasoning: Some(KiroReasoningConfig {
+                effort: "xhigh".to_string(),
+            }),
+        };
+        let v = serde_json::to_value(&fields).unwrap();
+        assert_eq!(v["reasoning"]["effort"], "xhigh");
+        assert!(
+            v.get("output_config").is_none(),
+            "GPT 路径不得同时下发 output_config，got {v}"
         );
     }
 }
