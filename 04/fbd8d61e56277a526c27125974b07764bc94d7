@@ -1,0 +1,19 @@
+src/anthropic/handlers.rs
+  s_82b1c1381cc3f2::t_792260d9de3b65 209-222,1161,1194,2308,2341,2714,2724,2732-2766
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "04fbd8d61e56277a526c27125974b07764bc94d7",
+  "prompts": {},
+  "sessions": {
+    "s_82b1c1381cc3f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2024e34a45ca5d7e",
+        "model": "unknown"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
