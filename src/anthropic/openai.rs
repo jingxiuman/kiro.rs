@@ -18,7 +18,7 @@ use axum::{
     Json,
     body::{Body, to_bytes},
     extract::{Extension, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -28,7 +28,7 @@ use uuid::Uuid;
 use super::handlers::post_messages;
 use super::middleware::{AppState, KeyContext};
 use super::types::{
-    DEFAULT_MAX_TOKENS, Message, MessagesRequest, OutputConfig, SystemMessage, Tool,
+    DEFAULT_MAX_TOKENS, Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Tool,
 };
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
@@ -53,14 +53,44 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<Value>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// OpenAI 官方的会话缓存键。用于把同一会话钉到同一 conversationId，
+    /// 让上游 prompt cache 能命中。
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
 }
 
 // ============================ Handler ============================
+
+/// 从 OpenAI 请求体或会话亲和请求头中提取并规范化会话 UUID。
+///
+/// 取值顺序：`prompt_cache_key` → `x-session-affinity` → `x-client-request-id`
+/// → `session_id`。值可带 `session_` 前缀。解析不出 UUID 时返回 `None`，
+/// 保持无状态语义（conversationId 随机，与改动前一致）。
+pub(super) fn resolve_session_metadata(
+    prompt_cache_key: Option<&str>,
+    headers: &HeaderMap,
+) -> Option<Metadata> {
+    let candidates = [
+        prompt_cache_key,
+        headers.get("x-session-affinity").and_then(|v| v.to_str().ok()),
+        headers.get("x-client-request-id").and_then(|v| v.to_str().ok()),
+        headers.get("session_id").and_then(|v| v.to_str().ok()),
+    ];
+
+    candidates.into_iter().flatten().find_map(|candidate| {
+        let raw = candidate.trim().strip_prefix("session_").unwrap_or(candidate.trim());
+        let uuid = Uuid::parse_str(raw).ok()?;
+        Some(Metadata {
+            user_id: Some(super::metadata::openai_session_user_id(&uuid)),
+        })
+    })
+}
 
 /// `POST /v1/chat/completions`
 pub async fn post_chat_completions(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     let want_stream = req.stream;
@@ -73,8 +103,10 @@ pub async fn post_chat_completions(
         "Received POST /v1/chat/completions request"
     );
 
+    let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &headers);
+
     // 1. OpenAI -> Anthropic 请求翻译
-    let anthropic_req = match openai_to_anthropic(req) {
+    let anthropic_req = match openai_to_anthropic(req, metadata) {
         Ok(r) => r,
         Err(msg) => {
             return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg);
@@ -135,7 +167,10 @@ pub async fn post_chat_completions(
 
 // ============================ 请求翻译 ============================
 
-fn openai_to_anthropic(req: ChatCompletionRequest) -> Result<MessagesRequest, String> {
+fn openai_to_anthropic(
+    req: ChatCompletionRequest,
+    metadata: Option<Metadata>,
+) -> Result<MessagesRequest, String> {
     let max_tokens = req
         .max_tokens
         .or(req.max_completion_tokens)
@@ -242,7 +277,7 @@ fn openai_to_anthropic(req: ChatCompletionRequest) -> Result<MessagesRequest, St
         tool_choice,
         thinking: None,
         output_config,
-        metadata: None,
+        metadata,
     })
 }
 
@@ -664,6 +699,49 @@ fn openai_error(status: StatusCode, err_type: &str, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const UUID_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const UUID_B: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+
+    #[test]
+    fn session_metadata_prefers_prompt_cache_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-affinity", UUID_B.parse().unwrap());
+        let md = resolve_session_metadata(Some(UUID_A), &headers).unwrap();
+        assert_eq!(
+            md.user_id.as_deref(),
+            Some(format!("openai_client__session_{UUID_A}").as_str())
+        );
+    }
+
+    #[test]
+    fn session_metadata_falls_through_header_chain() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-client-request-id", UUID_B.parse().unwrap());
+        let md = resolve_session_metadata(None, &headers).unwrap();
+        assert_eq!(
+            md.user_id.as_deref(),
+            Some(format!("openai_client__session_{UUID_B}").as_str())
+        );
+    }
+
+    #[test]
+    fn session_metadata_accepts_session_prefixed_value() {
+        let headers = HeaderMap::new();
+        let md = resolve_session_metadata(Some(&format!("session_{UUID_A}")), &headers).unwrap();
+        assert_eq!(
+            md.user_id.as_deref(),
+            Some(format!("openai_client__session_{UUID_A}").as_str())
+        );
+    }
+
+    /// 非 UUID 值维持无状态：不构造 metadata，conversationId 仍随机。
+    #[test]
+    fn session_metadata_ignores_non_uuid_values() {
+        let headers = HeaderMap::new();
+        assert!(resolve_session_metadata(Some("my-app-v1"), &headers).is_none());
+        assert!(resolve_session_metadata(None, &headers).is_none());
+    }
 
     fn base_parsed() -> ParsedResponse {
         ParsedResponse {
