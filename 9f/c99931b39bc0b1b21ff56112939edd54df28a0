@@ -1,0 +1,21 @@
+src/anthropic/converter.rs
+  s_838b2a2d364f1a::t_602ef994837aa1 425-428
+src/kiro/provider.rs
+  s_838b2a2d364f1a::t_975ce20a70cf26 821-823,825-847
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "9fc99931b39bc0b1b21ff56112939edd54df28a0",
+  "prompts": {},
+  "sessions": {
+    "s_838b2a2d364f1a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad95c6914d6f490ad",
+        "model": "unknown"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
