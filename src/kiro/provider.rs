@@ -814,38 +814,45 @@ impl KiroProvider {
                 continue;
             }
 
+            // effort 字段本身被上游拒绝：剥掉重试一次。该字段只是档位优化，失败语义
+            // 应当是「退化到不带 effort 的现状」，而不是打死请求。放在 402 分支之后、
+            // 400 分支之前——既不抢 402 的记账副作用，又能同时覆盖 400/401/403/429/5xx
+            // 各种传输层包装（见 should_strip_effort_field_for_retry 的文档）。
+            let effort_rejected = endpoint.is_effort_field_rejected(&body);
+            if Self::should_strip_effort_field_for_retry(
+                status.as_u16(),
+                effort_field_stripped,
+                effort_rejected,
+            ) && let Some(retry_body) =
+                Self::strip_additional_model_request_fields(effective_body.as_ref())
+            {
+                tracing::warn!(
+                    model = ?model,
+                    "上游拒绝 additionalModelRequestFields（{}），剥掉该字段重试一次: {}",
+                    status,
+                    body
+                );
+                effective_body = std::borrow::Cow::Owned(retry_body);
+                effort_field_stripped = true;
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    outcome::BAD_REQUEST, Some(&body), attempt_start, proxy_url.as_deref(),
+                );
+                // 循环可能在这次剥字段重试恰好用尽重试预算时结束（单凭据场景很容易
+                // 撞上 attempt + 1 == max_retries）。必须把这次错误记进 last_error，
+                // 否则调用方只会拿到"已达到最大重试次数"，丢失上游拒绝该字段的
+                // 唯一证据——而这份证据正是本次改动要保留的取证通道。
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                continue;
+            }
+
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
-                // effort 字段本身被拒：剥掉重试一次。该字段只是档位优化，
-                // 失败语义应当是「退化到不带 effort 的现状」，而不是打死请求。
-                if !effort_field_stripped
-                    && endpoint.is_effort_field_rejected(&body)
-                    && let Some(retry_body) =
-                        Self::strip_additional_model_request_fields(effective_body.as_ref())
-                {
-                    tracing::warn!(
-                        model = ?model,
-                        "上游拒绝 additionalModelRequestFields，剥掉该字段重试一次: {}",
-                        body
-                    );
-                    effective_body = std::borrow::Cow::Owned(retry_body);
-                    effort_field_stripped = true;
-                    Self::emit_attempt(
-                        sink, attempt, ctx.id, endpoint_name, Some(400),
-                        outcome::BAD_REQUEST, Some(&body), attempt_start, proxy_url.as_deref(),
-                    );
-                    // 循环可能在这次剥字段重试恰好用尽重试预算时结束（单凭据场景很容易
-                    // 撞上 attempt + 1 == max_retries）。必须把这次 400 记进 last_error，
-                    // 否则调用方只会拿到"已达到最大重试次数"，丢失上游拒绝该字段的
-                    // 唯一证据——而这份证据正是本次改动要保留的取证通道。
-                    last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败: {} {}",
-                        api_type,
-                        status,
-                        body
-                    ));
-                    continue;
-                }
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(400),
                     outcome::BAD_REQUEST, Some(&body), attempt_start, proxy_url.as_deref(),
@@ -1138,6 +1145,23 @@ impl KiroProvider {
         serde_json::to_string(&json).ok()
     }
 
+    /// 判断本次响应是否应触发「剥 additionalModelRequestFields 重试一次」。
+    ///
+    /// 不限定 400：上游把该字段的 ValidationException 包成 5xx 返回是实测存在的
+    /// 现象（本文件另一处注释也记录了同类"客户端错误被 5xx 包装"的情形）；若只
+    /// 在 status==400 时判断，这类响应会被当成瞬态错误按满预算重试（还带指数
+    /// 退避），字段永远剥不掉。
+    ///
+    /// 402（配额用尽）是唯一的例外：那个分支有 `report_quota_exhausted` 记账
+    /// 副作用，必须专属处理，不能被本兜底抢先拦截。
+    fn should_strip_effort_field_for_retry(
+        status: u16,
+        already_stripped: bool,
+        effort_rejected: bool,
+    ) -> bool {
+        !already_stripped && status != 402 && effort_rejected
+    }
+
     fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
@@ -1322,6 +1346,24 @@ mod rate_limit_tests {
         assert!(KiroProvider::strip_additional_model_request_fields(body).is_none());
         // 非 JSON 报文不得 panic
         assert!(KiroProvider::strip_additional_model_request_fields("not json").is_none());
+    }
+
+    #[test]
+    fn should_strip_effort_field_for_retry_covers_5xx_wrapped_rejection() {
+        // 终审发现的 bug：旧实现把剥字段判断嵌在 status==400 分支里，上游把
+        // 「拒绝 additionalModelRequestFields」包成 5xx 返回时永远剥不掉该字段。
+        // 兜底必须覆盖 400 之外的状态码。
+        assert!(KiroProvider::should_strip_effort_field_for_retry(500, false, true));
+        assert!(KiroProvider::should_strip_effort_field_for_retry(503, false, true));
+        assert!(KiroProvider::should_strip_effort_field_for_retry(400, false, true));
+        // 402 配额用尽有凭据记账副作用，必须留给 402 专属分支处理，不能被本兜底抢先拦截。
+        assert!(!KiroProvider::should_strip_effort_field_for_retry(402, false, true));
+        // 200 成功响应实际不会走到这条判断（更早 return），但纯函数本身仍需遵循同一规则。
+        assert!(KiroProvider::should_strip_effort_field_for_retry(200, false, true));
+        // 已经剥过一次：effort_field_stripped 单向置位，不重复剥离。
+        assert!(!KiroProvider::should_strip_effort_field_for_retry(500, true, true));
+        // 上游并未因该字段拒绝：无需剥离。
+        assert!(!KiroProvider::should_strip_effort_field_for_retry(500, false, false));
     }
 }
 
