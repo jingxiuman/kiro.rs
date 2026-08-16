@@ -422,10 +422,11 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
     // lower tier instead of failing the request. Unknown/future models keep
     // recognized values intact to avoid maintaining a brittle full allow-list.
     // `none` 只有 GPT 家族接受；Claude 侧收到会 400，降级到 high。
-    let normalized = if requested == EffortTier::None && !model_uses_gpt_reasoning_effort(model_id)
+    // 两条规则碰巧降级目标相同（都是 High），合并条件以消除 clippy 的
+    // identical-blocks 告警，但业务语义仍是两条独立规则。
+    let normalized = if (requested == EffortTier::None && !model_uses_gpt_reasoning_effort(model_id))
+        || (requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id))
     {
-        EffortTier::High
-    } else if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
         EffortTier::High
     } else {
         requested
