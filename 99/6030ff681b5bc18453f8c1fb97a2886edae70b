@@ -1,0 +1,19 @@
+src/kiro/provider.rs
+  s_d10524fdd08a12::t_c1d232ac17e9fb 836-845
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "996030ff681b5bc18453f8c1fb97a2886edae70b",
+  "prompts": {},
+  "sessions": {
+    "s_d10524fdd08a12": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a834c3313b2223afa",
+        "model": "unknown"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
