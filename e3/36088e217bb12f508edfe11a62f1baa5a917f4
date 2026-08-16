@@ -1,0 +1,19 @@
+src/kiro/model/events/base.rs
+  s_868932363e79dc::t_e37309dcd486d2 238-284
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "e336088e217bb12f508edfe11a62f1baa5a917f4",
+  "prompts": {},
+  "sessions": {
+    "s_868932363e79dc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-acb1fcca98af00a12",
+        "model": "unknown"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
