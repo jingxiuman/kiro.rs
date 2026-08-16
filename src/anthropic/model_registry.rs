@@ -174,6 +174,9 @@ pub fn builtin_rows() -> Vec<ModelRow> {
             "claude-sonnet-5" => {
                 vec!["sonnet-5".to_string(), "sonnet5".to_string(), "sonnet.5".to_string()]
             }
+            "claude-opus-5" => {
+                vec!["opus-5".to_string(), "opus5".to_string(), "opus.5".to_string()]
+            }
             _ => Vec::new(),
         },
         supports_reasoning: None,
@@ -207,6 +210,7 @@ pub fn builtin_rows() -> Vec<ModelRow> {
         gpt("gpt-5.6-sol", "GPT-5.6 Sol", 10),
         gpt("gpt-5.6-terra", "GPT-5.6 Terra", 20),
         gpt("gpt-5.6-luna", "GPT-5.6 Luna", 30),
+        claude("claude-opus-5", "claude-opus-5", "Claude Opus 5", 1781481600, 1_000_000, 35),
         claude("claude-fable-5", "claude-fable-5", "Claude Fable 5", 1781481600, 1_000_000, 40),
         claude("claude-sonnet-5", "claude-sonnet-5", "Claude Sonnet 5", 1781481600, 1_000_000, 50),
         claude("claude-opus-4.8", "claude-opus-4-8", "Claude Opus 4.8", 1779897600, 1_000_000, 60),
@@ -1218,6 +1222,8 @@ mod tests {
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
+        "claude-opus-5",
+        "claude-opus-5-thinking",
         "claude-fable-5",
         "claude-fable-5-thinking",
         "claude-sonnet-5",
@@ -1270,6 +1276,23 @@ mod tests {
         assert_eq!(row.exposed_id, "gpt-5");
         assert_eq!(row.context_window, 272_000);
         assert!(!row.listed, "prefix 行不能出现在 /v1/models");
+    }
+
+    /// opus-5 必须在内置默认里就是 1M：漏配会让 ContextUsage 上报缩小 5 倍，
+    /// 客户端进度条与自动压缩阈值全部失准（上游 v0.7.6 修复项）。
+    #[test]
+    fn builtin_rows_include_opus_5_with_1m_window() {
+        let row = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-5")
+            .expect("内置默认必须含 claude-opus-5");
+        assert_eq!(row.context_window, 1_000_000);
+        // opus-4.5 不得被顺手改成 1M
+        let old = builtin_rows()
+            .into_iter()
+            .find(|r| r.upstream_id == "claude-opus-4.5")
+            .unwrap();
+        assert_eq!(old.context_window, 200_000);
     }
 
     fn mapped(registry: &ModelRegistry, requested: &str) -> (String, i32) {
