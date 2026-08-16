@@ -235,4 +235,51 @@ mod tests {
         assert!(!super::note_unknown_event("metadataEvent"), "同名不得重复上报");
         assert!(super::note_unknown_event("someOtherEvent"), "新名字仍要上报");
     }
+
+    /// 构造一个 event-type 头为给定值、message-type 为 "event" 的 Frame，
+    /// 供 `from_frame` 相关测试复用。
+    fn frame_with_event_type(event_type: &str) -> Frame {
+        let mut headers = crate::kiro::parser::header::Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            crate::kiro::parser::header::HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            crate::kiro::parser::header::HeaderValue::String(event_type.to_string()),
+        );
+        Frame {
+            headers,
+            payload: b"{}".to_vec(),
+        }
+    }
+
+    /// 验证 `Event::from_frame` 在 Unknown 分支登记的是「原始事件名」而非
+    /// `EventType::Unknown.as_str()`（即字符串 "unknown"）。
+    ///
+    /// 取证价值：这个改动的唯一目的是让日志里出现真实的上游事件名，
+    /// 如果登记的其实是 "unknown"，取证就失效了。
+    ///
+    /// 前提：`SEEN_UNKNOWN_EVENTS` 是进程级全局状态，与
+    /// `unknown_event_name_is_recorded_once` 共享。为避免互相污染，本测试
+    /// 使用与该测试不同的事件名（"metadataEvent" / "someOtherEvent" 已被占用），
+    /// 不做全局 reset（reset 会与并行跑的其他测试产生竞态）。
+    #[test]
+    fn from_frame_unknown_branch_records_the_real_event_name() {
+        let frame = frame_with_event_type("weirdUpstreamEvent");
+
+        let event = Event::from_frame(frame).expect("Unknown 分支不应返回错误");
+        assert!(matches!(event, Event::Unknown {}), "未知事件应解析为 Event::Unknown {{}}");
+
+        // 已被 from_frame 登记过，再次登记应返回 false。
+        assert!(
+            !super::note_unknown_event("weirdUpstreamEvent"),
+            "from_frame 应已登记原始事件名 weirdUpstreamEvent，而不是字符串 \"unknown\""
+        );
+        // 一个从未出现过的名字应仍返回 true，证明登记的确是按真实事件名区分的。
+        assert!(
+            super::note_unknown_event("neverSeenBeforeEvent"),
+            "全新事件名应首次上报"
+        );
+    }
 }
