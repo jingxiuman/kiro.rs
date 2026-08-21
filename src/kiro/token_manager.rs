@@ -3531,6 +3531,52 @@ impl MultiTokenManager {
         self.persist_credentials()?;
         Ok(())
     }
+}
+
+/// [`MultiTokenManager::update_credentials_batch`] 的失败形态。
+#[derive(Debug)]
+pub enum BatchUpdateError {
+    /// 请求里有不存在的凭据 id（全部列出）。整批未应用。
+    MissingCredentials(Vec<u64>),
+    /// 内存态已更新但落盘失败——与单条 `update_credential` 在该场景下的语义一致。
+    Persist(anyhow::Error),
+}
+
+impl MultiTokenManager {
+    /// 单锁内批量更新凭据，落盘一次。全有或全无：任一 id 不存在则整批不应用。
+    ///
+    /// 与循环调 `update_credential` 的区别：后者每条各自加锁、各自落盘，
+    /// 中途失败会留下半应用状态；批量重绑（admin 代理批量分配）要求原子语义。
+    pub fn update_credentials_batch(
+        &self,
+        updates: Vec<(u64, CredentialUpdate)>,
+    ) -> Result<(), BatchUpdateError> {
+        {
+            let mut entries = self.entries.lock();
+            // 先整体校验存在性，报全部缺失 id 而不是第一个
+            let missing: Vec<u64> = updates
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| !entries.iter().any(|e| e.id == *id))
+                .collect();
+            if !missing.is_empty() {
+                return Err(BatchUpdateError::MissingCredentials(missing));
+            }
+            for (id, update) in updates {
+                let entry = entries
+                    .iter_mut()
+                    .find(|e| e.id == id)
+                    .expect("已通过存在性校验");
+                if let Some(v) = update.proxy_url {
+                    entry.credentials.proxy_url = v.filter(|s| !s.is_empty());
+                }
+                // 本函数当前只服务代理批量重绑，其余字段刻意不支持：
+                // 收窄语义好过悄悄接受但行为与单条接口不一致的字段。
+            }
+        }
+        self.persist_credentials().map_err(BatchUpdateError::Persist)?;
+        Ok(())
+    }
 
     /// 把所有绑定 `old_url` 代理的凭据改绑 `new_url`（None = 清除绑定，回退全局代理）。
     ///
@@ -6090,5 +6136,52 @@ mod tests {
         assert!(manager.set_account_rpm_limit_config(Some(true), Some(100_001)).is_err());
         assert_eq!(manager.get_account_rpm_limit(), 60);
         assert!(!manager.get_account_rpm_limit_enabled(), "校验失败不应改变开关");
+    }
+
+    #[tokio::test]
+    async fn update_credentials_batch_is_all_or_nothing() {
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("a".repeat(150));
+        let mut c2 = KiroCredentials::default();
+        c2.refresh_token = Some("b".repeat(150));
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        // 混入一个不存在的 id：整批拒绝，已存在的凭据不得被改动
+        let err = manager
+            .update_credentials_batch(vec![
+                (1, CredentialUpdate {
+                    proxy_url: Some(Some("http://p1:8080".to_string())),
+                    ..CredentialUpdate::default()
+                }),
+                (999, CredentialUpdate {
+                    proxy_url: Some(None),
+                    ..CredentialUpdate::default()
+                }),
+            ])
+            .unwrap_err();
+        match err {
+            BatchUpdateError::MissingCredentials(ids) => assert_eq!(ids, vec![999]),
+            other => panic!("预期 MissingCredentials，实际 {other:?}"),
+        }
+        // 凭据 1 未被部分应用
+        let creds = manager.clone_all_credentials();
+        assert!(creds.iter().all(|c| c.proxy_url.as_deref() != Some("http://p1:8080")));
+
+        // 全合法：两条一次生效（设置 + 清除）
+        manager
+            .update_credentials_batch(vec![
+                (1, CredentialUpdate {
+                    proxy_url: Some(Some("http://p1:8080".to_string())),
+                    ..CredentialUpdate::default()
+                }),
+                (2, CredentialUpdate {
+                    proxy_url: Some(None),
+                    ..CredentialUpdate::default()
+                }),
+            ])
+            .unwrap();
+        let creds = manager.clone_all_credentials();
+        assert!(creds.iter().any(|c| c.proxy_url.as_deref() == Some("http://p1:8080")));
     }
 }
