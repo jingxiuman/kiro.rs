@@ -378,6 +378,26 @@ export async function assignProxyToCredential(
   return data
 }
 
+export interface BatchAssignEntry {
+  credentialId: number
+  /** null = 解绑，回落全局代理 */
+  proxyId: number | null
+}
+
+export interface BatchAssignFailure {
+  credentialId: number
+  reason: string
+}
+
+/** 批量重绑凭据↔代理。400 时后端返回 { error, failures }，由调用方从
+ *  AxiosError.response.data 中取 failures 逐行展示。 */
+export async function batchAssignProxy(
+  assignments: BatchAssignEntry[],
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/credentials/proxy/batch', { assignments })
+  return data
+}
+
 // 即时探测单个代理连通性
 export async function checkProxy(id: number): Promise<ProxyCheckResponse> {
   const { data } = await api.post<ProxyCheckResponse>(`/proxy-pool/${id}/check`)

@@ -30,6 +30,7 @@ import {
   Zap,
   Tags,
   ChevronDown,
+  Network,
   LayoutGrid,
   List,
   Search,
@@ -75,6 +76,7 @@ import { CredentialCard } from "@/components/credential-card";
 import { AddCredentialDialog } from "@/components/add-credential-dialog";
 import { BatchImportDialog } from "@/components/batch-import-dialog";
 import { BatchEditCredentialDialog } from "@/components/batch-edit-credential-dialog";
+import { BatchAssignProxyDialog } from "@/components/batch-assign-proxy-dialog";
 import { IdcLoginDialog } from "@/components/idc-login-dialog";
 import { SocialLoginDialog } from "@/components/social-login-dialog";
 import { KamImportDialog } from "@/components/kam-import-dialog";
@@ -169,6 +171,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false);
   const [batchEditDialogOpen, setBatchEditDialogOpen] = useState(false);
+  const [batchAssignProxyDialogOpen, setBatchAssignProxyDialogOpen] = useState(false);
   const [idcLoginDialogOpen, setIdcLoginDialogOpen] = useState(false);
   const [enterpriseLoginDialogOpen, setEnterpriseLoginDialogOpen] =
     useState(false);
@@ -1616,6 +1619,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     批量验活
                   </DropdownMenuItem>
                   <DropdownMenuItem
+                    onSelect={() => setBatchAssignProxyDialogOpen(true)}
+                  >
+                    <Network />
+                    批量绑代理
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
                     onSelect={(e) => {
                       e.preventDefault();
                       handleBatchForceRefresh();
@@ -1881,6 +1890,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         )}
         groupOptions={groupOptions}
         onDone={deselectAll}
+      />
+      <BatchAssignProxyDialog
+        open={batchAssignProxyDialogOpen}
+        onOpenChange={setBatchAssignProxyDialogOpen}
+        credentials={data?.credentials ?? []}
       />
       <SocialLoginDialog
         open={socialLoginDialogOpen}
