@@ -516,19 +516,27 @@ pub async fn assign_proxies_batch(
 ) -> impl IntoResponse {
     match state.service.assign_proxies_batch(payload) {
         Ok(n) => Json(SuccessResponse::new(format!("已更新 {n} 张凭据的代理绑定"))).into_response(),
-        Err(BatchAssignError::Validation(failures)) => (
+        Err(e) => batch_assign_error_response(e).into_response(),
+    }
+}
+
+/// 批量重绑的错误响应体构造。单独提函数：响应**形状**（400 + failures 数组 +
+/// 每条的 credentialId/reason）是前端把失败原因落到对应行上的契约，需要可直接单测。
+fn batch_assign_error_response(
+    err: BatchAssignError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match err {
+        BatchAssignError::Validation(failures) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "批量重绑校验失败，未应用任何变更",
                 "failures": failures,
             })),
-        )
-            .into_response(),
-        Err(BatchAssignError::Internal(msg)) => (
+        ),
+        BatchAssignError::Internal(msg) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": msg })),
-        )
-            .into_response(),
+        ),
     }
 }
 
@@ -2162,6 +2170,8 @@ pub async fn ops_phase_baseline(
 #[cfg(test)]
 mod tests {
     use super::super::types::BatchAssignFailure;
+    use super::{BatchAssignError, batch_assign_error_response};
+    use axum::http::StatusCode;
 
     #[test]
     fn batch_assign_failure_serializes_camel_case() {
@@ -2169,5 +2179,44 @@ mod tests {
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["credentialId"], 7, "必须是 camelCase，前端按 credentialId 读: {v}");
         assert_eq!(v["reason"], "凭据不存在");
+    }
+
+    /// 400 响应的**形状**：前端靠 `failures[].credentialId` 把原因落到对应行上，
+    /// 少一个字段就是整行报错消失。只测单个结构体的序列化盖不住这层。
+    #[test]
+    fn batch_assign_validation_responds_400_with_all_failures() {
+        let (status, body) = batch_assign_error_response(BatchAssignError::Validation(vec![
+            BatchAssignFailure { credential_id: 7, reason: "凭据不存在".to_string() },
+            BatchAssignFailure {
+                credential_id: 9,
+                reason: "代理 #3 已禁用或被健康检查自动禁用".to_string(),
+            },
+        ]));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let v = body.0;
+        assert!(
+            v["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "顶层 error 文案不得为空: {v}"
+        );
+        let failures = v["failures"].as_array().expect("failures 必须是数组");
+        assert_eq!(failures.len(), 2, "两条不同凭据的失败必须都报出: {v}");
+        for f in failures {
+            assert!(f["credentialId"].as_u64().is_some(), "每条须含 credentialId: {f}");
+            assert!(
+                f["reason"].as_str().is_some_and(|s| !s.is_empty()),
+                "每条须含非空 reason: {f}"
+            );
+        }
+        assert_eq!(failures[0]["credentialId"], 7);
+        assert_eq!(failures[1]["credentialId"], 9);
+    }
+
+    #[test]
+    fn batch_assign_internal_error_responds_500() {
+        let (status, body) =
+            batch_assign_error_response(BatchAssignError::Internal("凭据落盘失败: x".to_string()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.0["error"], "凭据落盘失败: x");
     }
 }

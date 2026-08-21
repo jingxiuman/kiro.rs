@@ -535,6 +535,37 @@ fn subscription_type_from_title(title: Option<&str>) -> &'static str {
 /// 上游二进制覆盖本 fork 的改动。
 const GITHUB_RELEASES_REPO: &str = "jingxiuman/kiro.rs";
 
+/// 把同一 credentialId 的多条失败合并成一条（reason 用 `; ` 连接），保持首次出现顺序。
+///
+/// 前端按 `map[credentialId] = reason` 存展示，同一凭据多条会互相覆盖、先出现的
+/// 原因直接丢失（例如「重复出现」被「代理已禁用」盖掉）。不同凭据不合并。
+fn merge_batch_failures(failures: Vec<BatchAssignFailure>) -> Vec<BatchAssignFailure> {
+    let mut order: Vec<u64> = Vec::new();
+    let mut reasons: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    for f in failures {
+        match reasons.entry(f.credential_id) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                // 完全重复的原因不再追加（同一凭据的多条非法条目常指向同一个坏代理）
+                if !e.get().split("; ").any(|r| r == f.reason) {
+                    e.get_mut().push_str("; ");
+                    e.get_mut().push_str(&f.reason);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                order.push(f.credential_id);
+                e.insert(f.reason);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|credential_id| BatchAssignFailure {
+            reason: reasons.remove(&credential_id).unwrap_or_default(),
+            credential_id,
+        })
+        .collect()
+}
+
 /// [`AdminService::assign_proxies_batch`] 的失败形态
 #[derive(Debug)]
 pub enum BatchAssignError {
@@ -2939,7 +2970,12 @@ impl AdminService {
         }
 
         if !failures.is_empty() {
-            return Err(BatchAssignError::Validation(failures));
+            return Err(BatchAssignError::Validation(merge_batch_failures(failures)));
+        }
+
+        // 空批提前返回：没有任何变更却走 update_credentials_batch 会白落一次盘
+        if updates.is_empty() {
+            return Ok(0);
         }
 
         let n = updates.len();
@@ -5102,6 +5138,14 @@ mod tests {
             other => panic!("预期 Validation，实际 {other:?}"),
         }
 
+        // 「整批未应用」要落到数值上：那条合法条目（凭据 1 → p1）也不得生效
+        let before = manager.clone_all_credentials();
+        let c1_url = before
+            .iter()
+            .find(|c| c.id == Some(1))
+            .and_then(|c| c.proxy_url.clone());
+        assert_eq!(c1_url, None, "校验失败时同批的合法条目也不得落地: {before:?}");
+
         // 全合法：设置 + 解绑各一条
         let n = service
             .assign_proxies_batch(AssignProxyBatchRequest {
@@ -5112,6 +5156,113 @@ mod tests {
             })
             .unwrap();
         assert_eq!(n, 2);
+
+        // 回读实际值：n==2 只说明「处理了两条」，不说明绑对了
+        let after = manager.clone_all_credentials();
+        let url_of = |id: u64| {
+            after
+                .iter()
+                .find(|c| c.id == Some(id))
+                .and_then(|c| c.proxy_url.clone())
+        };
+        assert_eq!(url_of(1), Some(p1.url.clone()), "凭据 1 应绑到 p1: {after:?}");
+        assert_eq!(url_of(2), None, "凭据 2 应解绑为跟随全局: {after:?}");
+    }
+
+    /// M5：同一 credentialId 的多条失败必须合并成一条——前端按
+    /// `map[credentialId] = reason` 存展示，不合并会丢掉先出现的原因。
+    #[tokio::test]
+    async fn assign_proxies_batch_merges_failures_of_same_credential() {
+        let c1 = KiroCredentials { refresh_token: Some("a".repeat(150)), ..Default::default() };
+        let c2 = KiroCredentials { refresh_token: Some("b".repeat(150)), ..Default::default() };
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![c1, c2], None, None, false).unwrap(),
+        );
+        let pool = Arc::new(ProxyPoolManager::new(None, crate::model::config::TlsBackend::Rustls));
+        let p2 = pool.add("http://127.0.0.1:1081".to_string(), None).unwrap();
+        pool.set_enabled(p2.id, false).unwrap();
+        let service = AdminService::new(
+            manager,
+            Vec::<String>::new(),
+            pool,
+            Arc::new(BalanceCache::new(None)),
+        );
+
+        // 凭据 1 同时踩两条：重复出现 + 绑到已禁用代理；凭据 2 只踩一条
+        let err = service
+            .assign_proxies_batch(AssignProxyBatchRequest {
+                assignments: vec![
+                    AssignmentEntry { credential_id: 1, proxy_id: Some(p2.id) },
+                    AssignmentEntry { credential_id: 1, proxy_id: Some(p2.id) },
+                    AssignmentEntry { credential_id: 2, proxy_id: Some(p2.id) },
+                ],
+            })
+            .unwrap_err();
+
+        match err {
+            BatchAssignError::Validation(fails) => {
+                assert_eq!(
+                    fails.iter().filter(|f| f.credential_id == 1).count(),
+                    1,
+                    "同一凭据只应有一条 failure: {fails:?}"
+                );
+                let r1 = &fails.iter().find(|f| f.credential_id == 1).unwrap().reason;
+                assert!(r1.contains("出现多次"), "合并后不得丢掉重复原因: {r1}");
+                assert!(r1.contains("已禁用"), "合并后不得丢掉禁用原因: {r1}");
+                // 两条不同凭据仍要报两条
+                assert_eq!(fails.len(), 2, "不同凭据不得被合并: {fails:?}");
+                assert!(fails.iter().any(|f| f.credential_id == 2), "{fails:?}");
+            }
+            other => panic!("预期 Validation，实际 {other:?}"),
+        }
+    }
+
+    /// M3：空批不落盘。用「盘上文件被外部改过」来观察：若走了 persist，
+    /// 内存快照会把外部改动覆盖掉；提前 return 则文件原样保留。
+    // multi_thread：persist_credentials 内部用 block_in_place，单线程运行时会 panic
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assign_proxies_batch_empty_does_not_persist() {
+        let mut path = std::env::temp_dir();
+        path.push("kiro_test_batch_empty_no_persist.json");
+        let cred = KiroCredentials {
+            id: Some(1),
+            refresh_token: Some("a".repeat(150)),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&[&cred]).unwrap()).unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![cred],
+                None,
+                Some(path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let pool = Arc::new(ProxyPoolManager::new(None, crate::model::config::TlsBackend::Rustls));
+        let service = AdminService::new(
+            manager,
+            Vec::<String>::new(),
+            pool,
+            Arc::new(BalanceCache::new(None)),
+        );
+
+        // 外部标记：只要发生落盘就会被内存快照覆盖掉
+        std::fs::write(&path, br#"[{"__external_marker__": true}]"#).unwrap();
+
+        let n = service
+            .assign_proxies_batch(AssignProxyBatchRequest { assignments: vec![] })
+            .unwrap();
+        assert_eq!(n, 0);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            content.contains("__external_marker__"),
+            "空批不得落盘（盘上内容被覆盖说明发生了写入）: {content}"
+        );
     }
 
     #[test]
