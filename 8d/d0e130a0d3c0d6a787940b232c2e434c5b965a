@@ -1,0 +1,27 @@
+src/admin/handlers.rs
+  s_93ed41df2ed7dd::t_f5f9fe75153897 511-534
+  s_93ed41df2ed7dd::t_7a291bfc35e7d4 20
+  s_93ed41df2ed7dd::t_10909347b38161 2165
+  s_93ed41df2ed7dd::t_dea0663e843355 24
+  s_93ed41df2ed7dd::t_f027f8f4e84d92 2161-2164,2166-2174
+  s_93ed41df2ed7dd::t_5b95a8fe523003 23,25
+src/admin/router.rs
+  s_93ed41df2ed7dd::t_a568ae4151a68e 11-12
+  s_93ed41df2ed7dd::t_a7851c6472acb6 103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "8dd0e130a0d3c0d6a787940b232c2e434c5b965a",
+  "prompts": {},
+  "sessions": {
+    "s_93ed41df2ed7dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0320419c-c65b-4bb6-b256-7da69554742d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
