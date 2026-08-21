@@ -1622,7 +1622,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     onSelect={() => setBatchAssignProxyDialogOpen(true)}
                   >
                     <Network />
-                    批量绑代理
+                    批量绑代理（全部凭据）
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     onSelect={(e) => {
