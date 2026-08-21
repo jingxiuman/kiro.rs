@@ -2148,7 +2148,10 @@ impl StreamContext {
         let text_index = if let Some(idx) = self.text_block_index {
             idx
         } else {
-            // 文本块尚未创建，需要先创建
+            // 文本块尚未创建，需要先创建。
+            // 提前开出的工具块可能还开着（参数流期间来了正文 / 收尾 flush 残留），
+            // 必须先关掉它，否则两个块同时打开。
+            events.extend(self.close_open_tool_block());
             let idx = self.state_manager.next_block_index();
             self.text_block_index = Some(idx);
 
@@ -2192,6 +2195,35 @@ impl StreamContext {
             .is_some_and(|idx| self.state_manager.is_block_open_of_type(idx, "thinking"))
     }
 
+    /// 关闭「已提前开出、但参数尚未收齐」的工具块，返回 content_block_stop 事件。
+    ///
+    /// 反向守卫：`should_start_tool_block_early` 只守住「有别的块开着就不开工具块」，
+    /// 但工具块被提前开出后打开窗口显著变长，期间任何新块（text / thinking /
+    /// redacted_thinking）都可能与它并存 —— `handle_content_block_start` 的自动
+    /// 关闭只覆盖 text 块，管不到 tool_use。所有会新开块的入口都必须先调本函数。
+    ///
+    /// **语义**：Anthropic 协议没有「重开块」事件，被关掉的块不可复用。因此这里
+    /// 一并把 tool_use_id 从 `tool_block_indices` 移除，让后续参数收齐时
+    /// `emit_completed_tool_use` 重新分配一个新 index，在新块里发出完整的
+    /// name + input（旧块退化为一张空参数的工具卡片）。
+    fn close_open_tool_block(&mut self) -> Vec<SseEvent> {
+        let open: Vec<(String, i32)> = self
+            .tool_block_indices
+            .iter()
+            .filter(|&(_, &idx)| self.state_manager.is_block_open_of_type(idx, "tool_use"))
+            .map(|(id, &idx)| (id.clone(), idx))
+            .collect();
+
+        let mut events = Vec::new();
+        for (id, idx) in open {
+            self.tool_block_indices.remove(&id);
+            if let Some(stop_event) = self.state_manager.handle_content_block_stop(idx) {
+                events.push(stop_event);
+            }
+        }
+        events
+    }
+
     fn close_open_text_block(&mut self) -> Vec<SseEvent> {
         let Some(idx) = self.text_block_index else {
             return Vec::new();
@@ -2218,6 +2250,8 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(&buffered));
         }
         events.extend(self.close_open_text_block());
+        // 提前开出的工具块也可能还开着（thinking 与它并存同样违反串行约束）
+        events.extend(self.close_open_tool_block());
 
         let idx = self.state_manager.next_block_index();
         self.thinking_block_index = Some(idx);
@@ -2311,6 +2345,8 @@ impl StreamContext {
     fn create_redacted_thinking_events(&mut self, data: &str) -> Vec<SseEvent> {
         let mut events = self.close_open_thinking_block();
         events.extend(self.close_open_text_block());
+        // 同上：提前开出的工具块不能与 redacted_thinking 块并存
+        events.extend(self.close_open_tool_block());
 
         let idx = self.state_manager.next_block_index();
         events.extend(self.state_manager.handle_content_block_start(
@@ -2627,6 +2663,10 @@ impl StreamContext {
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // 先关掉提前开出、参数永远收不齐的工具块：下面的 flush 会吐出残留文本，
+        // 那会新开 text 块，两个块就同时打开了。
+        events.extend(self.close_open_tool_block());
 
         // 收尾：flush <tool_use> XML 过滤器的残留（截断的未闭合块会被丢弃），
         // 走同一文本路径，交由后续 thinking / invoke 缓冲一并 flush。
@@ -5760,5 +5800,106 @@ mod tests {
             !events.iter().any(|e| e.event == "content_block_start"),
             "工具名未知时不得提前开块"
         );
+    }
+
+    /// 反向守卫（探针 1）：提前开块把工具块的打开窗口拉长后，收尾 flush 出来的
+    /// 残留文本会另开 text 块 —— 若不先关工具块，两块同时打开。
+    ///
+    /// 本场景**不依赖上游行为**，本进程内必现：文本以 `<` 结尾时 XML 过滤器会
+    /// 扣住这个字节等待判断是不是 `<tool_use>`，直到 `finish()` 才吐回；而
+    /// `finish()` 发生在 `generate_final_events` 里、工具块仍开着的时刻。
+    #[test]
+    fn leftover_text_at_finish_does_not_coexist_with_early_tool_block() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, 200_000, false, HashMap::new(), test_known_tools(),
+        );
+
+        let mut all = ctx.generate_initial_events();
+        // 结尾的 `<` 被 XML 过滤器扣住，不会在这一步下发
+        all.extend(ctx.process_assistant_response("正文 <"));
+        // 提前开工具块，且上游就此截断（永远收不到 stop=true）
+        all.extend(ctx.process_tool_use(&tool_evt("tu-1", "Read", r#"{"file_path": "/a"#, false)));
+        assert!(
+            all.iter().any(|e| e.event == "content_block_start"
+                && e.data["content_block"]["type"] == "tool_use"),
+            "前置条件：应已提前开块"
+        );
+        all.extend(ctx.generate_final_events());
+
+        let (peak, still_open) = max_concurrent_open_blocks(&all);
+        assert_eq!(peak, 1, "任何时刻至多一个块打开");
+        assert!(still_open.is_empty(), "收尾后不得留下未关闭的块: {still_open:?}");
+    }
+
+    /// 反向守卫（探针 2）：工具参数还在流式传输时上游又来正文，
+    /// `emit_text_delta_raw` 建新 text 块前必须先关掉提前开的工具块。
+    #[test]
+    fn text_during_tool_param_stream_does_not_coexist_with_early_tool_block() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, 200_000, false, HashMap::new(), test_known_tools(),
+        );
+
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_tool_use(&tool_evt("tu-1", "Read", r#"{"file_path""#, false)));
+        assert!(
+            all.iter().any(|e| e.event == "content_block_start"
+                && e.data["content_block"]["type"] == "tool_use"),
+            "前置条件：应已提前开块"
+        );
+        // 参数流期间来正文
+        all.extend(ctx.process_assistant_response("插播一段正文"));
+        all.extend(ctx.process_tool_use(&tool_evt("tu-1", "Read", r#":"/a"}"#, true)));
+        all.extend(ctx.generate_final_events());
+
+        let (peak, still_open) = max_concurrent_open_blocks(&all);
+        assert_eq!(peak, 1, "任何时刻至多一个块打开");
+        assert!(still_open.is_empty(), "收尾后不得留下未关闭的块: {still_open:?}");
+    }
+
+    /// 「提前开 → 被文本打断关闭 → 参数收齐」的语义：已关闭的块不可复用
+    /// （协议没有「重开块」事件），完成路径必须重新分配一个新 index，
+    /// 并在新块里发出完整的 name + input。
+    #[test]
+    fn interrupted_early_tool_block_is_reemitted_with_new_index() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, 200_000, false, HashMap::new(), test_known_tools(),
+        );
+
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_tool_use(&tool_evt("tu-1", "Read", r#"{"file_path""#, false)));
+        let early_idx = all
+            .iter()
+            .find(|e| e.event == "content_block_start"
+                && e.data["content_block"]["type"] == "tool_use")
+            .and_then(|e| e.data["index"].as_i64())
+            .expect("前置条件：应已提前开块");
+
+        all.extend(ctx.process_assistant_response("插播一段正文"));
+        all.extend(ctx.process_tool_use(&tool_evt("tu-1", "Read", r#":"/a"}"#, true)));
+        all.extend(ctx.generate_final_events());
+
+        // 完成后的工具块：必须是新 index，且带完整参数
+        let final_tool_start = all
+            .iter()
+            .rfind(|e| e.event == "content_block_start"
+                && e.data["content_block"]["type"] == "tool_use")
+            .expect("参数收齐后必须发出完整工具块");
+        let final_idx = final_tool_start.data["index"].as_i64().unwrap_or(-1);
+        assert_ne!(final_idx, early_idx, "已关闭的块不可复用，必须分配新 index");
+        assert_eq!(final_tool_start.data["content_block"]["name"], "Read");
+
+        let param = all
+            .iter()
+            .find(|e| e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "input_json_delta")
+            .expect("必须下发完整参数");
+        assert_eq!(param.data["index"].as_i64(), Some(final_idx), "参数必须落在新块上");
+        let parsed: serde_json::Value =
+            serde_json::from_str(param.data["delta"]["partial_json"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["file_path"], "/a", "参数必须完整: {parsed}");
+
+        let (peak, still_open) = max_concurrent_open_blocks(&all);
+        assert_eq!(peak, 1, "任何时刻至多一个块打开");
+        assert!(still_open.is_empty(), "收尾后不得留下未关闭的块: {still_open:?}");
     }
 }
