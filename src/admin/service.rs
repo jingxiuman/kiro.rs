@@ -25,7 +25,7 @@ use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
     AddCredentialResponse,
-    AssignProxyBatchRequest, AssignProxyRequest, AssignRoundRobinResponse, AssignmentEntry,
+    AssignProxyBatchRequest, AssignProxyRequest, AssignRoundRobinResponse,
     AvailableModelItem, AvailableModelsResponse, BatchAssignFailure,
     BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
     CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
@@ -5056,6 +5056,7 @@ mod model_registry_tests {
 mod tests {
     use super::*;
     use crate::admin::balance_cache::BalanceCache;
+    use super::super::types::AssignmentEntry;
 
     #[tokio::test]
     async fn assign_proxies_batch_validates_all_before_applying() {
