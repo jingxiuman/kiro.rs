@@ -17,10 +17,12 @@ use std::sync::Arc;
 use super::{
     client_keys::mask_client_key,
     middleware::AdminState,
+    service::BatchAssignError,
     trace_db::TraceQuery,
     types::{
-        AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
-        BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
+        AddCredentialRequest, AddProxyRequest, AssignProxyBatchRequest, AssignProxyRequest,
+        AssignRoundRobinRequest, BatchAddProxyRequest, BatchImportEvent,
+        BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
         CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
         SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
@@ -503,6 +505,30 @@ pub async fn assign_proxies_round_robin(
     {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/proxy/batch
+/// 批量重绑凭据↔代理。全有或全无：校验失败返回 400 + 全部失败条目。
+pub async fn assign_proxies_batch(
+    State(state): State<AdminState>,
+    Json(payload): Json<AssignProxyBatchRequest>,
+) -> impl IntoResponse {
+    match state.service.assign_proxies_batch(payload) {
+        Ok(n) => Json(SuccessResponse::new(format!("已更新 {n} 张凭据的代理绑定"))).into_response(),
+        Err(BatchAssignError::Validation(failures)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "批量重绑校验失败，未应用任何变更",
+                "failures": failures,
+            })),
+        )
+            .into_response(),
+        Err(BatchAssignError::Internal(msg)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response(),
     }
 }
 
@@ -2131,4 +2157,18 @@ pub async fn ops_phase_baseline(
         return ops_unavailable();
     };
     Json(ops.events().phase_baseline(parse_ops_hours(&params))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::types::BatchAssignFailure;
+
+    #[test]
+    fn batch_assign_failure_serializes_camel_case() {
+        let f = BatchAssignFailure { credential_id: 7, reason: "凭据不存在".to_string() };
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["credentialId"], 7, "必须是 camelCase，前端按 credentialId 读: {v}");
+        assert_eq!(v["reason"], "凭据不存在");
+    }
 }
