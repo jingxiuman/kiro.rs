@@ -1,0 +1,19 @@
+docs/superpowers/plans/2026-08-21-proxy-batch-rebind.md
+  s_93ed41df2ed7dd::t_18a460469e9c9c 1-577
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "6c325661f4612adaf735e21d18e7e86915a9c344",
+  "prompts": {},
+  "sessions": {
+    "s_93ed41df2ed7dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0320419c-c65b-4bb6-b256-7da69554742d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
