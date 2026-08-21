@@ -47,11 +47,43 @@ function formatTs(ts: string, granularity: StatsGranularity): string {
   return `${d.getFullYear()}-${md} ${String(d.getHours()).padStart(2, '0')}:00`
 }
 
-/** 命中率 = cacheRead / (input + cacheRead)，无缓存读取时为 0 */
+/**
+ * 命中率 = cacheRead / (input + cacheCreation + cacheRead)，无输入 token 时为 0。
+ *
+ * 三段之和才是本次请求的完整 prompt：input 是未走缓存的余数，cacheCreation 是
+ * 写入缓存的部分（本次仍属未命中，且按溢价计费），cacheRead 才是命中。
+ * 分母漏掉 cacheCreation 会让该指标恒等于 ~100%（Claude Code 类流量下 input
+ * 常年只有几千，而 cacheRead 是千万级），失去区分度。
+ */
 function calcHitRate(p: TimeSeriesPoint): number {
-  const denom = p.inputTokens + p.cacheReadTokens
+  const denom = p.inputTokens + p.cacheCreationTokens + p.cacheReadTokens
   if (denom <= 0) return 0
   return (p.cacheReadTokens / denom) * 100
+}
+
+/** 命中率右轴的候选下限与配套步长，从宽到窄；上界恒为 100 */
+const RATE_AXIS_TIERS: ReadonlyArray<{ base: number; step: number }> = [
+  { base: 95, step: 1 },
+  { base: 90, step: 2 },
+  { base: 75, step: 5 },
+  { base: 50, step: 10 },
+  { base: 0, step: 20 },
+]
+
+/**
+ * 命中率右轴的刻度范围。写死 [0,100] 时 92%~97% 的真实波动全贴在顶端看不出来，
+ * 所以取「不高于最小值的最宽档位」作下限：档位本身即留出余量，不会把 1 个百分点
+ * 的抖动放大成断崖，刻度也始终落在整数上。
+ *
+ * 0 视为真实值参与取档——无流量时段的 0% 会把下限压回 0，这是刻意保留的信号，
+ * 宁可图变平也不隐藏「整小时零命中」。
+ */
+function pickRateAxis(rates: number[]): { domain: [number, number]; ticks: number[] } {
+  const min = rates.length > 0 ? Math.min(...rates) : 0
+  const tier = RATE_AXIS_TIERS.find((t) => t.base <= min) ?? RATE_AXIS_TIERS[RATE_AXIS_TIERS.length - 1]
+  const ticks: number[] = []
+  for (let v = tier.base; v <= 100; v += tier.step) ticks.push(v)
+  return { domain: [tier.base, 100], ticks }
 }
 
 function pickXAxisInterval(len: number): number | 'preserveStartEnd' {
@@ -174,12 +206,16 @@ function TimeSeriesChartImpl({ data, granularity }: Props) {
       ),
     [formatted],
   )
+  const rateAxis = useMemo(
+    () => pickRateAxis(formatted.map((p) => p.cacheHitRate)),
+    [formatted],
+  )
 
   return (
     <div className="h-[260px] sm:h-[320px]">
       <ResponsiveContainer width="100%" height="100%">
         <LineChart data={formatted} margin={{ top: 16, right: 6, left: -12, bottom: 0 }}>
-          {chartAxes({ interval, leftAllZero })}
+          {chartAxes({ interval, leftAllZero, rateAxis })}
           <Tooltip content={<ChartTooltip />} cursor={tooltipCursorStyle} />
           {chartLegend()}
           {chartLines()}
@@ -192,9 +228,11 @@ function TimeSeriesChartImpl({ data, granularity }: Props) {
 function chartAxes({
   interval,
   leftAllZero,
+  rateAxis,
 }: {
   interval: number | 'preserveStartEnd'
   leftAllZero: boolean
+  rateAxis: { domain: [number, number]; ticks: number[] }
 }) {
   return [
     <CartesianGrid key="grid" strokeDasharray="3 3" className="stroke-border/50" />,
@@ -221,8 +259,8 @@ function chartAxes({
       yAxisId="right"
       orientation="right"
       tick={{ fontSize: 11, fill: COLORS.cacheHitRate }}
-      domain={[0, 100]}
-      ticks={[0, 20, 40, 60, 80, 100]}
+      domain={rateAxis.domain}
+      ticks={rateAxis.ticks}
       tickFormatter={(v: number) => `${v}%`}
       width={36}
     />,

@@ -1247,6 +1247,17 @@ impl SseStateManager {
             .is_some_and(|b| b.started && !b.stopped && b.block_type == expected_type)
     }
 
+    /// 是否存在会与新块并存的已打开块。
+    ///
+    /// text 块不计入：`handle_content_block_start("tool_use", ..)` 会自动关闭它。
+    /// 其余类型（thinking / 另一个 tool_use）若仍打开，再开新块就会出现两个
+    /// 同时打开的块——Anthropic 流协议要求块严格串行，必须避免。
+    pub fn has_open_block_besides_text(&self) -> bool {
+        self.active_blocks
+            .values()
+            .any(|b| b.started && !b.stopped && b.block_type != "text")
+    }
+
     /// 获取下一个块索引
     pub fn next_block_index(&mut self) -> i32 {
         let index = self.next_block_index;
@@ -2392,6 +2403,82 @@ impl StreamContext {
         )
     }
 
+    /// 参数尚未收齐时先把工具块开出去，让客户端当场有可渲染帧（工具卡片）。
+    ///
+    /// 动机：工具 JSON 全程缓冲到 `stop=true` 才发块开始，而 `first_render`
+    /// 认的正是块开始，于是「生成一个 7KB 工具调用」= 客户端 48s 零帧。
+    /// 只发块开始、不发参数：`input_json_delta` 仍在 stop 时整体校验后一次性发，
+    /// 因此 JSON 校验与 `InvalidJson` 回退能力完全保留。
+    ///
+    /// 守卫不通过时返回空事件，行为与改动前完全一致。
+    fn maybe_start_tool_block_early(
+        &mut self,
+        tool_use: &crate::kiro::model::events::ToolUseEvent,
+    ) -> Vec<SseEvent> {
+        // 已开过（同一 tool_use_id 的后续分片）：不重复开
+        if self.tool_block_indices.contains_key(&tool_use.tool_use_id) {
+            return Vec::new();
+        }
+
+        // 复用唯一的工具名还原入口，拿到客户端可见的原始工具名
+        let (client_name, _) = super::converter::restore_tool_use_for_client(
+            &tool_use.name,
+            json!({}),
+            &self.tool_name_map,
+        );
+
+        if !Self::should_start_tool_block_early(
+            &client_name,
+            self.state_manager.has_open_block_besides_text(),
+        ) {
+            return Vec::new();
+        }
+
+        let block_index = self.state_manager.next_block_index();
+        self.tool_block_indices
+            .insert(tool_use.tool_use_id.clone(), block_index);
+        self.state_manager.set_has_tool_use(true);
+        self.state_manager.handle_content_block_start(
+            block_index,
+            "tool_use",
+            json!({
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_use.tool_use_id,
+                    "name": client_name,
+                    "input": {}
+                }
+            }),
+        )
+    }
+
+    /// 提前开工具块的守卫：决定「客户端多早看到工具卡片」与「协议安全」的取舍。
+    ///
+    /// 参数：
+    /// - `client_name`：还原后的客户端工具名，可能为空串（上游首片未带名字）。
+    /// - `has_open_block_besides_text`：是否已有 thinking / 另一个 tool_use 块打开着。
+    ///   （text 块不在此列，它会被工具块开始自动关闭。）
+    ///
+    /// 返回 true 表示立刻发 `content_block_start`；false 表示维持缓冲到 stop 的旧行为。
+    ///
+    /// 两个条件都是协议/正确性约束，不是体验取舍，任一不满足即放弃提前开块：
+    ///
+    /// 1. **工具名必须已知**。块开始一旦发出，`name` 就不可更改（协议没有
+    ///    「改名」事件），上游首片未必带名字（见 `ToolJsonAccumulator::push`
+    ///    里的 `entry.0.is_empty()` 兜底）。宁可晚发，不可发错名。
+    /// 2. **不得有其它非 text 块打开**。Anthropic 流协议要求内容块严格串行：
+    ///    同一时刻只能有一个块处于 start 与 stop 之间。thinking 块或另一个
+    ///    并行 tool_use 块还开着时提前开块，会造成两个块同时打开。
+    ///    （text 块除外——`handle_content_block_start("tool_use", ..)` 会先关闭它。）
+    fn should_start_tool_block_early(
+        client_name: &str,
+        has_open_block_besides_text: bool,
+    ) -> bool {
+        !client_name.is_empty() && !has_open_block_besides_text
+    }
+
     /// 统一的工具调用流式发出口：结构化 `toolUseEvent` 与 `<invoke>` 文本捞回都经此发出。
     ///
     /// 块索引按 `completed.id` 复用/分配（结构化按 tool_use_id 复用；invoke 合成用新 id 故新分配），
@@ -2519,7 +2606,11 @@ impl StreamContext {
         // 统一补发 error 事件，避免把无法解析的参数当成完整调用转发给客户端。
         let completed = match self.tool_json_accumulator.push(tool_use, &self.tool_name_map) {
             Ok(Some(completed)) => completed,
-            Ok(None) => return events,
+            Ok(None) => {
+                // 参数还没收齐：先把块开出去，消除「大工具调用期间零可渲染帧」的静默窗口
+                events.extend(self.maybe_start_tool_block_early(tool_use));
+                return events;
+            }
             Err(e) => {
                 tracing::error!("{}", e);
                 self.tool_json_error = Some(e);
@@ -5411,6 +5502,263 @@ mod tests {
         assert_eq!(
             phase_outcome_for(&err),
             crate::admin::trace_db::outcome::UPSTREAM_INVALID
+        );
+    }
+
+    // ===== 工具块提前开：消除「大工具调用期间零可渲染帧」的静默窗口 =====
+    //
+    // 病灶（生产实测，8000 条 trace）：工具参数 JSON 全程缓冲到 stop=true 才发
+    // content_block_start，而 first_render 恰认这个块开始。工具 JSON 字节 /
+    // 输出 token ≈ 4.0，滞后与体积严格线性：400B→2.0s，6424B→36.3s，7363B→48.1s。
+    // 7 条越过 30s 判为 dead_air，10s 以上的同类静默共 54 条。
+    // 对照：有 thinking 块的 725 条，首帧滞后 p99 仅 571ms。
+
+    /// 首个分片（名字已知、无其它块打开）即发出 content_block_start，
+    /// 客户端当场能渲染工具卡片——这正是 StreamShape 认可的可渲染帧。
+    #[test]
+    fn tool_block_start_is_emitted_on_first_fragment() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, 200_000, false, HashMap::new(), test_known_tools(),
+        );
+
+        // 半截 JSON、stop=false：旧行为下这里一个事件都不发
+        let events = ctx.process_tool_use(&tool_evt("tu-1", "Read", r#"{"file_pa"#, false));
+
+        let start = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .expect("首个分片就应发出 tool_use 块开始");
+        assert_eq!(start.data["content_block"]["type"], "tool_use");
+        assert_eq!(start.data["content_block"]["name"], "Read");
+        assert_eq!(
+            start.data["content_block"]["input"],
+            json!({}),
+            "参数尚未收齐，input 必须是空对象占位"
+        );
+        assert!(
+            !events.iter().any(|e| e.event == "content_block_delta"),
+            "参数未收齐前不得下发 input_json_delta（保住 JSON 校验与回退能力）"
+        );
+
+        // 这一帧必须被 StreamShape 认作可渲染
+        let mut shape = StreamShape::default();
+        shape.observe(&events, 1_200);
+        assert_eq!(
+            shape.first_render_ms(),
+            Some(1_200),
+            "tool_use 块开始即工具卡片，必须触发 first_render"
+        );
+    }
+
+    /// stop=true 时不得重复发块开始，只补 delta + stop，且索引与提前开的那个一致。
+    #[test]
+    fn tool_block_start_not_repeated_on_stop() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, 200_000, false, HashMap::new(), test_known_tools(),
+        );
+
+        let early = ctx.process_tool_use(&tool_evt("tu-1", "Read", r#"{"file_path""#, false));
+        let early_index = early
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .expect("应已提前开块")
+            .data["index"]
+            .as_i64()
+            .expect("块索引");
+
+        let done = ctx.process_tool_use(&tool_evt("tu-1", "Read", r#":"/a"}"#, true));
+        assert!(
+            !done.iter().any(|e| e.event == "content_block_start"),
+            "块已开，收尾不得重复发 content_block_start"
+        );
+
+        let delta = done
+            .iter()
+            .find(|e| e.event == "content_block_delta")
+            .expect("收尾应一次性发出完整参数");
+        assert_eq!(delta.data["index"].as_i64(), Some(early_index), "索引必须复用");
+        assert_eq!(
+            delta.data["delta"]["partial_json"],
+            r#"{"file_path":"/a"}"#,
+            "参数须是解析校验后的完整 JSON"
+        );
+        assert!(
+            done.iter().any(|e| e.event == "content_block_stop"
+                && e.data["index"].as_i64() == Some(early_index)),
+            "应关闭同一个块"
+        );
+    }
+
+    /// 并行工具调用：第一个工具块还开着时，第二个工具的分片不得提前开块，
+    /// 否则两个块同时打开 = 协议违规。此时退回旧行为（缓冲到 stop）。
+    #[test]
+    fn second_tool_does_not_start_early_while_first_block_open() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, 200_000, false, HashMap::new(), test_known_tools(),
+        );
+
+        let first = ctx.process_tool_use(&tool_evt("tu-1", "Read", r#"{"file_path""#, false));
+        assert!(
+            first.iter().any(|e| e.event == "content_block_start"),
+            "第一个工具应提前开块"
+        );
+
+        // tu-1 尚未 stop，块仍打开
+        let second = ctx.process_tool_use(&tool_evt("tu-2", "Write", r#"{"path""#, false));
+        assert!(
+            !second.iter().any(|e| e.event == "content_block_start"),
+            "已有块打开时不得再开新块，必须退回缓冲行为"
+        );
+    }
+
+    /// 协议不变式：内容块必须严格串行——扫一遍事件流，任何时刻至多一个块
+    /// 处于 start 与 stop 之间，且每个 start 都有配对的 stop。
+    /// 返回同时打开块数的峰值，供断言。
+    fn max_concurrent_open_blocks(events: &[SseEvent]) -> (usize, Vec<i64>) {
+        let mut open: Vec<i64> = Vec::new();
+        let mut peak = 0;
+        for e in events {
+            let idx = e.data["index"].as_i64().unwrap_or(-1);
+            match e.event.as_str() {
+                "content_block_start" => {
+                    open.push(idx);
+                    peak = peak.max(open.len());
+                }
+                "content_block_stop" => open.retain(|&i| i != idx),
+                _ => {}
+            }
+        }
+        (peak, open)
+    }
+
+    /// thinking 块打开时不得提前开工具块——否则两个块同时打开，违反串行约束。
+    #[test]
+    fn tool_block_not_started_early_while_thinking_block_open() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, 200_000, true, HashMap::new(), test_known_tools(),
+        );
+
+        // 先让 thinking 块打开
+        let mut all = ctx.process_assistant_response("<thinking>推导中");
+        assert!(
+            all.iter().any(|e| e.event == "content_block_start"
+                && e.data["content_block"]["type"] == "thinking"),
+            "前置条件：thinking 块应已打开"
+        );
+
+        let tool_events = ctx.process_tool_use(&tool_evt("tu-1", "Read", r#"{"file_pa"#, false));
+        assert!(
+            !tool_events.iter().any(|e| e.event == "content_block_start"),
+            "thinking 块打开时不得提前开工具块"
+        );
+
+        all.extend(tool_events);
+        assert_eq!(max_concurrent_open_blocks(&all).0, 1, "任何时刻至多一个块打开");
+    }
+
+    /// 协议底线：提前开块后上游截断（永远收不到 stop=true），
+    /// 收尾仍必须关闭该块、块序列合法，并补发 error 事件告知客户端。
+    #[test]
+    fn early_started_tool_block_is_closed_on_upstream_truncation() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, 200_000, false, HashMap::new(), test_known_tools(),
+        );
+
+        let mut all = ctx.process_tool_use(&tool_evt("tu-1", "Read", r#"{"file_path": "/a"#, false));
+        assert!(
+            all.iter().any(|e| e.event == "content_block_start"),
+            "前置条件：应已提前开块"
+        );
+
+        // 上游到此为止：没有 stop=true，参数是半截 JSON
+        all.extend(ctx.generate_final_events());
+
+        let (peak, still_open) = max_concurrent_open_blocks(&all);
+        assert_eq!(peak, 1, "任何时刻至多一个块打开");
+        assert!(still_open.is_empty(), "收尾后不得留下未关闭的块: {still_open:?}");
+        assert!(
+            all.iter().any(|e| e.event == "error"
+                && e.data["error"]["type"] == "upstream_tool_json_error"),
+            "半截 JSON 必须补发 error 事件"
+        );
+        assert!(
+            !all.iter().any(|e| e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "input_json_delta"),
+            "参数从未校验通过，不得下发任何 input_json_delta"
+        );
+    }
+
+    /// 正常路径的协议合规：text → 工具提前开块 → 收尾，全程块串行且配对。
+    /// （text 块由 `handle_content_block_start("tool_use", ..)` 自动关闭。）
+    #[test]
+    fn early_start_keeps_block_sequence_protocol_valid() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, 200_000, false, HashMap::new(), test_known_tools(),
+        );
+
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_assistant_response("正文"));
+        all.extend(ctx.process_tool_use(&tool_evt("tu-1", "Read", r#"{"file_path""#, false)));
+        all.extend(ctx.process_tool_use(&tool_evt("tu-1", "Read", r#":"/a"}"#, true)));
+        all.extend(ctx.generate_final_events());
+
+        let (peak, still_open) = max_concurrent_open_blocks(&all);
+        assert_eq!(peak, 1, "任何时刻至多一个块打开");
+        assert!(still_open.is_empty(), "收尾后不得留下未关闭的块: {still_open:?}");
+
+        // 每个块的事件顺序必须是 start → (delta)* → stop
+        let mut started: Vec<i64> = Vec::new();
+        for e in &all {
+            let idx = e.data["index"].as_i64().unwrap_or(-1);
+            match e.event.as_str() {
+                "content_block_start" => started.push(idx),
+                "content_block_delta" => assert!(
+                    started.contains(&idx),
+                    "块 {idx} 的 delta 出现在 start 之前"
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    /// 钉住一个**既有**（非本次改动引入）的协议缺陷：thinking 块打开时，
+    /// `emit_completed_tool_use` 直接开 tool_use 块而不先关闭 thinking——
+    /// `handle_content_block_start` 只自动关闭 text 块（`stream.rs` 中
+    /// `if block_type == "tool_use"` 那段），于是出现两个块同时打开。
+    ///
+    /// Anthropic 流协议要求内容块严格串行，这是真实缺陷，但修它会改变所有
+    /// 带 thinking 响应的块序列，超出「工具块提前开」的改动范围，故先钉住现状：
+    /// 本测试失败 = 有人修好了（把 2 改成 1 并删掉本注释），或者又变得更糟。
+    #[test]
+    fn known_defect_thinking_block_stays_open_across_tool_block() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, 200_000, true, HashMap::new(), test_known_tools(),
+        );
+
+        let mut all = ctx.process_assistant_response("<thinking>先想一下");
+        all.extend(ctx.process_tool_use(&tool_evt("tu-1", "Read", r#"{"file_path":"/a"}"#, true)));
+        all.extend(ctx.generate_final_events());
+
+        let (peak, still_open) = max_concurrent_open_blocks(&all);
+        assert_eq!(
+            peak, 2,
+            "既有缺陷现状：thinking 与 tool_use 同时打开。修好后应为 1"
+        );
+        assert!(still_open.is_empty(), "收尾至少要把所有块关掉: {still_open:?}");
+    }
+
+    /// 分片未携带工具名时不得提前开块——块开始必须带客户端可见的原始工具名，
+    /// 发一个空名字的工具卡片比晚一点发更糟。
+    #[test]
+    fn tool_block_not_started_early_without_name() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, 200_000, false, HashMap::new(), test_known_tools(),
+        );
+
+        let events = ctx.process_tool_use(&tool_evt("tu-1", "", r#"{"file_pa"#, false));
+        assert!(
+            !events.iter().any(|e| e.event == "content_block_start"),
+            "工具名未知时不得提前开块"
         );
     }
 }

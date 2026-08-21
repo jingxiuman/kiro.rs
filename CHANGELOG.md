@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.14] - 2026-08-17
+
+主题：**消除「大工具调用期间客户端零可渲染帧」的静默窗口**，外加一处并发门禁调参。
+
+### 🐛 工具块提前开
+
+- **症状与量化**：工具调用参数 JSON 全程缓冲到 `stop=true` 才发 `content_block_start`，而 `first_render`（可渲染帧判据）认的正是这个块开始。于是「模型生成一个大工具调用」= 客户端整段时间一帧都收不到。生产 trace 实测（8000 条，2026-08-14~17）：工具 JSON 字节 / 输出 token ≈ 4.0，首帧滞后与工具体积严格线性——400B→2.0s，4005B→27.7s，6424B→36.3s，7363B→48.1s。越过 30s 阈值被判 `dead_air` 的有 7 条，10s 以上的同类静默共 54 条。对照组（响应含 thinking 块）725 条的首帧滞后 p99 仅 571ms。
+- **改法**：`maybe_start_tool_block_early` 在参数尚未收齐时先发出 `content_block_start{type:"tool_use", input:{}}`，**不下发参数**。`input_json_delta` 仍在 `stop=true` 时整体解析校验后一次性发出，因此 `InvalidJson` / `IncompleteJson` 的错误路径与「非法 JSON 不当作完整调用转发」的判据完全保留。
+- **守卫（`should_start_tool_block_early`）是协议约束，不是体验取舍**：① 工具名未知时不开——块开始的 `name` 发出后不可更改，上游首片未必带名字；② 已有非 text 块打开时不开——Anthropic 流协议要求内容块严格串行，thinking 块或另一个并行 `tool_use` 块还开着时提前开块会造成两块同时打开（生产中 209/1541 条响应含 2~3 个 tool_use 块）。任一不满足即完全退回缓冲行为。
+- **语义变化（已知且刻意）**：上游在参数写到一半时截断，客户端现在会收到一个 `input:{}` 的 `tool_use` 块（收尾自动关闭）加 `error` 事件，而非「什么都不发」。这与 Anthropic 真实 API 的流式行为一致——真实 API 同样是 `content_block_start(input:{})` → 若干 `input_json_delta` → `content_block_stop`，断流时客户端本就会拿到参数不完整的块。原先的全缓冲才是偏离。
+
+### ✅ 测试
+
+- 4 条协议不变式测试：任意时刻至多一个块打开、收尾不留未关闭块、`delta` 不早于 `start`、上游截断时必须关块并补发 `error`。
+- 3 条守卫测试：工具名为空不提前开、thinking 块打开时不提前开、并行工具调用的第二个工具不提前开。
+- 2 条行为测试：首个分片即发块开始且被 `StreamShape` 认作可渲染帧、收尾不重复发块开始且索引复用。
+- `known_defect_thinking_block_stays_open_across_tool_block`：钉住一处**既有**协议缺陷——`handle_content_block_start` 只自动关闭 text 块，thinking 块打开时开 `tool_use` 块会造成两块并存。本次未修（会改变所有带 thinking 响应的块序列），以断言现状的方式使其可见。
+
+### 🔧 配置
+
+- `credentialQueueTimeoutSecs` 默认值语义未变；生产实例改为 `10`（原 `60`）：2.5 天内 6 次 `queue_timeout`，每次白等满 60s 才换凭据。该值在 `KiroProvider::new()` 一次性烘进 `CredentialGates`，无热更新入口，改后需重启。
+
+### 📊 面板
+
+- 命中率分母补上 `cacheCreation`：三段之和（input + cacheCreation + cacheRead）才是完整 prompt，漏掉写缓存段会让该指标在 Claude Code 类流量下恒等于 ~100%。右轴刻度改为按最小值取档自适应（92%~97% 的真实波动不再贴顶不可见），无流量时段的 0% 刻意保留参与取档。
+
 ## [0.9.13] - 2026-08-16
 
 主题：**吸收上游 [ZyphrZero/kiro.rs v0.7.6](https://github.com/ZyphrZero/kiro.rs) 的四项改动，并配套三处本项目独有的加固**。上游 v0.7.6 带来 GPT 家族 reasoning effort 原生字段、OpenAI 入口会话亲和、上游未知事件取证、`claude-opus-5` 内置 1M 上下文行；吸收过程中发现并修补了三处本项目自身链路（非上游原有问题）的隔离缺口。
