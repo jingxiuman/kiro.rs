@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.15] - 2026-08-21
+
+主题：**凭据↔代理批量重绑**——一次性把多张凭据改绑到不同代理，全有或全无。
+
+### ✨ 新功能
+
+- **`POST /api/admin/credentials/proxy/batch`**：批量提交 `{credentialId, proxyId}` 映射列表（`proxyId` 为 `null` 表示解绑回落全局代理）。整批校验：凭据必须存在、代理必须 `enabled` 且未被健康检查 `autoDisabled`、同一 `credentialId` 在请求内不得重复——任一条目非法，整批拒绝（400），响应体带上**全部**失败条目及各自原因，而非只报第一条。
+- **单锁落盘**：校验通过后复用既有 `update_credentials_batch` 路径，在同一把锁内一次性写入并持久化到 `data/credentials.json`，避免逐条更新时的中间态被并发请求读到。
+- **面板「批量绑代理」弹窗**：凭据列表可多选后弹出批量绑定对话框；提交时只发送本次实际改动的行（未改的行不进请求体，避免误覆盖其他并发改动）。校验失败（400）逐行内联展示对应的失败原因，不改用全局 toast 吞掉细节。池外的自定义代理 URL（不在代理池管理范围内的历史值）在弹窗里只读展示，防止批量操作误把它们替换成池内代理。
+
 ## [0.9.14] - 2026-08-17
 
 主题：**消除「大工具调用期间客户端零可渲染帧」的静默窗口**，外加一处并发门禁调参。
