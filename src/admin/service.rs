@@ -25,7 +25,8 @@ use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
     AddCredentialResponse,
-    AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse,
+    AssignProxyBatchRequest, AssignProxyRequest, AssignRoundRobinResponse, AssignmentEntry,
+    AvailableModelItem, AvailableModelsResponse, BatchAssignFailure,
     BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
     CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
     GitHubRateLimitInfo, ImageUpdateResponse, ExportedAccount, ExportedCredentials,
@@ -533,6 +534,15 @@ fn subscription_type_from_title(title: Option<&str>) -> &'static str {
 /// 与 [`binary_update::GITHUB_REPO`] 必须一致，且指向本 fork——否则自动更新会用
 /// 上游二进制覆盖本 fork 的改动。
 const GITHUB_RELEASES_REPO: &str = "jingxiuman/kiro.rs";
+
+/// [`AdminService::assign_proxies_batch`] 的失败形态
+#[derive(Debug)]
+pub enum BatchAssignError {
+    /// 校验失败：整批未应用，携带全部非法条目
+    Validation(Vec<BatchAssignFailure>),
+    /// 应用阶段内部错误（如落盘失败）
+    Internal(String),
+}
 
 impl AdminService {
     pub fn new(
@@ -2856,6 +2866,101 @@ impl AdminService {
             })
     }
 
+    /// 批量重绑凭据↔代理。全有或全无：先整体校验（凭据存在、代理存在且
+    /// enabled 且非 autoDisabled、无重复 credentialId），任一非法整批拒绝并
+    /// 返回**全部**失败条目；全部合法则单锁应用、落盘一次。
+    ///
+    /// 校验不用 `get_url`——它不检查 `auto_disabled`，而绑一个已被健康检查
+    /// 踢掉的代理没有意义。
+    pub fn assign_proxies_batch(
+        &self,
+        req: AssignProxyBatchRequest,
+    ) -> Result<usize, BatchAssignError> {
+        let mut failures: Vec<BatchAssignFailure> = Vec::new();
+
+        // 重复 credentialId：歧义输入不猜测意图
+        let mut seen = std::collections::HashSet::new();
+        for a in &req.assignments {
+            if !seen.insert(a.credential_id) {
+                failures.push(BatchAssignFailure {
+                    credential_id: a.credential_id,
+                    reason: "同一凭据在请求里出现多次".to_string(),
+                });
+            }
+        }
+
+        // 凭据存在性：这里做一次前置校验只为把「凭据不存在」和其余非法条目
+        // 合并进同一份错误反馈；真正的原子性保证仍在 update_credentials_batch
+        // 的锁内二次校验（避免 TOCTOU 导致误应用）。
+        let known_ids: std::collections::HashSet<u64> = self
+            .token_manager
+            .clone_all_credentials()
+            .iter()
+            .filter_map(|c| c.id)
+            .collect();
+        for a in &req.assignments {
+            if !known_ids.contains(&a.credential_id) {
+                failures.push(BatchAssignFailure {
+                    credential_id: a.credential_id,
+                    reason: "凭据不存在".to_string(),
+                });
+            }
+        }
+
+        // 代理校验：存在、enabled、非 autoDisabled
+        let pool: std::collections::HashMap<u64, crate::admin::proxy_pool::ProxyEntry> =
+            self.proxy_pool.list().into_iter().map(|e| (e.id, e)).collect();
+        let mut updates: Vec<(u64, CredentialUpdate)> = Vec::new();
+        for a in &req.assignments {
+            let proxy_url = match a.proxy_id {
+                None => None,
+                Some(pid) => match pool.get(&pid) {
+                    None => {
+                        failures.push(BatchAssignFailure {
+                            credential_id: a.credential_id,
+                            reason: format!("代理 #{pid} 不存在"),
+                        });
+                        continue;
+                    }
+                    Some(p) if !p.enabled || p.auto_disabled => {
+                        failures.push(BatchAssignFailure {
+                            credential_id: a.credential_id,
+                            reason: format!("代理 #{pid} 已禁用或被健康检查自动禁用"),
+                        });
+                        continue;
+                    }
+                    Some(p) => Some(p.url.clone()),
+                },
+            };
+            updates.push((
+                a.credential_id,
+                CredentialUpdate { proxy_url: Some(proxy_url), ..CredentialUpdate::default() },
+            ));
+        }
+
+        if !failures.is_empty() {
+            return Err(BatchAssignError::Validation(failures));
+        }
+
+        let n = updates.len();
+        self.token_manager.update_credentials_batch(updates).map_err(|e| match e {
+            crate::kiro::token_manager::BatchUpdateError::MissingCredentials(ids) => {
+                BatchAssignError::Validation(
+                    ids.into_iter()
+                        .map(|id| BatchAssignFailure {
+                            credential_id: id,
+                            reason: "凭据不存在".to_string(),
+                        })
+                        .collect(),
+                )
+            }
+            crate::kiro::token_manager::BatchUpdateError::Persist(err) => {
+                BatchAssignError::Internal(format!("凭据落盘失败: {err}"))
+            }
+        })?;
+        Ok(n)
+    }
+
     /// 即时探测单个代理的连通性（供 UI「测试」按钮调用）
     pub async fn check_proxy(&self, id: u64) -> Result<ProxyCheckResponse, AdminServiceError> {
         let (entry, newly_disabled) = self
@@ -4951,6 +5056,62 @@ mod model_registry_tests {
 mod tests {
     use super::*;
     use crate::admin::balance_cache::BalanceCache;
+
+    #[tokio::test]
+    async fn assign_proxies_batch_validates_all_before_applying() {
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("a".repeat(150));
+        let mut c2 = KiroCredentials::default();
+        c2.refresh_token = Some("b".repeat(150));
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![c1, c2], None, None, false).unwrap(),
+        );
+        let pool = Arc::new(ProxyPoolManager::new(None, crate::model::config::TlsBackend::Rustls));
+        let p1 = pool.add("http://127.0.0.1:1080".to_string(), None).unwrap();
+        let p2 = pool.add("http://127.0.0.1:1081".to_string(), None).unwrap();
+        pool.set_enabled(p2.id, false).unwrap();
+        let service = AdminService::new(
+            manager.clone(),
+            Vec::<String>::new(),
+            pool,
+            Arc::new(BalanceCache::new(None)),
+        );
+
+        // 三类非法混在一批：全部报出、整批不应用
+        let err = service
+            .assign_proxies_batch(AssignProxyBatchRequest {
+                assignments: vec![
+                    AssignmentEntry { credential_id: 1, proxy_id: Some(p1.id) }, // 本条合法
+                    AssignmentEntry { credential_id: 999, proxy_id: Some(p1.id) }, // 凭据不存在
+                    AssignmentEntry { credential_id: 2, proxy_id: Some(p2.id) },   // 代理已禁用
+                    AssignmentEntry { credential_id: 1, proxy_id: None },          // 重复 credentialId
+                ],
+            })
+            .unwrap_err();
+        match err {
+            BatchAssignError::Validation(fails) => {
+                let ids: Vec<u64> = fails.iter().map(|f| f.credential_id).collect();
+                assert!(ids.contains(&999), "缺失凭据必须报出: {fails:?}");
+                assert!(ids.contains(&2), "禁用代理必须报出: {fails:?}");
+                assert!(
+                    fails.iter().filter(|f| f.credential_id == 1).count() >= 1,
+                    "重复 credentialId 必须报出: {fails:?}"
+                );
+            }
+            other => panic!("预期 Validation，实际 {other:?}"),
+        }
+
+        // 全合法：设置 + 解绑各一条
+        let n = service
+            .assign_proxies_batch(AssignProxyBatchRequest {
+                assignments: vec![
+                    AssignmentEntry { credential_id: 1, proxy_id: Some(p1.id) },
+                    AssignmentEntry { credential_id: 2, proxy_id: None },
+                ],
+            })
+            .unwrap();
+        assert_eq!(n, 2);
+    }
 
     #[test]
     fn typed_upstream_rate_limit_is_classified_without_losing_retry_after() {

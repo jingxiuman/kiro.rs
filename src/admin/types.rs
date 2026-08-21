@@ -819,6 +819,30 @@ pub struct AssignProxyRequest {
     pub proxy_id: Option<u64>,
 }
 
+/// 批量重绑请求（`POST /credentials/proxy/batch`）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignProxyBatchRequest {
+    pub assignments: Vec<AssignmentEntry>,
+}
+
+/// 单条映射：proxy_id 为 null 表示解绑（回落全局代理）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignmentEntry {
+    pub credential_id: u64,
+    #[serde(default)]
+    pub proxy_id: Option<u64>,
+}
+
+/// 批量重绑校验失败的单条明细
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAssignFailure {
+    pub credential_id: u64,
+    pub reason: String,
+}
+
 // ============ 全局代理配置 ============
 
 /// 全局代理配置响应
