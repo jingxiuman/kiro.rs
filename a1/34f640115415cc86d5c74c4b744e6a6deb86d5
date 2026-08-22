@@ -1,0 +1,41 @@
+CHANGELOG.md
+  s_93ed41df2ed7dd::t_fefd13535624cf 22-24
+  s_93ed41df2ed7dd::t_6a167945fb7804 25
+src/kiro/token_manager.rs
+  s_93ed41df2ed7dd::t_fbab7dfd237478 3186,3188-3198,3205-3206
+  s_93ed41df2ed7dd::t_722ab49d8ba902 2722,2726
+  s_93ed41df2ed7dd::t_c23add44892b8e 1136-1144,1148-1159
+  s_93ed41df2ed7dd::t_95f33375d7b6aa 1400-1413,1418-1419
+  s_93ed41df2ed7dd::t_46b81e7016f696 2745
+  s_93ed41df2ed7dd::t_f548e6e3e46244 2712-2715,2729
+  s_93ed41df2ed7dd::t_cf7569a54ba4f0 2816-2819
+  s_93ed41df2ed7dd::t_0ad4e9e9d53360 5162-5231,5233-5239
+  s_93ed41df2ed7dd::t_facbacbc07aee2 2687-2704
+  s_93ed41df2ed7dd::t_af23aa90cf53d4 1161-1168
+  s_93ed41df2ed7dd::t_7f7d4771c190e8 1160
+src/admin/service.rs
+  s_93ed41df2ed7dd::t_d3a5ba37624972 809,817
+  s_93ed41df2ed7dd::t_2d447bef23c03f 777,780-785
+admin-ui/src/components/dashboard.tsx
+  s_93ed41df2ed7dd::t_e2ff2d69e91a4c 883-884,893-895,907,1734
+src/admin/handlers.rs
+  s_93ed41df2ed7dd::t_6d7e4518d9695d 174-175
+src/admin/types.rs
+  s_93ed41df2ed7dd::t_7009f2b7fb2dad 420-423,427,429
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "a134f640115415cc86d5c74c4b744e6a6deb86d5",
+  "prompts": {},
+  "sessions": {
+    "s_93ed41df2ed7dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0320419c-c65b-4bb6-b256-7da69554742d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
