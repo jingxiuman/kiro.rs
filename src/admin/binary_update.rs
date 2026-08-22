@@ -166,7 +166,10 @@ pub(super) fn build_http_client(
 ) -> Result<reqwest::Client, AdminServiceError> {
     let mut builder = reqwest::Client::builder()
         .user_agent("kiro-rs-updater")
-        .timeout(std::time::Duration::from_secs(180));
+        .timeout(std::time::Duration::from_secs(180))
+        // 建连超时：路由黑洞会卡在内核 TCP 重传直到耗尽（远超此处需要等待的时间），
+        // 且期间不产生可分类错误；10s 对正常网络绰绰有余。
+        .connect_timeout(std::time::Duration::from_secs(10));
     if let Some(url) = proxy.and_then(|u| {
         let s = u.trim();
         if s.is_empty() { None } else { Some(s) }

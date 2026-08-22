@@ -21,6 +21,10 @@ const HTTP2_KEEP_ALIVE_TIMEOUT_SECS: u64 = 15;
 /// 钉住取值以免依赖升级悄悄改变行为。经代理隧道时 h2 PING 走端到端、TCP keepalive
 /// 只覆盖到代理这一跳，两层各防一段链路。
 const TCP_KEEPALIVE_SECS: u64 = 30;
+/// TCP 建连超时。DNS 污染或路由黑洞会让单次建连尝试卡在内核 TCP 重传直到耗尽
+/// （Linux 默认约 130s），期间不产生任何可分类错误，只能等 total timeout 兜底。
+/// 10s 对正常代理链路的建连绰绰有余，不会误伤慢但可达的路径。
+const CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// 流式上游连接的默认超时。
 ///
@@ -241,7 +245,8 @@ fn build_client_with_policy(
         .http2_keep_alive_timeout(Duration::from_secs(HTTP2_KEEP_ALIVE_TIMEOUT_SECS))
         // 不开 http2_keep_alive_while_idle：有活跃流时 PING 本来就发（覆盖流式长静默这个
         // 目标场景）；池中无请求的连接无需靠 PING 延长寿命。
-        .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_SECS));
+        .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_SECS))
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS));
 
     if let Some(total) = timeout.total {
         builder = builder.timeout(total);
