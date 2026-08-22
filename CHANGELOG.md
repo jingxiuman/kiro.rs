@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.17] - 2026-08-22
+
+主题：**余额被动化 + 402 冷冻自然恢复**——分界线：可自愈（额度会重置）的进冷冻，不可自愈（手动停用、refresh token 失效）的才 disabled。
+
+### ✨ 余额被动化
+
+- **删除 300s 周期刷新**，改为选号触发的被动刷新：`dispatch` 发现候选凭据的余额快照过期时 `Notify` 一下，`AdminService` 侧监听协程 single-flight 消费，逐凭据 60s 防抖。无流量时段零上游查询；`priority` 模式天然零触发（不看余额）。
+- **量化**：生产基线 `operation='balance_refresh'` 16603 次 / 7.6 天，是推理请求次数的 2 倍——刷新本身就是最大的一类上游调用。预期改动后日调用量降一个数量级。
+- **已接受代价**：无流量时段面板余额曲线会停更（没有请求触发刷新，快照维持在最后一次的值），这是被动化设计的直接后果，不是缺陷。
+
+### 🐛 402 冷冻自然恢复
+
+- **配额耗尽从「disabled + 刷新探测自愈」改为「冷冻时间戳 + 惰性到期回池」**：命中 402 时不再禁用凭据，而是写入冷冻截止时间——优先取余额快照 `next_reset_at + 300s` 安全余量，快照缺失时兜底冻结 1h；冷冻期内再次 402 覆盖式重冻（不取旧值的最大值，按最新一次探测结果为准）。
+- **调度侧全面感知冷冻**：选号路径上的资格判定（含 `dispatch.rs` 与 `token_manager.rs` 的可用计数、下一候选筛选、组内可用性等共 7 处）全部改为冷冻感知，不再依赖单一的 `disabled` 标记。
+- **自愈链路收敛为冷冻语义**：`thaw_if_replenished` 从"主动探测触发解冻"降级为被动刷新拿到真实余额后的提前解冻兜底；盲冻（无 `next_reset_at`）凭据在下一次被动刷新拿到真实重置时间后，由 `refine_freeze_deadline` 校正冻结截止时间；任何一次成功请求都会清除该凭据的冷冻状态。
+- **存量迁移**：加载时把历史上因 `QuotaExceeded` 而 `disabled` 的凭据自动迁移为冷冻状态，避免升级后这批凭据永久卡在 disabled。
+- **面板**：凭据卡片新增冷冻态徽标，支持「立即解冻」手动动作。
+- **设计参照**：冷冻/回池模式参照 sub2api 的惰性冷却实现，与本仓库既有 `throttled_until` 字段是同构先例（同一种"到期即可用，不需要额外探测"的惰性判定）。
+
 ## [0.9.16] - 2026-08-22
 
 主题：吸收自 sub2api 上游评估的两处小改动（2898 个新提交扫描中挑出的两条根因修复）。
