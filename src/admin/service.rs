@@ -966,82 +966,6 @@ impl AdminService {
         Ok(AvailableModelsResponse { id, models })
     }
 
-    /// 批量刷新所有非禁用凭据的余额（用于后台调度）
-    ///
-    /// 冷冻中的凭据不是 disabled，会被这里正常刷到——这正是「冷冻中但
-    /// next_reset_at 未知（盲冻兜底）→ 尽快拿到真实重置时间」的实现载体：
-    /// 刷到余额后若该凭据仍处于冷冻中，`thaw_if_replenished` 会在额度已恢复时
-    /// 提前解冻；额度仍为 0 但拿到了新的 next_reset_at 时，
-    /// `refine_freeze_deadline` 会校正盲冻兜底截止时间。
-    /// disabled（手动停用、refresh token 失效等）与余额无关，统一跳过。
-    ///
-    /// 串行执行以避免对上游产生瞬时高并发，每次成功的查询都会更新内存缓存
-    /// 与磁盘缓存。失败的条目不会清空旧缓存，调用方可在下次轮询时重试。
-    pub async fn refresh_all_balances(&self) -> (usize, usize) {
-        let snapshot = self.token_manager.snapshot();
-        let mut success = 0_usize;
-        let mut failure = 0_usize;
-        // 本轮拿到的余额，批量落一次时序库（失败不影响余额刷新本身）
-        let mut history: Vec<crate::admin::balance_store::BalanceSnapshot> = Vec::new();
-        // 以现有快照打底：失败的账号沿用旧值，成功的整轮结束后一次性覆盖发布
-        let mut collected: HashMap<u64, CachedBalance> = self.balance_cache.snapshot().entries;
-
-        for entry in snapshot.entries.into_iter() {
-            // disabled 与余额无关（手动停用 / refresh token 失效等不可自愈原因），跳过。
-            // 冷冻中的凭据不是 disabled，不在此处特判，正常参与刷新。
-            if entry.disabled {
-                continue;
-            }
-            match self.fetch_balance(entry.id).await {
-                Ok(balance) => {
-                    history.push(crate::admin::balance_store::BalanceSnapshot {
-                        credential_id: entry.id,
-                        subscription_title: balance
-                            .subscription_title
-                            .clone()
-                            .unwrap_or_default(),
-                        current_usage: balance.current_usage,
-                        usage_limit: balance.usage_limit,
-                        remaining: balance.remaining,
-                        usage_percentage: balance.usage_percentage,
-                        next_reset_at: balance.next_reset_at.map(|v| v as i64),
-                    });
-                    let thawed = self
-                        .token_manager
-                        .thaw_if_replenished(entry.id, balance.remaining);
-                    if !thawed {
-                        if let Some(next_reset_at) = balance.next_reset_at {
-                            self.token_manager
-                                .refine_freeze_deadline(entry.id, next_reset_at as i64);
-                        }
-                    }
-                    collected.insert(
-                        entry.id,
-                        CachedBalance {
-                            cached_at: Utc::now().timestamp() as f64,
-                            data: balance,
-                        },
-                    );
-                    success += 1;
-                }
-                Err(e) => {
-                    tracing::warn!("后台刷新凭据 #{} 余额失败: {}", entry.id, e);
-                    failure += 1;
-                }
-            }
-            // 节流，避免上游限流
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        }
-
-        if success > 0 {
-            self.balance_cache.publish(collected);
-            if let Some(store) = &self.balance_store {
-                store.record_batch(&history);
-            }
-        }
-        (success, failure)
-    }
-
     /// 被动余额刷新监听：等待选号侧 poke，single-flight + 逐凭据 60s 防抖。
     /// 与旧的 300s 周期循环（`start_balance_refresher`，已删除）的区别：
     /// 无流量 = 零上游查询——选号侧发现候选余额快照过期才 poke。
@@ -1076,10 +1000,9 @@ impl AdminService {
         });
     }
 
-    /// `refresh_all_balances` 的被动刷新版本：只刷「未禁用且（缓存已过期
+    /// 被动余额刷新：只刷「未禁用且（缓存已过期
     /// 或冷冻中且余额快照缺 next_reset_at）」的凭据，其余跳过不查上游。
     /// 刷到余额后复用 Task 2 的 `thaw_if_replenished` / `refine_freeze_deadline`。
-    /// `refresh_all_balances` 本体保留给面板手动刷新用（无条件刷全部未禁用凭据）。
     pub async fn refresh_stale_balances(&self) -> (usize, usize) {
         let snapshot = self.token_manager.snapshot();
         let now_ts = Utc::now().timestamp();
