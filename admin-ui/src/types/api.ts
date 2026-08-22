@@ -31,6 +31,8 @@ export interface CredentialStatusItem {
   disabledReason?: string
   /** 账号级风控冷却剩余秒数（>0 表示冷却中） */
   throttledRemainingSecs?: number
+  /** 402 配额耗尽被动冷冻到期时间（Unix 秒）；缺省/已过期 = 未冷冻，到期自然恢复 */
+  frozenUntil?: number
   endpoint: string
   /** 账号所属分组（可属于多个分组） */
   groups?: string[]
