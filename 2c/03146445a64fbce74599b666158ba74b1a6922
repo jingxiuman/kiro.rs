@@ -1,0 +1,22 @@
+src/admin/binary_update.rs
+  s_93ed41df2ed7dd::t_33b5e511622e38 169-172
+src/http_client.rs
+  s_93ed41df2ed7dd::t_094ba21660e801 24-27
+  s_93ed41df2ed7dd::t_c5bde148724dc9 248-249
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "2c03146445a64fbce74599b666158ba74b1a6922",
+  "prompts": {},
+  "sessions": {
+    "s_93ed41df2ed7dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0320419c-c65b-4bb6-b256-7da69554742d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
