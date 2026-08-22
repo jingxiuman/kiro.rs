@@ -1143,6 +1143,18 @@ fn clamp_freeze_deadline(deadline: i64, now_ts: i64) -> i64 {
     deadline.min(now_ts + FREEZE_MAX_HORIZON_SECS)
 }
 
+/// epoch 秒 → 本地时区的 `MM-DD HH:MM`，用于错误文案里的「最早解冻」提示。
+/// 面向读日志的人，故用本地时间而非 UTC；非法时间戳退化为原始数字。
+fn format_local_ts(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| ts.to_string())
+}
+
 /// 冷冻判定：与 throttled_until 同构的惰性比较，到期即视为可调度，无需写回。
 fn entry_frozen(e: &CredentialEntry, now_ts: i64) -> bool {
     e.credentials.frozen_until.is_some_and(|t| now_ts < t)
@@ -1682,6 +1694,7 @@ impl MultiTokenManager {
     }
 
     /// 见 [`group_supported_models_from`]。entries 快照 + credential_support 缓存。
+
     pub fn group_supported_models(
         &self,
         group: Option<&str>,
@@ -1702,11 +1715,7 @@ impl MultiTokenManager {
         self.entries
             .lock()
             .iter()
-            .filter(|e| {
-                !e.disabled
-                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                    && !entry_frozen(e, now_ts)
-            })
+            .filter(|e| entry_schedulable(e, now, now_ts))
             .count()
     }
 
@@ -1756,12 +1765,7 @@ impl MultiTokenManager {
         let now_ts = Utc::now().timestamp();
 
         for entry in entries.iter().filter(|entry| {
-            !entry.disabled
-                && !entry
-                    .throttled_until
-                    .map(|until| until > now)
-                    .unwrap_or(false)
-                && !entry_frozen(entry, now_ts)
+            entry_schedulable(entry, now, now_ts)
                 && credential_matches_request(
                     &entry.credentials,
                     entry.id,
@@ -2054,10 +2058,8 @@ impl MultiTokenManager {
                         .iter()
                         .find(|e| {
                             e.id == current_id
-                                && !e.disabled
+                                && entry_schedulable(e, now, now_ts)
                                 && !excluded.contains_key(&e.id)
-                                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && !entry_frozen(e, now_ts)
                                 && !self.rpm_exceeded(e, now)
                                 && credential_matches_request(&e.credentials, e.id, model, group, &credential_support)
                         })
@@ -2117,15 +2119,51 @@ impl MultiTokenManager {
                         // 分组筛选生效时会打出 "9/1" 这种可用数大于总数的消息
                         // （实测日志里出现过），把「该组内的凭据都被禁用」误报成
                         // 全局状态，掩盖真实原因。
-                        let available = entries
+                        //
+                        // 分类计数而不是只数 `!disabled`：三张凭据全被 402 冷冻时，
+                        // 旧文案会打出「所有凭据均已禁用（3/3）」——可用数等于总数
+                        // 却说全禁用，自相矛盾；且 ops 指纹与「真·全禁用」合并，
+                        // 两种处置动作完全不同的故障看起来是同一条。
+                        // 归类互斥且有优先级（禁用 > 冷冻 > 冷却），保证 D+F+T ≤ N。
+                        let now = Instant::now();
+                        let now_ts = Utc::now().timestamp();
+                        let (mut disabled_n, mut frozen_n, mut throttled_n) = (0usize, 0usize, 0usize);
+                        let mut earliest_thaw: Option<i64> = None;
+                        for e in entries
                             .iter()
                             .filter(|e| group_matches(&e.credentials.groups, group))
-                            .filter(|e| !e.disabled)
-                            .count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        {
+                            if e.disabled {
+                                disabled_n += 1;
+                            } else if entry_frozen(e, now_ts) {
+                                frozen_n += 1;
+                                if let Some(t) = e.credentials.frozen_until {
+                                    earliest_thaw =
+                                        Some(earliest_thaw.map_or(t, |cur: i64| cur.min(t)));
+                                }
+                            } else if e.throttled_until.map(|t| t > now).unwrap_or(false) {
+                                throttled_n += 1;
+                            }
+                        }
+                        let thaw_hint = earliest_thaw
+                            .map(|t| format!("，最早解冻 {}", format_local_ts(t)))
+                            .unwrap_or_default();
+                        anyhow::bail!(
+                            "所有凭据不可调度（禁用 {} / 冷冻 {} / 冷却 {}，共 {}）{}",
+                            disabled_n,
+                            frozen_n,
+                            throttled_n,
+                            total,
+                            thaw_hint
+                        );
                     }
                 }
             };
+
+            // 被动余额刷新的触发点（模式无关，见 [`Self::poke_balance_refresh_if_stale`]）。
+            // 放在选号之后、取 token 之前：两条选号路径（current_id 快路径与
+            // select_next_credential_excluding）在此汇合。
+            self.poke_balance_refresh_if_stale();
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
@@ -2156,6 +2194,33 @@ impl MultiTokenManager {
                 }
             }
         }
+    }
+
+    /// 被动余额刷新的**模式无关**触发点：任一「未禁用未冷冻」凭据的余额快照
+    /// 过期（含从未采集到）就 poke 一次刷新协程。
+    ///
+    /// 为什么不放在 `dispatch.pick` 里：pick 只有 weighted 模式会调用，
+    /// 挂在那儿等于把被动刷新门控在 weighted 之后，默认的 priority 模式下
+    /// 永不触发。0.9.11 已经因为同一形状的门控出过一次回归（当年由
+    /// `refresh_all_balances_runs_regardless_of_mode` 钉住），守卫测试见
+    /// [`tests::passive_refresh_poke_is_independent_of_balancing_mode`]。
+    ///
+    /// 成本：一次 entries 锁下的 id 收集 + 一次 balance 锁下的 bool 判定，
+    /// 都不 clone 整表；未注入 dispatcher（单测/未启用）时直接返回。
+    fn poke_balance_refresh_if_stale(&self) {
+        let Some(dispatcher) = self.dispatcher.read().clone() else {
+            return;
+        };
+        let now_ts = Utc::now().timestamp();
+        let ids: Vec<u64> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|e| entry_enabled_unfrozen(e, now_ts))
+                .map(|e| e.id)
+                .collect()
+        };
+        dispatcher.poke_if_stale(&ids);
     }
 
     /// 分类并记录一次 Token 刷新错误。
@@ -2631,17 +2696,21 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
+        // 冷冻中的凭据不算「还有可用凭据」——漏查它会让故障转移误以为还有号
+        // 可试，把一轮注定失败的重试当成有希望的重试。（本函数原本就不查
+        // throttled_until：账号级冷却是秒级自愈的临时状态，不该被算成没号了。）
+        let now_ts = Utc::now().timestamp();
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return entries.iter().any(|e| entry_enabled_unfrozen(e, now_ts)),
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                return entries.iter().any(|e| entry_enabled_unfrozen(e, now_ts));
             }
 
             entry.failure_count += 1;
@@ -2664,7 +2733,7 @@ impl MultiTokenManager {
                 // 切换到优先级最高的可用凭据
                 if let Some(next) = entries
                     .iter()
-                    .filter(|e| !e.disabled)
+                    .filter(|e| entry_enabled_unfrozen(e, now_ts))
                     .min_by_key(|e| e.credentials.priority)
                 {
                     *current_id = next.id;
@@ -2678,7 +2747,7 @@ impl MultiTokenManager {
                 }
             }
 
-            entries.iter().any(|e| !e.disabled)
+            entries.iter().any(|e| entry_enabled_unfrozen(e, now_ts))
         };
         self.save_stats_debounced();
         result
@@ -2832,17 +2901,19 @@ impl MultiTokenManager {
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
     /// 与 API 401/403 的累计失败策略保持一致。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
+        // 同 report_failure：可用性判断要感知冷冻，throttled 语义维持原样（不查）。
+        let now_ts = Utc::now().timestamp();
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return entries.iter().any(|e| entry_enabled_unfrozen(e, now_ts)),
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                return entries.iter().any(|e| entry_enabled_unfrozen(e, now_ts));
             }
 
             entry.last_used_at = Some(Utc::now().to_rfc3339());
@@ -2857,7 +2928,7 @@ impl MultiTokenManager {
             );
 
             if refresh_failure_count < MAX_FAILURES_PER_CREDENTIAL {
-                return entries.iter().any(|e| !e.disabled);
+                return entries.iter().any(|e| entry_enabled_unfrozen(e, now_ts));
             }
 
             entry.disabled = true;
@@ -2871,7 +2942,7 @@ impl MultiTokenManager {
 
             if let Some(next) = entries
                 .iter()
-                .filter(|e| !e.disabled)
+                .filter(|e| entry_enabled_unfrozen(e, now_ts))
                 .min_by_key(|e| e.credentials.priority)
             {
                 *current_id = next.id;
@@ -2895,13 +2966,15 @@ impl MultiTokenManager {
     /// 立即禁用凭据，不累计、不重试。
     /// 返回是否还有可用凭据。
     pub fn report_refresh_token_invalid(&self, id: u64) -> bool {
+        // 同 report_failure：可用性判断要感知冷冻，throttled 语义维持原样（不查）。
+        let now_ts = Utc::now().timestamp();
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return entries.iter().any(|e| entry_enabled_unfrozen(e, now_ts)),
             };
 
             entry.last_used_at = Some(Utc::now().to_rfc3339());
@@ -2916,7 +2989,7 @@ impl MultiTokenManager {
 
             if let Some(next) = entries
                 .iter()
-                .filter(|e| !e.disabled)
+                .filter(|e| entry_enabled_unfrozen(e, now_ts))
                 .min_by_key(|e| e.credentials.priority)
             {
                 *current_id = next.id;
@@ -2942,13 +3015,17 @@ impl MultiTokenManager {
     ///
     /// 返回是否成功切换
     pub fn switch_to_next(&self) -> bool {
+        // 切换目标与「当前凭据是否还能用」的兜底判断都要跳过冷冻中的凭据，
+        // 否则 current_id 会指向一个马上又被选号过滤掉的号。
+        // throttled 语义维持原样（本函数原本就不查）。
+        let now_ts = Utc::now().timestamp();
         let entries = self.entries.lock();
         let mut current_id = self.current_id.lock();
 
         // 选择优先级最高的未禁用凭据（排除当前凭据）
         if let Some(next) = entries
             .iter()
-            .filter(|e| !e.disabled && e.id != *current_id)
+            .filter(|e| entry_enabled_unfrozen(e, now_ts) && e.id != *current_id)
             .min_by_key(|e| e.credentials.priority)
         {
             *current_id = next.id;
@@ -2960,7 +3037,7 @@ impl MultiTokenManager {
             true
         } else {
             // 没有其他可用凭据，检查当前凭据是否可用
-            entries.iter().any(|e| e.id == *current_id && !e.disabled)
+            entries.iter().any(|e| e.id == *current_id && entry_enabled_unfrozen(e, now_ts))
         }
     }
 
@@ -2995,11 +3072,7 @@ impl MultiTokenManager {
         let now_ts = Utc::now().timestamp();
         let available = entries
             .iter()
-            .filter(|e| {
-                !e.disabled
-                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                    && !entry_frozen(e, now_ts)
-            })
+            .filter(|e| entry_schedulable(e, now, now_ts))
             .count();
 
         ManagerSnapshot {
@@ -3135,9 +3208,7 @@ impl MultiTokenManager {
             entries
                 .iter()
                 .filter(|e| {
-                    !e.disabled
-                        && !e.throttled_until.map(|t| t > throttled_now).unwrap_or(false)
-                        && !entry_frozen(e, throttled_now_ts)
+                    entry_schedulable(e, throttled_now, throttled_now_ts)
                         && credential_matches_request(&e.credentials, e.id, model, group, &credential_support)
                 })
                 .count()
@@ -4373,9 +4444,7 @@ impl crate::anthropic::model_sync::ModelListFetcher for MultiTokenManager {
 /// - refreshToken 可用性：refreshToken 失效（但尚未触发自动禁用阈值）的凭据
 ///   拉取必然失败；API Key 凭据不走刷新流程，豁免这一条。
 fn sync_credential_is_usable(entry: &CredentialEntry, now: Instant) -> bool {
-    !entry.disabled
-        && !entry.throttled_until.map(|t| t > now).unwrap_or(false)
-        && !entry_frozen(entry, Utc::now().timestamp())
+    entry_schedulable(entry, now, Utc::now().timestamp())
         && (entry.credentials.is_api_key_credential()
             || validate_refresh_token(&entry.credentials).is_ok())
 }
@@ -5091,11 +5160,14 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
+        // 全员因刷新失败被禁用：分类计数全落在「禁用」一档，冷冻/冷却为 0，
+        // 且不带「最早解冻」后缀。
         assert!(
-            err.contains("所有凭据均已禁用"),
-            "错误应提示所有凭据禁用，实际: {}",
+            err.contains("所有凭据不可调度（禁用 2 / 冷冻 0 / 冷却 0，共 2）"),
+            "错误应分类计数并全部归入禁用，实际: {}",
             err
         );
+        assert!(!err.contains("最早解冻"), "无冷冻凭据时不应带解冻时间，实际: {}", err);
     }
 
     /// 402 不再禁用而是冷冻：到期前不可调度，到期后无需任何刷新即自然回池。
@@ -5157,6 +5229,88 @@ mod tests {
         // 沿用了被测试手动改到过去的旧值」——此时 second 会等于人为设置的
         // `now - 10`，明显小于 first，故用 `>=` 既保留探测能力又消除该假阴性。
         assert!(second >= first, "重冻必须重新计算，不是沿用旧值");
+    }
+
+    /// poke 之后 `notified()` 是否立即就绪（`now_or_never` 探测，不阻塞测试）。
+    fn poke_pending(cache: &crate::admin::balance_cache::SharedBalanceCache) -> bool {
+        use futures::FutureExt;
+        let fut = cache.passive_refresh_requested().notified();
+        futures::pin_mut!(fut);
+        fut.now_or_never().is_some()
+    }
+
+    /// I1 守卫：被动余额刷新的 poke 必须与负载均衡模式解耦。
+    ///
+    /// **语义继承链**：`refresh_all_balances_runs_regardless_of_mode`
+    /// （0.9.11 的回归：余额刷新被门控在 weighted 分支里，priority 模式下
+    /// 402 凭据永远等不到刷新、回不了池）→ 本轮冷冻改造把那条测试改写成了
+    /// `frozen_credential_returns_to_pool_without_any_refresh`（自愈不再依赖
+    /// 刷新，那一维确实不必再守）→ 但 poke 这一维的门控**又回来了**：唯一的
+    /// poke 点落在 `dispatch.pick`，而只有 weighted 会调 pick。默认 priority
+    /// 模式下被动刷新永不触发，表现为余额趋势图断更、盲冻校正（
+    /// `refine_freeze_deadline`）与提前解冻（`thaw_if_replenished`）死路、
+    /// 402 恒走兜底盲冻。这是同一类回归的第二次发生，故单列此守卫。
+    #[tokio::test]
+    async fn passive_refresh_poke_is_independent_of_balancing_mode() {
+        for mode in ["priority", "balanced", "weighted"] {
+            let mut config = Config::default();
+            config.load_balancing_mode = mode.to_string();
+
+            let cred = KiroCredentials {
+                access_token: Some("token-a".to_string()),
+                expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+                ..Default::default()
+            };
+
+            // 余额缓存为空 = 所有凭据的快照「从未采集到」，按口径视为过期。
+            let cache: crate::admin::balance_cache::SharedBalanceCache =
+                std::sync::Arc::new(crate::admin::balance_cache::BalanceCache::new(None));
+            let dispatcher = std::sync::Arc::new(
+                crate::kiro::dispatch::GroupDispatcher::new(cache.clone()),
+            );
+            let manager = MultiTokenManager::new(config, vec![cred], None, None, false)
+                .unwrap()
+                .with_dispatcher(dispatcher);
+
+            assert!(!poke_pending(&cache), "mode={mode}: 选号前不应有 poke 残留");
+            manager
+                .acquire_context(None, None)
+                .await
+                .expect("token 未过期，应能直接拿到上下文");
+            assert!(
+                poke_pending(&cache),
+                "mode={mode}: 选号命中过期余额快照必须触发被动刷新 poke，\
+                 不得只在 weighted 分支里触发"
+            );
+        }
+    }
+
+    /// I3 守卫：故障转移的「是否还有可用凭据」判断必须感知冷冻。
+    ///
+    /// 构造 3 凭据：2 张冷冻 + 1 张禁用。旧实现只查 `!disabled`，会把两张
+    /// 冷冻中的凭据算成可用，`report_failure` 返回 true，调用侧于是继续重试
+    /// 一轮注定选不出号的故障转移。
+    #[test]
+    fn report_failure_counts_frozen_as_unavailable() {
+        let config = Config::default();
+        let creds: Vec<KiroCredentials> = (0..3)
+            .map(|i| KiroCredentials {
+                priority: i,
+                ..Default::default()
+            })
+            .collect();
+        let manager = MultiTokenManager::new(config, creds, None, None, false).unwrap();
+
+        let future = Utc::now().timestamp() + 3600;
+        manager.set_frozen_until_for_test(1, Some(future));
+        manager.set_frozen_until_for_test(2, Some(future));
+        manager.set_disabled(3, true).unwrap();
+
+        assert_eq!(manager.available_count(), 0, "三张都不可调度");
+        assert!(
+            !manager.report_failure(1),
+            "2 冷冻 + 1 禁用 = 没有可重试的凭据，不得返回 true"
+        );
     }
 
     /// 面板「一键超额」与 402 同义：写冷冻，不写 disabled。
@@ -5294,9 +5448,17 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
+        // I2：全员冷冻时必须分类计数，旧文案「所有凭据均已禁用（2/2）」
+        // 既自相矛盾（available == total 却说全禁用），又与真·全禁用共用
+        // 同一个 ops 指纹。
         assert!(
-            err.contains("所有凭据均已禁用"),
-            "错误应提示所有凭据禁用，实际: {}",
+            err.contains("所有凭据不可调度（禁用 0 / 冷冻 2 / 冷却 0，共 2）"),
+            "错误应分类计数并全部归入冷冻，实际: {}",
+            err
+        );
+        assert!(
+            err.contains("最早解冻"),
+            "冷冻数 > 0 时应附带最早解冻时间，实际: {}",
             err
         );
         assert_eq!(manager.available_count(), 0);
@@ -6288,19 +6450,20 @@ mod tests {
         };
 
         assert!(
-            msg.contains("所有凭据均已禁用"),
+            msg.contains("所有凭据不可调度"),
             "应命中分组耗尽分支，实际: {}",
             msg
         );
-        // 关键断言：available 必须 ≤ total。修复前这里是 3/1。
+        // 关键断言：分类计数之和必须 ≤ total，且只统计组内凭据。
+        // 修复前这里是「(3/1)」——available 统计了组外的 3 张。
         assert!(
-            msg.contains("（0/1）"),
-            "available 与 total 必须同为组内口径（期望 0/1），实际: {}",
+            msg.contains("禁用 1 / 冷冻 0 / 冷却 0，共 1"),
+            "分类计数与 total 必须同为组内口径（期望 禁用 1，共 1），实际: {}",
             msg
         );
         assert!(
-            !msg.contains("（3/1）"),
-            "available 不得统计组外凭据，实际: {}",
+            !msg.contains("共 4"),
+            "不得统计组外凭据，实际: {}",
             msg
         );
     }

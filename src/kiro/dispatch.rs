@@ -94,6 +94,23 @@ impl GroupDispatcher {
         }
     }
 
+    /// 被动余额刷新的 poke 入口：给定凭据里任一余额快照过期（含从未采集到）
+    /// 即唤醒刷新协程。零成本、不阻塞，`Notify` 天然合并重复 poke。
+    ///
+    /// 挂在 `token_manager` 的选号出口（模式无关）而不是 [`Self::pick`] 里：
+    /// pick 只有 weighted 模式会走到，放那儿等于把被动刷新门控在 weighted
+    /// 后面——0.9.11 已经因为同一形状的门控出过一次回归。守卫测试见
+    /// `token_manager::tests::passive_refresh_poke_is_independent_of_balancing_mode`。
+    pub fn poke_if_stale(&self, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let now_ts = chrono::Utc::now().timestamp() as f64;
+        if self.balance.any_stale(ids, now_ts) {
+            self.balance.request_passive_refresh();
+        }
+    }
+
     /// 读某凭据余额快照里的 next_reset_at（epoch 秒）。无快照或无该字段返回 None。
     /// 供 402 冷冻计算截止时间；只读，不触发刷新。
     pub fn balance_next_reset_at(&self, cred_id: u64) -> Option<i64> {
@@ -161,12 +178,9 @@ impl GroupDispatcher {
         let candidate_count = available.len();
         let generation = st.generation;
 
-        // 被动刷新：任一候选余额快照过期即 poke（weighted 才会走到本函数，
-        // priority 模式天然零触发，因为它不调 pick）。poke 只是 Notify，
-        // 不阻塞、不重复排队——监听侧还没醒来之前的多次 poke 只算一次。
-        if candidates_stale(&available, &snap.entries, now_ts) {
-            self.balance.request_passive_refresh();
-        }
+        // 注：被动刷新的 poke 曾经在这里，已上移到 `token_manager` 的选号
+        // 出口（见 [`Self::poke_if_stale`]）——放在 pick 里等于只有 weighted
+        // 模式才会触发刷新。这里不再重复 poke。
 
         // 1. 查粘滞
         if let Some(k) = &skey {
@@ -360,19 +374,6 @@ fn balance_age_secs(
     entries.get(&id).map(|e| now_ts - e.cached_at).unwrap_or(f64::INFINITY)
 }
 
-/// 任一候选的余额快照过期（含缺失，视为过期）即返回 true——用于触发被动刷新
-/// 的 poke。与 `balance_age_secs` 共用「缺失 = INFINITY」的口径，缺失天然
-/// 大于 TTL，不需要单独分支。
-fn candidates_stale(
-    candidates: &[Candidate],
-    entries: &HashMap<u64, crate::admin::balance_cache::CachedBalance>,
-    now_ts: f64,
-) -> bool {
-    candidates
-        .iter()
-        .any(|c| balance_age_secs(entries, c.id, now_ts) > crate::admin::balance_cache::BALANCE_CACHE_TTL_SECS as f64)
-}
-
 /// 到量时先清全部过期条目，仍满则 O(n) 淘汰 last_seen 最早的一条。
 /// 不引入 lru 依赖：正常负载下 30min 过期会让表远小于上限，O(n) 基本不触发。
 fn evict_if_full(sticky: &mut HashMap<String, StickyEntry>, now: Instant) {
@@ -523,9 +524,12 @@ mod tests {
         fut.now_or_never().is_some()
     }
 
+    /// poke 判据本身：快照过期即触发。
+    /// 注意触发**时机**已不在 `pick` 里（那样只有 weighted 模式会走到），
+    /// 模式无关性由 `token_manager::tests::passive_refresh_poke_is_independent_of_balancing_mode`
+    /// 守。
     #[test]
-    fn pick_pokes_passive_refresh_when_candidate_balance_is_stale() {
-        // 候选 1 的余额快照已过期（超过 BALANCE_CACHE_TTL_SECS）。
+    fn poke_if_stale_pokes_when_balance_snapshot_is_stale() {
         let d = disp(&[(1, 7000.0)]);
         {
             let mut m = HashMap::new();
@@ -535,16 +539,25 @@ mod tests {
             });
             d.balance.publish(m);
         }
-        assert!(!was_poked(&d), "pick 调用前不应有 poke 残留");
-        pick(&d, &cands(&[1]));
-        assert!(was_poked(&d), "候选余额过期应触发被动刷新 poke");
+        assert!(!was_poked(&d), "调用前不应有 poke 残留");
+        d.poke_if_stale(&[1]);
+        assert!(was_poked(&d), "余额快照过期应触发被动刷新 poke");
+    }
+
+    /// 从未采集到余额的凭据同样算过期（否则新加的凭据永远等不到第一次刷新）。
+    #[test]
+    fn poke_if_stale_treats_missing_snapshot_as_stale() {
+        let d = disp(&[(1, 7000.0)]);
+        assert!(!was_poked(&d), "调用前不应有 poke 残留");
+        d.poke_if_stale(&[999]);
+        assert!(was_poked(&d), "缺失快照应视为过期并 poke");
     }
 
     #[test]
-    fn pick_does_not_poke_when_candidate_balance_is_fresh() {
+    fn poke_if_stale_does_not_poke_when_balance_is_fresh() {
         let d = disp(&[(1, 7000.0), (2, 3000.0)]);
-        pick(&d, &cands(&[1, 2]));
-        assert!(!was_poked(&d), "候选余额新鲜时不应触发被动刷新 poke");
+        d.poke_if_stale(&[1, 2]);
+        assert!(!was_poked(&d), "余额新鲜时不应触发被动刷新 poke");
     }
 
     #[test]

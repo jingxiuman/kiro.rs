@@ -47,10 +47,13 @@ use super::types::{
 /// 看到红点提醒，又能避免短时间内重复请求被限流。
 const UPDATE_CHECK_TTL_SECS: i64 = 1800;
 
-/// 被动余额刷新的防抖下限（秒）：一轮刷新结束后至少歇这么久再接受下一次
-/// poke，避免突发流量下同一批候选反复触发刷新。也用作「缓存条目多久算
-/// 值得再刷一次」的下限（与 poke 触发的 300s TTL 判定分层：poke 判定用
-/// BALANCE_CACHE_TTL_SECS，这里判定「本轮该刷谁」用更短的 60s）。
+/// 被动余额刷新的**整轮**防抖下限（秒）：一轮刷新结束后至少歇这么久再接受
+/// 下一次 poke，避免突发流量下同一批候选反复触发刷新。
+///
+/// 注意它**不再**兼任「某条凭据多久该再刷一次」——那一层原本用 60s 判
+/// `cached_at`，而 `cached_at` 只有成功才写，于是查询持续失败的凭据永远
+/// stale，每 60s 被全量重刷。现在逐凭据防抖统一按 `passive_attempt_at`
+/// （无论成败都记）配合 `BALANCE_CACHE_TTL_SECS` 判定。
 const PASSIVE_REFRESH_MIN_INTERVAL_SECS: u64 = 60;
 
 /// 单条凭据导入结果（服务端内部用，映射为 SSE 事件）
@@ -214,6 +217,12 @@ pub struct AdminService {
     /// priority/balanced 下无条件启动会凭空多出周期性上游请求。
     /// `compare_exchange` 防止模式来回切换时重复启动多个循环任务。
     balance_refresher_running: std::sync::atomic::AtomicBool,
+    /// 被动刷新的**尝试**时间（凭据 id → epoch 秒），无论成败都记。
+    ///
+    /// 与 `balance_cache` 的 `cached_at`（只有成功才写）分开是必须的：查询
+    /// 持续失败的凭据在 `cached_at` 口径下永远 stale，会把每次 poke 都放大成
+    /// 一轮全量刷新——一张挂掉的号就足以让被动化退回成 60s 周期轮询。
+    passive_attempt_at: parking_lot::Mutex<HashMap<u64, i64>>,
 }
 
 /// Social 登录会话状态
@@ -610,6 +619,7 @@ impl AdminService {
             model_sync_service: None,
             kiro_provider: None,
             balance_refresher_running: std::sync::atomic::AtomicBool::new(false),
+            passive_attempt_at: parking_lot::Mutex::new(HashMap::new()),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -1021,12 +1031,21 @@ impl AdminService {
             if entry.disabled {
                 continue;
             }
+            // 逐凭据防抖：距上次**尝试**（无论成败）不足一个 TTL 就跳过。
+            // 这条必须先于 cache_stale 判定——失败不写 cached_at，只靠
+            // cache_stale 拦不住持续失败的凭据。
+            let last_attempt = self.passive_attempt_at.lock().get(&entry.id).copied();
+            if last_attempt
+                .is_some_and(|t| now_ts - t < BALANCE_CACHE_TTL_SECS)
+            {
+                continue;
+            }
             let cache_age = cache_snapshot
                 .entries
                 .get(&entry.id)
                 .map(|c| now_ts as f64 - c.cached_at);
             let cache_stale = cache_age
-                .map(|age| age > PASSIVE_REFRESH_MIN_INTERVAL_SECS as f64)
+                .map(|age| age > BALANCE_CACHE_TTL_SECS as f64)
                 .unwrap_or(true);
             // 冷冻中且拿不到 next_reset_at（盲冻兜底）：即使缓存本身还没过期，
             // 也值得尽快刷一次去拿真实重置时间，好让 refine_freeze_deadline 校正。
@@ -1039,6 +1058,11 @@ impl AdminService {
             if !cache_stale && !frozen_without_reset_at {
                 continue;
             }
+            // 记在发起之前：即便 fetch_balance panic 或本轮被取消，也不会留下
+            // 「从未尝试过」的假象让下一轮立刻重来。
+            self.passive_attempt_at
+                .lock()
+                .insert(entry.id, Utc::now().timestamp());
             match self.fetch_balance(entry.id).await {
                 Ok(balance) => {
                     history.push(crate::admin::balance_store::BalanceSnapshot {
@@ -5606,6 +5630,31 @@ mod tests {
             success + failure,
             1,
             "只有缺失缓存（视为过期）的凭据 2 应被尝试刷新，凭据 1 的新鲜缓存应跳过"
+        );
+    }
+
+    /// I4：查询**持续失败**的凭据不得把被动刷新放大成全量轮询。
+    ///
+    /// 防抖若只看 `cached_at`（只有成功才写），失败的凭据就永远 stale：每次
+    /// poke 都把它算进本轮，而一轮结束后监听协程只歇 60s——一张挂掉的号足以
+    /// 让整池每 60s 被全量刷一遍，正是被动化想消灭的那种周期性上游调用。
+    /// 故按「尝试时间」防抖（无论成败都记）。
+    ///
+    /// 构造照 `refresh_stale_balances_skips_fresh_entries`：测试环境没有上游，
+    /// `fetch_balance` 对两条凭据都必然失败。
+    #[tokio::test]
+    async fn refresh_stale_balances_debounces_persistently_failing_credentials() {
+        let service = service_with_balancing_mode("priority");
+
+        let (ok1, err1) = service.refresh_stale_balances().await;
+        assert_eq!(ok1, 0, "测试环境没有上游，不可能成功");
+        assert_eq!(err1, 2, "第一轮两条凭据都应被尝试");
+
+        let (ok2, err2) = service.refresh_stale_balances().await;
+        assert_eq!(
+            (ok2, err2),
+            (0, 0),
+            "第二轮必须整轮跳过：失败没有写 cached_at，只有按尝试时间防抖才拦得住"
         );
     }
 }

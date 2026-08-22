@@ -67,6 +67,19 @@ impl BalanceCache {
         &self.passive_refresh
     }
 
+    /// 给定凭据里是否存在余额快照已过期（或从未采集到）的。
+    ///
+    /// 刻意不走 [`Self::snapshot`]：那会 clone 整张 entries 表，而这是每次
+    /// 选号都要走的热路径，调用方只需要一个 bool。「条目缺失 = 过期」的口径
+    /// 与 `dispatch::balance_age_secs`（缺失取 `INFINITY`）一致。
+    pub fn any_stale(&self, ids: &[u64], now_ts: f64) -> bool {
+        let inner = self.inner.lock();
+        ids.iter().any(|id| match inner.entries.get(id) {
+            Some(e) => now_ts - e.cached_at > BALANCE_CACHE_TTL_SECS as f64,
+            None => true,
+        })
+    }
+
     /// 只读代次号。比 [`Self::snapshot`] 便宜——不 clone 整张 entries 表，
     /// 供只需判断「是否换代」的热路径（消耗回写）使用。
     pub fn generation(&self) -> u64 {

@@ -26,6 +26,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - **面板**：凭据卡片新增冷冻态徽标，支持「立即解冻」手动动作。
 - **设计参照**：冷冻/回池模式参照 sub2api 的惰性冷却实现，与本仓库既有 `throttled_until` 字段是同构先例（同一种"到期即可用，不需要额外探测"的惰性判定）。
 
+### 🔧 终审修复（同轮）
+
+- **被动刷新的 poke 与负载均衡模式解耦**：poke 原本只挂在 `dispatch.pick` 里，而只有 weighted 模式会调 pick——默认的 priority 模式下被动刷新**永不触发**，表现为余额趋势图断更、盲冻校正与提前解冻死路、402 恒走兜底盲冻。改为挂在 `token_manager` 选号出口（两条选号路径的汇合点，模式无关），`GroupDispatcher::poke_if_stale` 封装判据。这是同一形状回归的第二次发生（0.9.11 曾把余额刷新门控在 weighted 之后），故新增守卫测试 `passive_refresh_poke_is_independent_of_balancing_mode` 并在注释里写明语义继承链。
+- **失败凭据不再把被动刷新放大成 60s 全量轮询**：逐凭据防抖原本看 `cached_at`，而它只有查询成功才写——查询持续失败的凭据永远 stale，每次 poke 都把它算进本轮，一轮结束只歇 60s，一张挂掉的号就足以让整池每 60s 全量刷一遍。新增 `passive_attempt_at`（无论成败都记尝试时间），按它 + `BALANCE_CACHE_TTL_SECS` 防抖。
+- **统一可调度判据**：抽出 `entry_schedulable`（未禁用 + 未冷却 + 未冷冻）与 `entry_enabled_unfrozen`（前者去掉冷却那一项），把冷冻改造时漏掉的五处补齐：`report_failure` / `report_refresh_failure` / `report_refresh_token_invalid` 的「是否还有可用凭据」判断，以及 `switch_to_next` 的切换目标与 current_id 兜底判断。逐站点核对后**保留各自原有的 `throttled_until` 语义**（这几处原本就刻意不查冷却——账号级 429 是秒级自愈的临时状态，算作"没号了"会把可重试的请求提前判死），故拆成两个函数而不是一个带开关的。
+- **全员冷冻的错误文案与 ops 指纹**：`所有凭据均已禁用（3/3）` 在全员冷冻时既自相矛盾（可用数等于总数却说全禁用），又与真·全禁用共用同一个 ops 指纹。改为分类计数 `所有凭据不可调度（禁用 D / 冷冻 F / 冷却 T，共 N）`，`F > 0` 时附带最早解冻的本地时间。归一化无需新规则（通用的数字换 `N` 已收敛计数），旧文案规则保留，新增测试钉住"新旧是两个独立指纹"。
+
 ## [0.9.16] - 2026-08-22
 
 主题：吸收自 sub2api 上游评估的两处小改动（2898 个新提交扫描中挑出的两条根因修复）。
