@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.16] - 2026-08-22
+
+主题：吸收自 sub2api 上游评估的两处小改动（2898 个新提交扫描中挑出的两条根因修复）。
+
+### 🐛 修复
+
+- **补 TCP 建连超时**（吸收自 sub2api `66ad405dd`）：`http_client.rs` 的 `Client::builder()` 链此前设了 http2 keepalive / tcp keepalive / total timeout / read_timeout，唯独没设 `.connect_timeout()`。DNS 污染或路由黑洞时，单次建连尝试会卡在内核 TCP 重传直到耗尽（Linux 默认约 130s），期间不产生任何可分类错误，只能干等 total timeout 兜底。新增 `CONNECT_TIMEOUT_SECS = 10`，对正常代理链路绰绰有余；`admin/binary_update.rs` 的 `build_http_client`（已有 180s 总超时）同理补上。建连超时的真实时序行为在本沙箱不可靠（网络出口被统一代理拦截，正是 `reqwest_timeout_error_is_tagged_before_the_chain` 那条 flake 的成因），故未新增基于真实网络的时序测试，以「builder 配置正确编译 + 全量测试无回归」验收。
+- **GPT 家族 `max` effort 降级为 `xhigh`**（吸收自 sub2api `d5824f6a5` 的反面教训）：`normalize_effort_for_model` 此前只对 `None`（非 GPT 家族）和 `XHigh`（不支持的模型）做降级，`Max` 对任何模型原样透传。GPT 家族走 `additionalModelRequestFields.reasoning.effort`，遵循 OpenAI 惯例只有 none/low/medium/high/xhigh 五档、没有 `max`——原样透传会撞上游 400，进而触发「剥字段重试」把 effort 整个丢光，而不是优雅降一档。现在 GPT 家族的 `max` 会降到该家族支持的最高档 `xhigh`（而非 `high`，避免损失过多推理强度）。**Claude 家族的 `max` 是实测有效档位**（`kiro/model/requests/kiro.rs` 记录了 low↔max 5 倍差异的阶梯实验），本次改动只对 GPT 家族生效，Claude 侧行为不变，由既有测试 `test_output_config_normalizes_effort_case_and_spacing` 钉住。
+
+### ✅ 测试
+
+- 新增 `max_effort_downgrades_to_xhigh_only_for_gpt_family`：断言 GPT 家族的 `max`（含大小写/空格变体）归一化为 `xhigh`，Claude 家族的 `max` 原样保留。
+
 ## [0.9.15] - 2026-08-21
 
 主题：**凭据↔代理批量重绑**——一次性把多张凭据改绑到不同代理，全有或全无。
