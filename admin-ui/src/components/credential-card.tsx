@@ -12,6 +12,7 @@ import {
   Zap,
   ZapOff,
   Clock,
+  Snowflake,
   ScrollText,
   Boxes,
   Wallet,
@@ -49,6 +50,7 @@ import {
   useForceRefreshToken,
   useResetSuccessCount,
   useClearThrottle,
+  useClearFreeze,
 } from "@/hooks/use-credentials";
 import { setCredentialOverage } from "@/api/credentials";
 import { useQueryClient } from "@tanstack/react-query";
@@ -118,6 +120,20 @@ function formatThrottleCountdown(secs: number): string {
   const s = total % 60;
   const pad = (n: number) => String(n).padStart(2, "0");
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+
+/** 把冷冻到期时间戳（epoch 秒）格式化为本地 `HH:MM`；跨天时前缀日期 */
+function formatFreezeUntil(epochSecs: number): string {
+  const d = new Date(epochSecs * 1000);
+  const now = new Date();
+  const hm = d.toLocaleTimeString("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  if (d.toDateString() === now.toDateString()) return hm;
+  const md = d.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" });
+  return `${md} ${hm}`;
 }
 
 /**
@@ -227,6 +243,7 @@ export function CredentialCard({
   const forceRefresh = useForceRefreshToken();
   const resetSuccess = useResetSuccessCount();
   const clearThrottle = useClearThrottle();
+  const clearFreeze = useClearFreeze();
   const queryClient = useQueryClient();
 
   // 拖拽排序：手柄触发，整卡随拖动位移
@@ -270,6 +287,14 @@ export function CredentialCard({
       onError: (err) => toast.error("解除失败: " + extractErrorMessage(err)),
     });
   }, [clearThrottle, credential.id]);
+  const isFrozen =
+    !!credential.frozenUntil && credential.frozenUntil > Date.now() / 1000;
+  const handleClearFreeze = useCallback(() => {
+    clearFreeze.mutate(credential.id, {
+      onSuccess: (res) => toast.success(res.message),
+      onError: (err) => toast.error("解冻失败: " + extractErrorMessage(err)),
+    });
+  }, [clearFreeze, credential.id]);
   const [overageBusy, setOverageBusy] = useState(false);
   const handleSetOverage = async (enabled: boolean) => {
     setOverageBusy(true);
@@ -425,6 +450,16 @@ export function CredentialCard({
           冷却 {formatThrottleCountdown(throttleRemaining)}
         </Badge>
       )}
+      {isFrozen && (
+        <Badge
+          variant="warning"
+          className="bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30"
+          title="402 配额耗尽被动冷冻中：到期自动恢复调度，无需人工处理；也可立即解冻"
+        >
+          <Snowflake className="mr-1 h-3 w-3" />
+          冷冻中（至 {formatFreezeUntil(credential.frozenUntil!)}）
+        </Badge>
+      )}
       {credential.authMethod && <Badge variant="secondary">{authLabel}</Badge>}
       {/* 配置元信息合并为单个徽章，减少换行：endpoint · ARN */}
       {(credential.endpoint || credential.hasProfileArn) && (
@@ -499,6 +534,18 @@ export function CredentialCard({
           >
             <Clock />
             解除风控冷却（{formatThrottleCountdown(throttleRemaining)}）
+          </DropdownMenuItem>
+        )}
+        {isFrozen && (
+          <DropdownMenuItem
+            onSelect={(e) => {
+              e.preventDefault();
+              handleClearFreeze();
+            }}
+            disabled={clearFreeze.isPending}
+          >
+            <Snowflake />
+            立即解冻（至 {formatFreezeUntil(credential.frozenUntil!)}）
           </DropdownMenuItem>
         )}
         {balance?.overageCapable === true &&

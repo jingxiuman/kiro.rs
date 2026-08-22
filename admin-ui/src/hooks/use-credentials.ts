@@ -6,6 +6,7 @@ import {
   resetCredentialFailure,
   forceRefreshToken,
   clearThrottle,
+  clearFreeze,
   getCredentialBalance,
   getCredentialModels,
   addCredential,
@@ -105,6 +106,17 @@ export function useClearThrottle() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => clearThrottle(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 立即解冻（402 配额耗尽被动冷冻）
+export function useClearFreeze() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => clearFreeze(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

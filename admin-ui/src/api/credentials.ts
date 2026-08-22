@@ -144,6 +144,12 @@ export async function clearThrottle(id: number): Promise<SuccessResponse> {
   return data
 }
 
+// 立即解冻凭据（402 配额耗尽被动冷冻）
+export async function clearFreeze(id: number): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/unfreeze`)
+  return data
+}
+
 // 获取凭据余额
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
