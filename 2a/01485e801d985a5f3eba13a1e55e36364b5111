@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_93ed41df2ed7dd::t_4d34a5de5a40be 35-36
+admin-ui/src/components/credential-card.tsx
+  s_93ed41df2ed7dd::t_f78dd0f2bc71a2 290-292,294-296,410-411
+src/kiro/token_manager.rs
+  s_93ed41df2ed7dd::t_ca9b6b6ef2c69c 1697-1701,1962-1971,1977-1978
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "2a01485e801d985a5f3eba13a1e55e36364b5111",
+  "prompts": {},
+  "sessions": {
+    "s_93ed41df2ed7dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0320419c-c65b-4bb6-b256-7da69554742d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
