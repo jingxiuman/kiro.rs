@@ -1,0 +1,37 @@
+src/kiro/dispatch.rs
+  s_93ed41df2ed7dd::t_90e6a9178e015b 97-113
+  s_93ed41df2ed7dd::t_f32922c216fb1c 557,559-560
+  s_93ed41df2ed7dd::t_ec7f2c83448f58 527-530,532,542-553
+  s_93ed41df2ed7dd::t_a5f8451cb2bc39 181-183
+src/admin/balance_cache.rs
+  s_93ed41df2ed7dd::t_c890e653e891ec 70-82
+src/admin/ops.rs
+  s_93ed41df2ed7dd::t_7bb356fdb4514d 2656-2673
+CHANGELOG.md
+  s_93ed41df2ed7dd::t_4d34a5de5a40be 29-35
+src/kiro/token_manager.rs
+  s_93ed41df2ed7dd::t_a66975dea95fb7 2122-2132,2135-2158
+  s_93ed41df2ed7dd::t_15b394981542e9 3040,5234-5285
+  s_93ed41df2ed7dd::t_afabccce9d695e 1146-1157
+  s_93ed41df2ed7dd::t_125602b4305bd9 5166-5167,5170,5286-5314,6460,6466
+  s_93ed41df2ed7dd::t_9add3098081808 2199-2225,2701,2750,2904,2969,3020,6458
+  s_93ed41df2ed7dd::t_28d729315fc069 1697,1718,1768,2061,2163-2167,2699-2700,2702,2709,2713,2736,2905,2912,2916,2931,2945,2970,2977,2992,3018-3019,3021,3028,3075,3211,4447,5163-5164,5315,5451-5458,5460-5461,6453,6457,6461,6465
+src/admin/service.rs
+  s_93ed41df2ed7dd::t_7947857d2a7b92 50-56,220-225,622,1034-1042,1048,1061-1065,5635-5659
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "91bbeade74ed07df49db596f02ce19cae729e4b9",
+  "prompts": {},
+  "sessions": {
+    "s_93ed41df2ed7dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0320419c-c65b-4bb6-b256-7da69554742d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
