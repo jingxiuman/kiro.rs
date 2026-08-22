@@ -1,0 +1,25 @@
+src/kiro/token_manager.rs
+  s_93ed41df2ed7dd::t_b94fd755246df9 5163-5179,5185-5188
+  s_93ed41df2ed7dd::t_09af79fc9773f9 2718-2723,2725,2727-2728,2731,2733,2737,2743-2769
+src/admin/service.rs
+  s_93ed41df2ed7dd::t_5d91f5fb9720d8 956,958-963,977-979,996-1004
+  s_93ed41df2ed7dd::t_74596eb3af73a4 5526-5530,5532-5547,5562
+  s_93ed41df2ed7dd::t_f6e33e2272fb11 1039-1041
+  s_93ed41df2ed7dd::t_69842460fb0e8d 5548-5561
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "4c742fb1bb5295df0331f543eb23408b78206444",
+  "prompts": {},
+  "sessions": {
+    "s_93ed41df2ed7dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0320419c-c65b-4bb6-b256-7da69554742d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
