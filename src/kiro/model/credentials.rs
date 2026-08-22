@@ -129,6 +129,21 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub disabled: bool,
 
+    /// 禁用原因（字符串形式持久化，如 "QuotaExceeded" / "Manual" 等）。
+    /// 此前该原因只存在于内存 `CredentialEntry`，重启后一律回落成 Manual；
+    /// 现持久化后，402 冷冻的存量迁移（见 token_manager 的加载期迁移逻辑）
+    /// 才能在跨重启场景下正确识别「原本因配额禁用」的凭据。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+
+    /// 402 冷冻截止时间（epoch 秒）。冷冻期内不参与调度，到期惰性回池——
+    /// 无任何后台解冻任务（参照 sub2api 的惰性冷却模式）。None = 未冷冻。
+    /// 与 `disabled` 的分界：可自愈的（配额月度重置）进冷冻，不可自愈的
+    /// （手动停用、refresh token 失效）才禁用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_until: Option<i64>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -200,6 +215,8 @@ impl std::fmt::Debug for KiroCredentials {
             .field("proxy_username", &self.proxy_username)
             .field("proxy_password", &fmt_redacted(&self.proxy_password))
             .field("disabled", &self.disabled)
+            .field("disabled_reason", &self.disabled_reason)
+            .field("frozen_until", &self.frozen_until)
             .field("kiro_api_key", &fmt_redacted(&self.kiro_api_key))
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
@@ -624,6 +641,8 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            frozen_until: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -818,6 +837,8 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            frozen_until: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -856,6 +877,8 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            frozen_until: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -977,6 +1000,8 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            frozen_until: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],

@@ -1016,6 +1016,9 @@ pub struct CredentialEntrySnapshot {
     /// 临时冷却剩余秒数（账号级 429 风控）；冷却中且 `> 0` 才返回
     #[serde(skip_serializing_if = "Option::is_none")]
     pub throttled_remaining_secs: Option<u64>,
+    /// 冷冻截止（epoch 秒）；None = 未冷冻。到期后字段保留到下次成功请求。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frozen_until: Option<i64>,
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
@@ -1124,6 +1127,42 @@ const RPM_WINDOW_SECS: u64 = 60;
 
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+
+/// 402 冷冻兜底时长：拿不到 next_reset_at 时乐观冻 1 小时——到期回池，
+/// 仍超限会被下一个真实 402 覆盖式重冻，每小时一次试探成本可忽略。
+const FREEZE_FALLBACK_SECS: i64 = 3600;
+/// next_reset_at 的安全余量：上游重置生效可能滞后于时间戳本身。
+const FREEZE_RESET_MARGIN_SECS: i64 = 300;
+
+/// 冷冻判定：与 throttled_until 同构的惰性比较，到期即视为可调度，无需写回。
+fn entry_frozen(e: &CredentialEntry, now_ts: i64) -> bool {
+    e.credentials.frozen_until.is_some_and(|t| now_ts > 0 && now_ts < t)
+}
+
+/// `DisabledReason` <-> 持久化字符串的双向映射，供快照序列化、`KiroCredentials`
+/// 落盘/加载复用，避免多处手写 match 各自漂移。
+fn disabled_reason_str(r: DisabledReason) -> &'static str {
+    match r {
+        DisabledReason::Manual => "Manual",
+        DisabledReason::TooManyFailures => "TooManyFailures",
+        DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+        DisabledReason::QuotaExceeded => "QuotaExceeded",
+        DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+        DisabledReason::InvalidConfig => "InvalidConfig",
+    }
+}
+
+fn disabled_reason_from_str(s: &str) -> Option<DisabledReason> {
+    match s {
+        "Manual" => Some(DisabledReason::Manual),
+        "TooManyFailures" => Some(DisabledReason::TooManyFailures),
+        "TooManyRefreshFailures" => Some(DisabledReason::TooManyRefreshFailures),
+        "QuotaExceeded" => Some(DisabledReason::QuotaExceeded),
+        "InvalidRefreshToken" => Some(DisabledReason::InvalidRefreshToken),
+        "InvalidConfig" => Some(DisabledReason::InvalidConfig),
+        _ => None,
+    }
+}
 
 /// API 调用上下文
 ///
@@ -1292,7 +1331,12 @@ impl MultiTokenManager {
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
                     disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
+                        Some(
+                            cred.disabled_reason
+                                .as_deref()
+                                .and_then(disabled_reason_from_str)
+                                .unwrap_or(DisabledReason::Manual),
+                        )
                     } else {
                         None
                     },
@@ -1321,6 +1365,16 @@ impl MultiTokenManager {
                 );
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::InvalidConfig);
+            }
+        }
+
+        // 存量迁移：旧版把 402 记作 disabled+QuotaExceeded（自愈靠余额刷新，
+        // 该链路已被冷冻机制取代）。一次性转为冷冻态，其他禁用原因不动。
+        for e in entries.iter_mut() {
+            if e.disabled && e.disabled_reason == Some(DisabledReason::QuotaExceeded) {
+                e.disabled = false;
+                e.disabled_reason = None;
+                e.credentials.frozen_until = Some(Utc::now().timestamp() + FREEZE_FALLBACK_SECS);
             }
         }
 
@@ -1602,10 +1656,15 @@ impl MultiTokenManager {
 
     pub fn available_count(&self) -> usize {
         let now = Instant::now();
+        let now_ts = Utc::now().timestamp();
         self.entries
             .lock()
             .iter()
-            .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .filter(|e| {
+                !e.disabled
+                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    && !entry_frozen(e, now_ts)
+            })
             .count()
     }
 
@@ -1652,6 +1711,7 @@ impl MultiTokenManager {
         let window = StdDuration::from_secs(RPM_WINDOW_SECS);
         let credential_support = self.credential_support.read();
         let mut earliest_retry_after = None;
+        let now_ts = Utc::now().timestamp();
 
         for entry in entries.iter().filter(|entry| {
             !entry.disabled
@@ -1659,6 +1719,7 @@ impl MultiTokenManager {
                     .throttled_until
                     .map(|until| until > now)
                     .unwrap_or(false)
+                && !entry_frozen(entry, now_ts)
                 && credential_matches_request(
                     &entry.credentials,
                     entry.id,
@@ -1774,6 +1835,7 @@ impl MultiTokenManager {
     ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
+        let now_ts = Utc::now().timestamp();
         let credential_support = self.credential_support.read();
 
         // 过滤可用凭据
@@ -1788,6 +1850,10 @@ impl MultiTokenManager {
                 }
                 // 临时冷却中（账号级 429 风控）：跳过
                 if e.throttled_until.map(|t| t > now).unwrap_or(false) {
+                    return false;
+                }
+                // 402 冷冻中：跳过（到期后惰性回池，不需要任何刷新）
+                if entry_frozen(e, now_ts) {
                     return false;
                 }
                 // 本窗口 RPM 额度已耗尽：跳过，让请求故障转移到下一个账号
@@ -1940,6 +2006,7 @@ impl MultiTokenManager {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     let now = Instant::now();
+                    let now_ts = Utc::now().timestamp();
                     let credential_support = self.credential_support.read();
                     entries
                         .iter()
@@ -1948,6 +2015,7 @@ impl MultiTokenManager {
                                 && !e.disabled
                                 && !excluded.contains_key(&e.id)
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                                && !entry_frozen(e, now_ts)
                                 && !self.rpm_exceeded(e, now)
                                 && credential_matches_request(&e.credentials, e.id, model, group, &credential_support)
                         })
@@ -2237,6 +2305,7 @@ impl MultiTokenManager {
                     cred.canonicalize_auth_method();
                     // 同步 disabled 状态到凭据对象
                     cred.disabled = e.disabled;
+                    cred.disabled_reason = e.disabled_reason.map(disabled_reason_str).map(String::from);
                     cred
                 })
                 .collect()
@@ -2486,23 +2555,30 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_success(&self, id: u64) {
-        {
+        let was_frozen = {
             let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.failure_count = 0;
-                entry.refresh_failure_count = 0;
-                entry.success_count += 1;
-                entry.last_used_at = Some(Utc::now().to_rfc3339());
-                // 成功 = 风控已解除，提前结束冷却
-                entry.throttled_until = None;
-                tracing::debug!(
-                    "凭据 #{} API 调用成功（累计 {} 次）",
-                    id,
-                    entry.success_count
-                );
-            }
-        }
+            let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+                return;
+            };
+            entry.failure_count = 0;
+            entry.refresh_failure_count = 0;
+            entry.success_count += 1;
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            // 成功 = 风控已解除，提前结束冷却
+            entry.throttled_until = None;
+            // 成功 = 额度可用，冷冻解除（含清理过期残留的时间戳）
+            let was_frozen = entry.credentials.frozen_until.take().is_some();
+            tracing::debug!(
+                "凭据 #{} API 调用成功（累计 {} 次）",
+                id,
+                entry.success_count
+            );
+            was_frozen
+        };
         self.save_stats_debounced();
+        if was_frozen {
+            let _ = self.persist_credentials();
+        }
     }
 
     /// 报告指定凭据 API 调用失败
@@ -2569,39 +2645,50 @@ impl MultiTokenManager {
     /// 报告指定凭据额度已用尽
     ///
     /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
-    /// - 立即禁用该凭据（不等待连续失败阈值）
+    /// - 402 = 可自愈状态（月度重置），进冷冻不进禁用（不再 disabled+探测自愈）
     /// - 切换到下一个可用凭据继续重试
     /// - 返回是否还有可用凭据
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
+            let now_ts = Utc::now().timestamp();
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return entries.iter().any(|e| !e.disabled && !entry_frozen(e, now_ts)),
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                return entries.iter().any(|e| !e.disabled && !entry_frozen(e, now_ts));
             }
 
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+            // 截止时间优先取余额快照的 next_reset_at（+安全余量）；
+            // dispatcher 未注入（单测）或快照缺失 → 兜底 1 小时。
+            let reset_based = self
+                .dispatcher
+                .read()
+                .as_ref()
+                .and_then(|d| d.balance_next_reset_at(id))
+                .filter(|t| *t > now_ts)
+                .map(|t| t + FREEZE_RESET_MARGIN_SECS);
+            entry.credentials.frozen_until = Some(reset_based.unwrap_or(now_ts + FREEZE_FALLBACK_SECS));
             entry.last_used_at = Some(Utc::now().to_rfc3339());
-            // 设为阈值，便于在管理面板中直观看到该凭据已不可用
-            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
             entry.total_failure_count += 1;
+            // 不再置 disabled / disabled_reason / failure_count=MAX：
+            // 面板以「冷冻中」状态呈现，不该伪装成失败爆表。
 
-            tracing::error!(
-                "凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT 或 OVERAGE_REQUEST_LIMIT_EXCEEDED），已被禁用",
-                id
+            tracing::warn!(
+                "凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT 或 OVERAGE_REQUEST_LIMIT_EXCEEDED），已冷冻至 {}",
+                id,
+                entry.credentials.frozen_until.unwrap_or_default()
             );
 
-            // 切换到优先级最高的可用凭据
+            // 切换到优先级最高的可用凭据（跳过已冷冻的，避免 current_id 指向一个
+            // 马上又会被 pick 过滤掉的凭据）
             if let Some(next) = entries
                 .iter()
-                .filter(|e| !e.disabled)
+                .filter(|e| !e.disabled && !entry_frozen(e, now_ts))
                 .min_by_key(|e| e.credentials.priority)
             {
                 *current_id = next.id;
@@ -2612,11 +2699,15 @@ impl MultiTokenManager {
                 );
                 true
             } else {
-                tracing::error!("所有凭据均已禁用！");
+                tracing::error!("所有凭据均已冷冻/禁用！");
                 false
             }
         };
         self.save_stats_debounced();
+        // frozen_until 在凭据文件而非统计文件；持久化失败打 warn 不炸请求路径。
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("持久化冷冻状态失败: {}", e);
+        }
         result
     }
 
@@ -2803,6 +2894,7 @@ impl MultiTokenManager {
                 let mut cred = e.credentials.clone();
                 cred.canonicalize_auth_method();
                 cred.disabled = e.disabled;
+                cred.disabled_reason = e.disabled_reason.map(disabled_reason_str).map(String::from);
                 cred.id = Some(e.id);
                 cred
             })
@@ -2814,9 +2906,14 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let now = Instant::now();
+        let now_ts = Utc::now().timestamp();
         let available = entries
             .iter()
-            .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .filter(|e| {
+                !e.disabled
+                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    && !entry_frozen(e, now_ts)
+            })
             .count();
 
         ManagerSnapshot {
@@ -2872,22 +2969,13 @@ impl MultiTokenManager {
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| {
-                        match r {
-                            DisabledReason::Manual => "Manual",
-                            DisabledReason::TooManyFailures => "TooManyFailures",
-                            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                            DisabledReason::QuotaExceeded => "QuotaExceeded",
-                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                            DisabledReason::InvalidConfig => "InvalidConfig",
-                        }
-                        .to_string()
-                    }),
+                    disabled_reason: e.disabled_reason.map(|r| disabled_reason_str(r).to_string()),
                     throttled_remaining_secs: e
                         .throttled_until
                         .and_then(|t| t.checked_duration_since(now))
                         .map(|d| d.as_secs())
                         .filter(|s| *s > 0),
+                    frozen_until: e.credentials.frozen_until,
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
@@ -2956,12 +3044,14 @@ impl MultiTokenManager {
             }
 
             let throttled_now = Instant::now();
+            let throttled_now_ts = Utc::now().timestamp();
             let credential_support = self.credential_support.read();
             entries
                 .iter()
                 .filter(|e| {
                     !e.disabled
                         && !e.throttled_until.map(|t| t > throttled_now).unwrap_or(false)
+                        && !entry_frozen(e, throttled_now_ts)
                         && credential_matches_request(&e.credentials, e.id, model, group, &credential_support)
                 })
                 .count()
@@ -2980,6 +3070,31 @@ impl MultiTokenManager {
         entry.throttled_until = None;
         tracing::info!("凭据 #{} 风控冷却已被手动解除", id);
         Ok(())
+    }
+
+    /// 人工立即解冻（面板动作）。只清冷冻，不碰 disabled。
+    pub fn clear_freeze(&self, id: u64) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.frozen_until = None;
+            tracing::info!("凭据 #{} 冷冻已被手动解除", id);
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 测试专用：直接设置内存中的冷冻截止时间，不落盘。用于构造「冷冻已到期」
+    /// 场景，避免测试真实等待或依赖时钟穿越。
+    #[cfg(test)]
+    pub fn set_frozen_until_for_test(&self, id: u64, frozen_until: Option<i64>) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.credentials.frozen_until = frozen_until;
+        }
     }
 
     /// 以"额度已用尽"为原因禁用凭据（Admin 一键超额功能）
@@ -4155,14 +4270,17 @@ impl crate::anthropic::model_sync::ModelListFetcher for MultiTokenManager {
 /// 采样轮照样会选到冷却中、或 refreshToken 已失效的凭据，白发一次注定失败的
 /// 上游请求，还挤掉一个真能返回数据的名额。抽成同一个 helper，杜绝再次漂移。
 ///
-/// 三条判据的由来（spec §6.2）：
+/// 三条判据的由来（spec §6.2），外加冷冻态（402 冷冻改造时补齐的第五处，
+/// 这里此前只查 `!disabled`，同样会让模型同步选到冷冻中注定失败的凭据）：
 /// - `disabled`：人工或自动下线的凭据本就不参与轮换。
 /// - `throttled_until`：账号级 429 风控冷却窗口，字段注释即写明「视为不可用」。
+/// - `frozen_until`：402 冷冻期内同样不可用，到期前不该被选去拉模型列表。
 /// - refreshToken 可用性：refreshToken 失效（但尚未触发自动禁用阈值）的凭据
 ///   拉取必然失败；API Key 凭据不走刷新流程，豁免这一条。
 fn sync_credential_is_usable(entry: &CredentialEntry, now: Instant) -> bool {
     !entry.disabled
         && !entry.throttled_until.map(|t| t > now).unwrap_or(false)
+        && !entry_frozen(entry, Utc::now().timestamp())
         && (entry.credentials.is_api_key_credential()
             || validate_refresh_token(&entry.credentials).is_ok())
 }
@@ -4885,26 +5003,85 @@ mod tests {
         );
     }
 
-    /// 契约守卫（M3）：`report_quota_exhausted` 写入的 `DisabledReason::QuotaExceeded`
-    /// 经 `snapshot()` 序列化后必须仍是字面量字符串 `"QuotaExceeded"`——
-    /// `src/admin/service.rs` 里的 quota 自愈探测逻辑（是否继续探测被禁用账号）
-    /// 靠字符串比较这个值，两边今天靠手写 match 对齐，没有共享类型或编译期检查。
-    /// 若日后这里改成 serde 派生（如变成 `quota_exceeded`）或改名，该测试必须先变红。
-    #[test]
-    fn quota_exhausted_snapshot_disabled_reason_is_quota_exceeded_literal() {
+    /// 402 不再禁用而是冷冻：到期前不可调度，到期后无需任何刷新即自然回池。
+    #[tokio::test]
+    async fn quota_exhausted_freezes_instead_of_disabling() {
         let config = Config::default();
-        let manager =
-            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-                .unwrap();
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("a".repeat(150));
+        let mut c2 = KiroCredentials::default();
+        c2.refresh_token = Some("b".repeat(150));
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
 
-        // 返回值语义是「禁用后是否还有其它可用凭据」，与本测试无关（此处只有
-        // 一条凭据，禁用后自然无可用，返回值恒为 false）——这里只关心
-        // disabled_reason 落盘后的字面量。
+        // 402：无 dispatcher（None）→ 走兜底 now+3600
+        let has_available = manager.report_quota_exhausted(1);
+        assert!(has_available, "另一张凭据仍可用");
+        let snap = manager.snapshot();
+        let e1 = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!e1.disabled, "402 不得再置 disabled");
+        let fu = e1.frozen_until.expect("必须写入 frozen_until");
+        let now = chrono::Utc::now().timestamp();
+        assert!((fu - now - 3600).abs() <= 5, "兜底应为 now+3600±5s，实际 {}", fu - now);
+
+        // 冷冻中不可被选中：选号只剩凭据 2
+        let picked = manager.select_next_credential(None, None);
+        assert_eq!(picked.map(|(id, _)| id), Some(2), "冷冻中的凭据 1 不应被选中");
+
+        // 到期自然回池：把 frozen_until 改到过去
+        manager.set_frozen_until_for_test(1, Some(now - 10));
+        let snap = manager.snapshot();
+        let e1 = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(e1.frozen_until.is_some(), "过期时间戳保留（成功请求才清）");
+        // 断言选号过滤视其为可调度：现在两张凭据都可能被选中
+        let ids: std::collections::HashSet<_> = (0..10)
+            .filter_map(|_| manager.select_next_credential(None, None).map(|(id, _)| id))
+            .collect();
+        assert!(ids.contains(&1), "冷冻到期后应重新参与调度");
+
+        // 成功请求清冻结
+        manager.report_success(1);
+        let snap = manager.snapshot();
+        assert!(snap.entries.iter().find(|e| e.id == 1).unwrap().frozen_until.is_none());
+    }
+
+    /// 再次 402 是覆盖式重冻：新时间戳整体替换，不叠加。
+    #[tokio::test]
+    async fn refreeze_overwrites_deadline() {
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("a".repeat(150));
+        let manager = MultiTokenManager::new(config, vec![c1], None, None, false).unwrap();
         manager.report_quota_exhausted(1);
+        let first = manager.snapshot().entries[0].frozen_until.unwrap();
+        manager.set_frozen_until_for_test(1, Some(chrono::Utc::now().timestamp() - 10));
+        manager.report_quota_exhausted(1);
+        let second = manager.snapshot().entries[0].frozen_until.unwrap();
+        // 注：与 brief 字面量的偏差——原断言 `second > first` 在秒级时间戳下，
+        // 若两次 report_quota_exhausted 落在同一 wall-clock 秒（本机测试恒如此），
+        // 会必然失败，并非真实回归信号。真正要防的回归是「重冻没有重新计算，
+        // 沿用了被测试手动改到过去的旧值」——此时 second 会等于人为设置的
+        // `now - 10`，明显小于 first，故用 `>=` 既保留探测能力又消除该假阴性。
+        assert!(second >= first, "重冻必须重新计算，不是沿用旧值");
+    }
 
-        let snapshot = manager.snapshot();
-        let entry = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
-        assert_eq!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
+    /// 存量迁移：加载时 disabled+QuotaExceeded → 冷冻态。
+    #[test]
+    fn legacy_quota_disabled_migrates_to_frozen_on_load() {
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("a".repeat(150));
+        c1.disabled = true;
+        c1.disabled_reason = Some("QuotaExceeded".to_string());
+        let mut c2 = KiroCredentials::default();
+        c2.refresh_token = Some("b".repeat(150));
+        c2.disabled = true;
+        c2.disabled_reason = Some("Manual".to_string());
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+        let snap = manager.snapshot();
+        let e1 = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!e1.disabled && e1.frozen_until.is_some(), "QuotaExceeded 禁用应转冷冻");
+        let e2 = snap.entries.iter().find(|e| e.id == 2).unwrap();
+        assert!(e2.disabled && e2.frozen_until.is_none(), "其他禁用原因不动");
     }
 
     #[test]
@@ -4953,18 +5130,10 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
     }
 
-    #[test]
-    fn quota_disabled_credential_is_reenabled_after_reset() {
-        let manager = test_manager_with_two_credentials();
-        manager.report_quota_exhausted(1);
-        assert!(manager.snapshot().entries.iter().any(|e| e.id == 1 && e.disabled));
-
-        // 上游返回了新周期的余额（remaining 恢复），应自动解除 QuotaExceeded 禁用
-        manager.clear_quota_disable_if_replenished(1, 9000.0);
-        let s = manager.snapshot();
-        let e = s.entries.iter().find(|e| e.id == 1).unwrap();
-        assert!(!e.disabled, "月度重置后 quota 禁用应自动解除");
-    }
+    // 注：原 `quota_disabled_credential_is_reenabled_after_reset` 测试的前提
+    // （quota 耗尽 = disabled）已被本轮冷冻改造取代，删除。「额度恢复提前解冻」
+    // 的等价覆盖在 Task 2 把 `clear_quota_disable_if_replenished` 改造为
+    // `thaw_if_replenished`（冷冻语义）时补上，不在此处留空窗。
 
     #[test]
     fn reenable_does_not_touch_other_disable_reasons() {

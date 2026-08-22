@@ -94,6 +94,17 @@ impl GroupDispatcher {
         }
     }
 
+    /// 读某凭据余额快照里的 next_reset_at（epoch 秒）。无快照或无该字段返回 None。
+    /// 供 402 冷冻计算截止时间；只读，不触发刷新。
+    pub fn balance_next_reset_at(&self, cred_id: u64) -> Option<i64> {
+        self.balance
+            .snapshot()
+            .entries
+            .get(&cred_id)
+            .and_then(|c| c.data.next_reset_at)
+            .map(|t| t as i64)
+    }
+
     pub fn report_consumption(&self, group: Option<&str>, cred_id: u64, credits: f64) {
         if !credits.is_finite() || credits <= 0.0 {
             return;
