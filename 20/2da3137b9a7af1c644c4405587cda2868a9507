@@ -1,0 +1,28 @@
+src/admin/service.rs
+  s_93ed41df2ed7dd::t_5ab951804e7870 5225,5227-5234
+admin-ui/src/components/batch-assign-proxy-dialog.tsx
+  s_93ed41df2ed7dd::t_18f9df8903a302 156-157
+  s_93ed41df2ed7dd::t_0cac7eff401f7d 48-52,56
+  s_93ed41df2ed7dd::t_1865c7a27721ec 133-140
+  s_93ed41df2ed7dd::t_552bd219d60a72 89,96
+admin-ui/src/lib/batch-assign-proxy.ts
+  s_93ed41df2ed7dd::t_aab8432a4cc804 54-60,65,67
+admin-ui/tests/batch-assign-proxy.test.ts
+  s_93ed41df2ed7dd::t_f94a52bc06d3c1 40-41,43-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "202da3137b9a7af1c644c4405587cda2868a9507",
+  "prompts": {},
+  "sessions": {
+    "s_93ed41df2ed7dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0320419c-c65b-4bb6-b256-7da69554742d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
