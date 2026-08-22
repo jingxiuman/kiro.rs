@@ -428,6 +428,14 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
         || (requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id))
     {
         EffortTier::High
+    } else if requested == EffortTier::Max && model_uses_gpt_reasoning_effort(model_id) {
+        // GPT 家族走 additionalModelRequestFields.reasoning.effort，遵循 OpenAI
+        // 惯例只有 none/low/medium/high/xhigh，wire 上没有 max 档；原样透传会被
+        // 上游 400 拒绝，进而触发「剥字段重试」把 effort 整个丢掉。降到该家族支持
+        // 的最高档 xhigh（而非 high），以保留尽量高的推理强度。
+        // Claude 家族的 max 是实测有效档位（见 kiro/model/requests/kiro.rs 的
+        // low↔max 5 倍差异阶梯实验记录），不受此规则影响，原样保留。
+        EffortTier::XHigh
     } else {
         requested
     };
@@ -2243,6 +2251,27 @@ mod tests {
             fields.output_config.unwrap().effort,
             "max",
             "effort should be normalized before being sent to upstream"
+        );
+    }
+
+    /// GPT 家族 wire（reasoning.effort）无 max 档：透传会 400→剥字段→effort 全丢，
+    /// 必须降到该家族支持的最高档 xhigh。Claude 家族的 max 是实测有效档位，不受影响
+    /// （Claude 侧行为由 test_output_config_normalizes_effort_case_and_spacing 钉住）。
+    #[test]
+    fn max_effort_downgrades_to_xhigh_only_for_gpt_family() {
+        assert_eq!(
+            normalize_effort_for_model("gpt-5.6-sol", "max").as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            normalize_effort_for_model("gpt-5.9-nova", "MAX ").as_deref(),
+            Some("xhigh"),
+            "前缀家族判定 + 大小写归一化都要生效"
+        );
+        assert_eq!(
+            normalize_effort_for_model("claude-opus-4.7", "max").as_deref(),
+            Some("max"),
+            "Claude 家族的 max 必须原样保留"
         );
     }
 
