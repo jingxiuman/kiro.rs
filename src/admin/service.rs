@@ -862,6 +862,13 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    /// 人工立即解冻（面板动作）。只清冷冻，不碰 disabled。
+    pub fn clear_freeze(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .clear_freeze(id)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
     pub fn reset_success_count(&self, id: Option<u64>) -> Result<u32, AdminServiceError> {
         self.token_manager
             .reset_success_count(id)

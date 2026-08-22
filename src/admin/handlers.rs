@@ -134,6 +134,18 @@ pub async fn clear_throttle(
     }
 }
 
+/// POST /api/admin/credentials/:id/unfreeze
+/// 人工立即解冻（面板动作）。正路是冷冻到期惰性回池，本端点是提前解冻的手动兜底。
+pub async fn unfreeze_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.clear_freeze(id) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已解冻", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/credentials/:id/balance
 /// 获取指定凭据的余额
 pub async fn get_credential_balance(
@@ -2218,5 +2230,34 @@ mod tests {
             batch_assign_error_response(BatchAssignError::Internal("凭据落盘失败: x".to_string()));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.0["error"], "凭据落盘失败: x");
+    }
+
+    /// 契约测试：快照结构是 `#[serde(rename_all = "camelCase")]`
+    /// （`CredentialEntrySnapshot`），`frozen_until` 必须序列化为 `frozenUntil`。
+    /// 前端（admin-ui）按这个字面量读取冷冻状态，Rust 侧改名/改 case 会静默
+    /// 断掉前端而不报错——用字面量断言把这条隐式契约钉死。
+    #[test]
+    fn credential_entry_snapshot_frozen_until_serializes_camel_case() {
+        let config = crate::model::config::Config::default();
+        let mut cred = crate::kiro::model::credentials::KiroCredentials::default();
+        cred.disabled = true;
+        cred.disabled_reason = Some("QuotaExceeded".to_string());
+        let manager = crate::kiro::token_manager::MultiTokenManager::new(
+            config,
+            vec![cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 存量迁移会把 QuotaExceeded 禁用转成冷冻，frozen_until 必为 Some。
+        let snap = manager.snapshot();
+        let v = serde_json::to_value(&snap).unwrap();
+        let entry = &v["entries"][0];
+        assert!(
+            entry.get("frozenUntil").is_some(),
+            "frozen_until 必须序列化为 frozenUntil（camelCase）: {entry}"
+        );
+        assert!(entry["frozenUntil"].is_i64(), "frozenUntil 应为 epoch 秒整数: {entry}");
     }
 }
