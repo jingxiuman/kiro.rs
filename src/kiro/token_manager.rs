@@ -1180,6 +1180,54 @@ fn entry_enabled_unfrozen(e: &CredentialEntry, now_ts: i64) -> bool {
     !e.disabled && !entry_frozen(e, now_ts)
 }
 
+/// 「一个凭据都调度不出来」的统一错误文案：按不可调度的原因分类计数，
+/// 冷冻数 > 0 时附带最早解冻的本地时间。
+///
+/// 为什么分类而不是只数 `!disabled`：三张凭据全被 402 冷冻时，旧文案会打出
+/// 「所有凭据均已禁用（3/3）」——可用数等于总数却说全禁用，自相矛盾；且它与
+/// 「真·全禁用」共用同一个 ops 指纹，而两者的处置动作完全相反（等一等 vs
+/// 人工介入）。
+///
+/// 归类**互斥且有优先级**（禁用 > 冷冻 > 冷却），保证 `D + F + T ≤ N`。
+/// `total` 由调用方传入（来自 `total_count_in_group`），与这里的 `group`
+/// 过滤必须同口径——早先两者口径不一致时打出过 "9/1" 这种可用数大于总数的
+/// 消息，把「该组内凭据都不可用」误报成全局状态。
+///
+/// 抽成自由函数而非方法：两个调用点里有一个已经持有 `entries` 锁，走
+/// `&self` 再去拿锁会死锁。
+fn unschedulable_message(
+    entries: &[CredentialEntry],
+    group: Option<&str>,
+    total: usize,
+    now: Instant,
+    now_ts: i64,
+) -> String {
+    let (mut disabled_n, mut frozen_n, mut throttled_n) = (0usize, 0usize, 0usize);
+    let mut earliest_thaw: Option<i64> = None;
+    for e in entries
+        .iter()
+        .filter(|e| group_matches(&e.credentials.groups, group))
+    {
+        if e.disabled {
+            disabled_n += 1;
+        } else if entry_frozen(e, now_ts) {
+            frozen_n += 1;
+            if let Some(t) = e.credentials.frozen_until {
+                earliest_thaw = Some(earliest_thaw.map_or(t, |cur: i64| cur.min(t)));
+            }
+        } else if e.throttled_until.map(|t| t > now).unwrap_or(false) {
+            throttled_n += 1;
+        }
+    }
+    let thaw_hint = earliest_thaw
+        .map(|t| format!("，最早解冻 {}", format_local_ts(t)))
+        .unwrap_or_default();
+    format!(
+        "所有凭据不可调度（禁用 {} / 冷冻 {} / 冷却 {}，共 {}）{}",
+        disabled_n, frozen_n, throttled_n, total, thaw_hint
+    )
+}
+
 /// `DisabledReason` <-> 持久化字符串的双向映射，供快照序列化、`KiroCredentials`
 /// 落盘/加载复用，避免多处手写 match 各自漂移。
 fn disabled_reason_str(r: DisabledReason) -> &'static str {
@@ -2127,41 +2175,16 @@ impl MultiTokenManager {
                         // （实测日志里出现过），把「该组内的凭据都被禁用」误报成
                         // 全局状态，掩盖真实原因。
                         //
-                        // 分类计数而不是只数 `!disabled`：三张凭据全被 402 冷冻时，
-                        // 旧文案会打出「所有凭据均已禁用（3/3）」——可用数等于总数
-                        // 却说全禁用，自相矛盾；且 ops 指纹与「真·全禁用」合并，
-                        // 两种处置动作完全不同的故障看起来是同一条。
-                        // 归类互斥且有优先级（禁用 > 冷冻 > 冷却），保证 D+F+T ≤ N。
-                        let now = Instant::now();
-                        let now_ts = Utc::now().timestamp();
-                        let (mut disabled_n, mut frozen_n, mut throttled_n) = (0usize, 0usize, 0usize);
-                        let mut earliest_thaw: Option<i64> = None;
-                        for e in entries
-                            .iter()
-                            .filter(|e| group_matches(&e.credentials.groups, group))
-                        {
-                            if e.disabled {
-                                disabled_n += 1;
-                            } else if entry_frozen(e, now_ts) {
-                                frozen_n += 1;
-                                if let Some(t) = e.credentials.frozen_until {
-                                    earliest_thaw =
-                                        Some(earliest_thaw.map_or(t, |cur: i64| cur.min(t)));
-                                }
-                            } else if e.throttled_until.map(|t| t > now).unwrap_or(false) {
-                                throttled_n += 1;
-                            }
-                        }
-                        let thaw_hint = earliest_thaw
-                            .map(|t| format!("，最早解冻 {}", format_local_ts(t)))
-                            .unwrap_or_default();
+                        // 分类计数见 [`unschedulable_message`]。
                         anyhow::bail!(
-                            "所有凭据不可调度（禁用 {} / 冷冻 {} / 冷却 {}，共 {}）{}",
-                            disabled_n,
-                            frozen_n,
-                            throttled_n,
-                            total,
-                            thaw_hint
+                            "{}",
+                            unschedulable_message(
+                                &entries,
+                                group,
+                                total,
+                                Instant::now(),
+                                Utc::now().timestamp()
+                            )
                         );
                     }
                 }
@@ -2194,7 +2217,25 @@ impl MultiTokenManager {
                         TokenRefreshErrorAction::Recorded { has_available } => {
                             attempt_count += 1;
                             if !has_available {
-                                anyhow::bail!("所有凭据均已禁用（0/{}）", total);
+                                // 与选号路径共用同一条文案：这里原本硬编码
+                                // 「所有凭据均已禁用（0/N）」，而自从
+                                // report_refresh_failure / report_refresh_token_invalid
+                                // 改成冷冻感知，「剩下的号全冷冻」也会走到这里——
+                                // 同一个故障会按「是否顺带撞上 token 刷新失败」
+                                // 分裂成两个 ops 指纹，其中旧文案那半还会被归一
+                                // 进「所有凭据均已禁用（N/N）」这个要人工介入的
+                                // 旧桶，把 I2 的指纹分离抵消掉一半。
+                                let msg = {
+                                    let entries = self.entries.lock();
+                                    unschedulable_message(
+                                        &entries,
+                                        group,
+                                        total,
+                                        Instant::now(),
+                                        Utc::now().timestamp(),
+                                    )
+                                };
+                                anyhow::bail!("{}", msg);
                             }
                         }
                     }
@@ -5023,6 +5064,28 @@ mod tests {
 
     /// 两个可用凭据：A（priority=1，优先级赢家）、B（priority=2）。
     /// 都带有效 access_token，不 disabled、不 throttled。
+    /// 两条**没有任何 token** 的凭据：`try_ensure_token` 会在本地校验阶段就
+    /// 失败（不碰网络），用于走 token 刷新失败的故障转移路径。
+    fn test_manager_with_two_credentials_without_tokens() -> MultiTokenManager {
+        MultiTokenManager::new(
+            Config::default(),
+            vec![
+                KiroCredentials {
+                    priority: 1,
+                    ..Default::default()
+                },
+                KiroCredentials {
+                    priority: 2,
+                    ..Default::default()
+                },
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap()
+    }
+
     fn test_manager_with_two_credentials() -> MultiTokenManager {
         let config = Config::default();
 
@@ -5290,6 +5353,71 @@ mod tests {
                  不得只在 weighted 分支里触发"
             );
         }
+    }
+
+    /// I2 补漏：**token 刷新失败**路径的「一个号都调度不出来」文案必须与选号
+    /// 路径同源。
+    ///
+    /// 这条路径此前硬编码 `所有凭据均已禁用（0/N）`。在 I3 把
+    /// `report_refresh_failure` / `report_refresh_token_invalid` 改成冷冻感知
+    /// 之后，「剩下的号全冷冻」也会让它们返回 `has_available=false`，于是同一个
+    /// 故障（全员不可调度）会按「是否顺带撞上 token 刷新失败」分裂成两个 ops
+    /// 指纹，而旧文案那一半还会被 `normalize_error_message` 归一进
+    /// 「所有凭据均已禁用（N/N）」这个**要人工介入**的旧桶。
+    ///
+    /// 构造：凭据 2 冷冻（选不中），凭据 1 没有 refreshToken → 每次
+    /// `try_ensure_token` 都在本地校验阶段失败（不碰网络），累计到阈值后被禁用，
+    /// 此时 `has_available=false`，命中该 bail。
+    #[tokio::test]
+    async fn token_refresh_exhaustion_message_is_classified_too() {
+        let manager = test_manager_with_two_credentials_without_tokens();
+        manager.set_frozen_until_for_test(2, Some(Utc::now().timestamp() + 3600));
+
+        let err = manager
+            .acquire_context(None, None)
+            .await
+            .err()
+            .expect("凭据 1 拿不到 token、凭据 2 冷冻，必须失败")
+            .to_string();
+
+        assert!(
+            !err.contains("所有凭据均已禁用"),
+            "不得再出现旧文案（会与真·全禁用共用 ops 指纹），实际: {}",
+            err
+        );
+        assert!(
+            err.contains("所有凭据不可调度（禁用 1 / 冷冻 1 / 冷却 0，共 2）"),
+            "应与选号路径同源的分类计数，实际: {}",
+            err
+        );
+        assert!(
+            err.contains("最早解冻"),
+            "冷冻数 > 0 时应附带最早解冻时间，实际: {}",
+            err
+        );
+    }
+
+    /// 分类计数本身的单测：归类互斥且有优先级（禁用 > 冷冻 > 冷却），
+    /// 保证 D + F + T ≤ N；同时钉住 group 过滤口径。
+    #[test]
+    fn unschedulable_message_classifies_exclusively() {
+        let manager = test_manager_with_two_credentials();
+        let now_ts = Utc::now().timestamp();
+        // 同时被禁用与冷冻的凭据只能记一次，且记在优先级更高的「禁用」一档。
+        manager.set_disabled(1, true).unwrap();
+        manager.set_frozen_until_for_test(1, Some(now_ts + 3600));
+        manager.set_frozen_until_for_test(2, Some(now_ts + 7200));
+
+        let entries = manager.entries.lock();
+        let msg = unschedulable_message(&entries, None, 2, Instant::now(), now_ts);
+        assert!(
+            msg.contains("所有凭据不可调度（禁用 1 / 冷冻 1 / 冷却 0，共 2）"),
+            "禁用+冷冻的凭据不得被重复计数，实际: {}",
+            msg
+        );
+        // 最早解冻取的是仍处于「冷冻」一档的凭据 2（now+7200），
+        // 被归入禁用档的凭据 1 不参与。
+        assert!(msg.contains("最早解冻"), "实际: {}", msg);
     }
 
     /// I3 守卫：故障转移的「是否还有可用凭据」判断必须感知冷冻。
