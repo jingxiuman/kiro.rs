@@ -417,13 +417,16 @@ pub struct ModelTestResponse {
 
 // ============ 一键超额 ============
 
-/// 一键超额禁用结果
+/// 一键超额处理结果。
+///
+/// 字段名保留 `disabledIds`（面板已依赖）；语义自 0.9.17 起是「已被冷冻」——
+/// 一键超额与 402 同走冷冻，不再置 `disabled`。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaExceededResult {
-    /// 已被禁用的凭据 ID 列表
+    /// 本次被冷冻的凭据 ID 列表
     pub disabled_ids: Vec<u64>,
-    /// 跳过的凭据 ID 列表（如禁用失败、缓存缺失等）
+    /// 跳过的凭据 ID 列表（如冷冻失败、缓存缺失等）
     pub skipped_ids: Vec<u64>,
 }
 

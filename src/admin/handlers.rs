@@ -171,7 +171,8 @@ pub async fn get_credential_models(
 }
 
 /// POST /api/admin/credentials/disable-quota-exceeded
-/// 一键禁用所有"已超额"凭据（remaining ≤ 0 或 usage_percentage ≥ 100）
+/// 一键**冷冻**所有"已超额"凭据（remaining ≤ 0 或 usage_percentage ≥ 100）。
+/// 路由名保持 `disable-*` 是对外契约，实际写的是 `frozen_until`（不再 disabled）。
 pub async fn disable_quota_exceeded(State(state): State<AdminState>) -> impl IntoResponse {
     let result = state.service.disable_quota_exceeded();
     Json(result).into_response()

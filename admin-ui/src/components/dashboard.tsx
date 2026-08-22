@@ -880,7 +880,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     });
   };
 
-  // 一键超额：把所有已超额（未禁用）凭据标记为 QuotaExceeded 并禁用
+  // 一键超额：把所有已超额（未禁用）凭据冷冻（0.9.17 起与 402 同语义，
+  // 写 frozen_until 而非 disabled；到冷冻期满自动回池，无需人工重新启用）
   const [disablingQuota, setDisablingQuota] = useState(false);
   const handleDisableQuotaExceeded = async () => {
     if (quotaExceededCount === 0) {
@@ -889,9 +890,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
     if (
       !(await confirm({
-        title: "禁用已超额凭据",
-        description: `确定要把 ${quotaExceededCount} 个已超额的凭据全部禁用吗？`,
-        confirmText: "禁用",
+        title: "冷冻已超额凭据",
+        description: `确定要把 ${quotaExceededCount} 个已超额的凭据全部冷冻吗？冷冻期满会自动恢复调度。`,
+        confirmText: "冷冻",
         destructive: true,
       }))
     )
@@ -903,7 +904,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       const skip = res.skippedIds?.length || 0;
       if (ok > 0)
         toast.success(
-          `已禁用 ${ok} 个已超额凭据${skip > 0 ? `，跳过 ${skip} 个` : ""}`,
+          `已冷冻 ${ok} 个已超额凭据${skip > 0 ? `，跳过 ${skip} 个` : ""}`,
         );
       else toast.warning("未找到已超额凭据（缓存可能已失效）");
       queryClient.invalidateQueries({ queryKey: ["credentials"] });
@@ -1730,7 +1731,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     }}
                   >
                     <AlertTriangle />
-                    一键超额禁用 ({quotaExceededCount})
+                    一键超额冷冻 ({quotaExceededCount})
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     destructive

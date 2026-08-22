@@ -774,10 +774,15 @@ impl AdminService {
         }
     }
 
-    /// 一键禁用所有"已超额"的凭据（remaining ≤ 0 或 usage_percentage ≥ 100）
+    /// 一键**冷冻**所有"已超额"的凭据（remaining ≤ 0 或 usage_percentage ≥ 100）
     ///
     /// 数据来源是 `balance_cache`，所以前端在调用前最好先触发一次"查询信息"
-    /// 或等待后台调度器完成首次刷新。返回 (禁用数量, 跳过数量, 已超额未禁用名单)。
+    /// 或等待后台调度器完成首次刷新。
+    ///
+    /// 语义已随 402 冷冻改造对齐：不再置 `disabled`，而是写 `frozen_until`
+    /// （见 [`crate::kiro::token_manager::MultiTokenManager::freeze_quota_exceeded`]）。
+    /// 方法名与路由 `/credentials/disable-quota-exceeded`、响应字段 `disabledIds`
+    /// 是对外契约，为不破坏面板/脚本保持原样，含义按"本次处理的凭据"读。
     pub fn disable_quota_exceeded(&self) -> QuotaExceededResult {
         let snapshot = self.token_manager.snapshot();
         let current_id = snapshot.current_id;
@@ -801,7 +806,7 @@ impl AdminService {
             if !exceeded {
                 continue;
             }
-            match self.token_manager.disable_quota_exceeded(entry.id) {
+            match self.token_manager.freeze_quota_exceeded(entry.id) {
                 Ok(()) => {
                     disabled_ids.push(entry.id);
                     if entry.id == current_id {
@@ -809,7 +814,7 @@ impl AdminService {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("一键超额：禁用凭据 #{} 失败: {}", entry.id, e);
+                    tracing::warn!("一键超额：冷冻凭据 #{} 失败: {}", entry.id, e);
                     skipped_ids.push(entry.id);
                 }
             }

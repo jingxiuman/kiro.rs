@@ -1133,10 +1133,39 @@ const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 const FREEZE_FALLBACK_SECS: i64 = 3600;
 /// next_reset_at 的安全余量：上游重置生效可能滞后于时间戳本身。
 const FREEZE_RESET_MARGIN_SECS: i64 = 300;
+/// 冷冻截止的上界（35 天 = 月度重置周期 + 余量）。
+const FREEZE_MAX_HORIZON_SECS: i64 = 35 * 86400;
+
+/// 冷冻截止统一钳制上界：防上游 `next_reset_at` 的时间戳量纲变化（秒→毫秒）
+/// 或脏数据把凭据冻到天荒地老——那是一种没有告警、只表现为「这张号再也不
+/// 被选中」的静默失效。所有写 `frozen_until` 的路径都必须过这里。
+fn clamp_freeze_deadline(deadline: i64, now_ts: i64) -> i64 {
+    deadline.min(now_ts + FREEZE_MAX_HORIZON_SECS)
+}
 
 /// 冷冻判定：与 throttled_until 同构的惰性比较，到期即视为可调度，无需写回。
 fn entry_frozen(e: &CredentialEntry, now_ts: i64) -> bool {
-    e.credentials.frozen_until.is_some_and(|t| now_ts > 0 && now_ts < t)
+    e.credentials.frozen_until.is_some_and(|t| now_ts < t)
+}
+
+/// 统一可调度判据：未禁用 + 未风控冷却 + 未 402 冷冻。
+///
+/// 存在的理由是「漏一处就静默退化」——这三个条件此前在十余处站点各自手写，
+/// 冷冻改造时漏了其中八处（终审发现），表现为已冷冻的凭据仍被当作可用去做
+/// 「是否还有可用凭据」的判断。注意本函数**不含** RPM 窗口与模型/分组匹配：
+/// 那两项依赖 `&self` 与请求上下文，且部分站点刻意不查。
+fn entry_schedulable(e: &CredentialEntry, now: Instant, now_ts: i64) -> bool {
+    !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false) && !entry_frozen(e, now_ts)
+}
+
+/// [`entry_schedulable`] 去掉风控冷却那一项：「未禁用且未冷冻」。
+///
+/// 给的是故障转移里「是否还有别的号可以重试」这类判断——它们原本就刻意不看
+/// `throttled_until`（账号级 429 冷却是几十秒到半小时自愈的临时状态，把它算作
+/// 「没号了」会把可重试的请求提前判死）。本轮统一判据时按站点逐条核对后保留
+/// 了各自原有的 throttled 语义，故拆成两个函数而不是一个带开关的。
+fn entry_enabled_unfrozen(e: &CredentialEntry, now_ts: i64) -> bool {
+    !e.disabled && !entry_frozen(e, now_ts)
 }
 
 /// `DisabledReason` <-> 持久化字符串的双向映射，供快照序列化、`KiroCredentials`
@@ -1368,13 +1397,26 @@ impl MultiTokenManager {
             }
         }
 
-        // 存量迁移：旧版把 402 记作 disabled+QuotaExceeded（自愈靠余额刷新，
-        // 该链路已被冷冻机制取代）。一次性转为冷冻态，其他禁用原因不动。
+        // 存量迁移：把 `disabled + QuotaExceeded` 一次性转为冷冻态，其他禁用
+        // 原因不动。
+        //
+        // **覆盖范围要如实理解**：`disabledReason` 是本轮（0.9.17）才开始
+        // 持久化的字段，0.9.16 及更早的 credentials.json 里根本没有它——那些
+        // 文件读出来的 reason 一律是 `Manual`，走不到这个分支。也就是说
+        // 真实的 0.9.16→0.9.17 升级路径上，本迁移的覆盖率是 0。
+        // （这不是行为回归：旧版本的 reason 本来就只活在内存里，重启后旧的
+        // 刷新自愈链路同样救不回被 402 禁用过的凭据。）
+        //
+        // 保留它的理由只剩两条：① 吃掉 C2 修复前那个版本的「一键超额」写出
+        // 的持久化 QuotaExceeded 数据；② 手工编辑或未来其它路径若再写出同形
+        // 数据，仍能被自动拉回冷冻语义而不是卡成死禁用。
+        let now_ts = Utc::now().timestamp();
         for e in entries.iter_mut() {
             if e.disabled && e.disabled_reason == Some(DisabledReason::QuotaExceeded) {
                 e.disabled = false;
                 e.disabled_reason = None;
-                e.credentials.frozen_until = Some(Utc::now().timestamp() + FREEZE_FALLBACK_SECS);
+                e.credentials.frozen_until =
+                    Some(clamp_freeze_deadline(now_ts + FREEZE_FALLBACK_SECS, now_ts));
             }
         }
 
@@ -2642,6 +2684,24 @@ impl MultiTokenManager {
         result
     }
 
+    /// 402 冷冻截止时间的统一算法（[`Self::report_quota_exhausted`] 与
+    /// [`Self::freeze_quota_exceeded`] 共用）：优先取余额快照的 `next_reset_at`
+    /// 加安全余量；dispatcher 未注入（单测）、快照缺失或时间戳已过期时兜底
+    /// 冻 1 小时。结果统一过 [`clamp_freeze_deadline`] 钳上界。
+    fn freeze_deadline_for(&self, id: u64, now_ts: i64) -> i64 {
+        let reset_based = self
+            .dispatcher
+            .read()
+            .as_ref()
+            .and_then(|d| d.balance_next_reset_at(id))
+            .filter(|t| *t > now_ts)
+            .map(|t| t + FREEZE_RESET_MARGIN_SECS);
+        clamp_freeze_deadline(
+            reset_based.unwrap_or(now_ts + FREEZE_FALLBACK_SECS),
+            now_ts,
+        )
+    }
+
     /// 报告指定凭据额度已用尽
     ///
     /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
@@ -2649,30 +2709,24 @@ impl MultiTokenManager {
     /// - 切换到下一个可用凭据继续重试
     /// - 返回是否还有可用凭据
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
+        let now_ts = Utc::now().timestamp();
+        // 先算截止时间再上锁：`freeze_deadline_for` 会取 `dispatcher` 读锁并
+        // 读余额快照，没必要压在 entries 锁里。
+        let deadline = self.freeze_deadline_for(id, now_ts);
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
-            let now_ts = Utc::now().timestamp();
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled && !entry_frozen(e, now_ts)),
+                None => return entries.iter().any(|e| entry_enabled_unfrozen(e, now_ts)),
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled && !entry_frozen(e, now_ts));
+                return entries.iter().any(|e| entry_enabled_unfrozen(e, now_ts));
             }
 
-            // 截止时间优先取余额快照的 next_reset_at（+安全余量）；
-            // dispatcher 未注入（单测）或快照缺失 → 兜底 1 小时。
-            let reset_based = self
-                .dispatcher
-                .read()
-                .as_ref()
-                .and_then(|d| d.balance_next_reset_at(id))
-                .filter(|t| *t > now_ts)
-                .map(|t| t + FREEZE_RESET_MARGIN_SECS);
-            entry.credentials.frozen_until = Some(reset_based.unwrap_or(now_ts + FREEZE_FALLBACK_SECS));
+            entry.credentials.frozen_until = Some(deadline);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.total_failure_count += 1;
             // 不再置 disabled / disabled_reason / failure_count=MAX：
@@ -2688,7 +2742,7 @@ impl MultiTokenManager {
             // 马上又会被 pick 过滤掉的凭据）
             if let Some(next) = entries
                 .iter()
-                .filter(|e| !e.disabled && !entry_frozen(e, now_ts))
+                .filter(|e| entry_enabled_unfrozen(e, now_ts))
                 .min_by_key(|e| e.credentials.priority)
             {
                 *current_id = next.id;
@@ -2759,7 +2813,10 @@ impl MultiTokenManager {
             let mut entries = self.entries.lock();
             match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) if entry_frozen(e, now_ts) => {
-                    e.credentials.frozen_until = Some(next_reset_at + FREEZE_RESET_MARGIN_SECS);
+                    e.credentials.frozen_until = Some(clamp_freeze_deadline(
+                        next_reset_at + FREEZE_RESET_MARGIN_SECS,
+                        now_ts,
+                    ));
                     true
                 }
                 _ => false,
@@ -3126,18 +3183,27 @@ impl MultiTokenManager {
         }
     }
 
-    /// 以"额度已用尽"为原因禁用凭据（Admin 一键超额功能）
+    /// 以"额度已用尽"为原因**冷冻**凭据（Admin 一键超额功能）
     ///
-    /// 与手动禁用不同，原因记录为 `QuotaExceeded`，便于自愈逻辑识别。
-    pub fn disable_quota_exceeded(&self, id: u64) -> anyhow::Result<()> {
+    /// 与 [`Self::report_quota_exhausted`]（402 触发）同语义、同截止时间规则：
+    /// 手动点的「一键超额」和上游回的 402 说的是同一件事——额度到顶、会随
+    /// 月度重置自愈。故这里也只写 `frozen_until`，不写 `disabled`。
+    ///
+    /// 历史：本方法曾写 `disabled + DisabledReason::QuotaExceeded`。那套写法
+    /// 依赖「余额刷新探测到额度恢复就重新启用」的自愈链路，该链路已随冷冻
+    /// 改造删除，于是它退化成了没有出口的死禁用；又因 `disabled_reason` 现在
+    /// 会持久化，重启时会被加载迁移转成冷冻，同一动作在重启前后行为相反。
+    pub fn freeze_quota_exceeded(&self, id: u64) -> anyhow::Result<()> {
+        let now_ts = Utc::now().timestamp();
+        let deadline = self.freeze_deadline_for(id, now_ts);
         {
             let mut entries = self.entries.lock();
             let entry = entries
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+            entry.credentials.frozen_until = Some(deadline);
+            tracing::info!("凭据 #{} 被面板「一键超额」冷冻至 {}", id, deadline);
         }
         self.persist_credentials()?;
         Ok(())
@@ -5093,7 +5159,84 @@ mod tests {
         assert!(second >= first, "重冻必须重新计算，不是沿用旧值");
     }
 
+    /// 面板「一键超额」与 402 同义：写冷冻，不写 disabled。
+    ///
+    /// 守的回归：自愈链路（刷新探测 → 重新启用）已随冷冻改造删除，此处若仍写
+    /// `disabled + QuotaExceeded` 就成了没有出口的死禁用；且 `disabled_reason`
+    /// 现在会持久化，重启后又会被加载时的迁移循环转成冷冻——同一个动作在重启
+    /// 前后行为相反。
+    #[test]
+    fn panel_quota_exceeded_action_freezes_instead_of_disabling() {
+        let manager = test_manager_with_two_credentials();
+        manager.freeze_quota_exceeded(1).unwrap();
+
+        let snap = manager.snapshot();
+        let e1 = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!e1.disabled, "一键超额不得再置 disabled");
+        assert!(
+            e1.disabled_reason.is_none(),
+            "不得再写 QuotaExceeded 禁用原因"
+        );
+        let fu = e1.frozen_until.expect("必须写入 frozen_until");
+        let now = Utc::now().timestamp();
+        // 与 report_quota_exhausted 同规则：无 dispatcher（单测）→ 兜底 now+3600
+        assert!(
+            (fu - now - FREEZE_FALLBACK_SECS).abs() <= 5,
+            "兜底应为 now+3600±5s，实际 {}",
+            fu - now
+        );
+        assert_eq!(manager.available_count(), 1, "冷冻后不参与调度");
+    }
+
+    /// M2：`frozen_until` 上界钳制。上游 `next_reset_at` 若量纲变化（秒→毫秒）
+    /// 会算出一个几万年后的截止时间，把凭据冻到天荒地老且无人察觉。
+    #[test]
+    fn freeze_deadline_is_clamped_to_max_horizon() {
+        let now = Utc::now().timestamp();
+        // 毫秒时间戳被当秒用的典型形态
+        let absurd = now * 1000;
+        assert_eq!(
+            clamp_freeze_deadline(absurd, now),
+            now + FREEZE_MAX_HORIZON_SECS,
+            "超上界必须钳到 now+35 天"
+        );
+        // 正常值不受影响
+        assert_eq!(clamp_freeze_deadline(now + 3600, now), now + 3600);
+    }
+
+    /// M5：冷冻中再次 402 且新截止更短 → 覆盖式缩短（不是取最大值）。
+    /// 与 `refeeze_overwrites_deadline` 的方向相反，两条一起钉住「覆盖」语义。
+    #[test]
+    fn refreeze_can_shorten_deadline() {
+        let manager = test_manager_with_two_credentials();
+        let now = Utc::now().timestamp();
+        manager.set_frozen_until_for_test(1, Some(now + 30 * 86400));
+
+        manager.report_quota_exhausted(1);
+
+        let fu = manager
+            .snapshot()
+            .entries
+            .iter()
+            .find(|e| e.id == 1)
+            .unwrap()
+            .frozen_until
+            .expect("仍应处于冷冻");
+        assert!(
+            (fu - now - FREEZE_FALLBACK_SECS).abs() <= 5,
+            "新的兜底截止（now+1h）必须覆盖掉更远的旧值，实际 {}",
+            fu - now
+        );
+    }
+
     /// 存量迁移：加载时 disabled+QuotaExceeded → 冷冻态。
+    ///
+    /// 注意本测试构造的是**C2 修复前**写出的持久化格式：只有那个版本的
+    /// 「一键超额」会把 `disabled=true + disabledReason=QuotaExceeded` 落盘。
+    /// 修复后的代码不再产生这种数据（402 与面板动作都只写 `frozen_until`），
+    /// 迁移分支保留是为了吃掉这批存量以及手工编辑出来的同形数据。
+    /// 真实的 0.9.16→0.9.17 升级路径**不**走这个分支——0.9.16 根本不持久化
+    /// `disabledReason`，旧文件里读出来一律是 `Manual`。
     #[test]
     fn legacy_quota_disabled_migrates_to_frozen_on_load() {
         let config = Config::default();
