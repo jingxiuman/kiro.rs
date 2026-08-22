@@ -2715,29 +2715,58 @@ impl MultiTokenManager {
     ///
     /// 只解除 QuotaExceeded：手动停用、refresh token 失效等原因与额度无关，
     /// 被余额恢复顺手唤醒会绕过人的意图。
-    pub fn clear_quota_disable_if_replenished(&self, id: u64, remaining: f64) {
+    /// 提前解冻的兜底优化：正路是冷冻到期惰性回池（`entry_frozen` 到期即视为可调度，
+    /// 不需要任何人为清理）。这里只是在被动刷新恰好拿到该凭据的最新余额、且
+    /// 发现额度已经恢复（`remaining > 0.0`）时，主动清掉 `frozen_until`，
+    /// 省去等到冷冻截止时间的空等——纯优化，不是自愈链路本身。
+    /// 返回是否真的提前解冻了（非冷冻中 / 额度仍为 0 都返回 false）。
+    pub fn thaw_if_replenished(&self, id: u64, remaining: f64) -> bool {
         if remaining <= 0.0 {
-            return;
+            return false;
         }
-        let reenabled = {
+        let now_ts = Utc::now().timestamp();
+        let thawed = {
             let mut entries = self.entries.lock();
             match entries.iter_mut().find(|e| e.id == id) {
-                Some(e) if e.disabled && e.disabled_reason == Some(DisabledReason::QuotaExceeded) => {
+                Some(e) if entry_frozen(e, now_ts) => {
                     tracing::info!(
-                        "凭据 #{} 额度已恢复（remaining={:.2}），解除 quota 禁用",
+                        "凭据 #{} 额度已恢复（remaining={:.2}），提前解除冷冻",
                         id,
                         remaining
                     );
-                    e.disabled = false;
-                    e.disabled_reason = None;
-                    e.failure_count = 0;
+                    e.credentials.frozen_until = None;
                     true
                 }
                 _ => false,
             }
         };
-        if reenabled {
-            self.save_stats_debounced();
+        if thawed {
+            let _ = self.persist_credentials();
+        }
+        thawed
+    }
+
+    /// 盲冻（拿不到 next_reset_at、用了兜底 1h）后，被动刷新拿到了该凭据真实的
+    /// `next_reset_at`：校正冷冻截止为 `next_reset_at + FREEZE_RESET_MARGIN_SECS`，
+    /// 避免盲冻兜底值偏差过大（过早或过晚回池）。仅在仍处于冷冻中时生效；
+    /// 不影响已到期/已清空的 `frozen_until`。
+    pub fn refine_freeze_deadline(&self, id: u64, next_reset_at: i64) {
+        let now_ts = Utc::now().timestamp();
+        if next_reset_at <= now_ts {
+            return;
+        }
+        let refined = {
+            let mut entries = self.entries.lock();
+            match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) if entry_frozen(e, now_ts) => {
+                    e.credentials.frozen_until = Some(next_reset_at + FREEZE_RESET_MARGIN_SECS);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if refined {
+            let _ = self.persist_credentials();
         }
     }
 
@@ -5131,15 +5160,32 @@ mod tests {
     }
 
     // 注：原 `quota_disabled_credential_is_reenabled_after_reset` 测试的前提
-    // （quota 耗尽 = disabled）已被本轮冷冻改造取代，删除。「额度恢复提前解冻」
-    // 的等价覆盖在 Task 2 把 `clear_quota_disable_if_replenished` 改造为
-    // `thaw_if_replenished`（冷冻语义）时补上，不在此处留空窗。
+    // （quota 耗尽 = disabled）已被本轮冷冻改造取代，删除；「额度恢复提前解冻」
+    // 的等价覆盖见下面的 `thaw_if_replenished_clears_freeze_when_replenished`。
+
+    #[test]
+    fn thaw_if_replenished_clears_freeze_when_replenished() {
+        let manager = test_manager_with_two_credentials();
+        manager.report_quota_exhausted(1);
+        assert!(manager.snapshot().entries.iter().any(|e| e.id == 1 && e.frozen_until.is_some()));
+        assert!(
+            manager.thaw_if_replenished(1, 9000.0),
+            "冷冻中且额度已恢复应提前解冻"
+        );
+        assert!(
+            manager.snapshot().entries.iter().any(|e| e.id == 1 && e.frozen_until.is_none()),
+            "提前解冻应清空 frozen_until"
+        );
+    }
 
     #[test]
     fn reenable_does_not_touch_other_disable_reasons() {
         let manager = test_manager_with_two_credentials();
         manager.set_disabled(1, true).unwrap();
-        manager.clear_quota_disable_if_replenished(1, 9000.0);
+        assert!(
+            !manager.thaw_if_replenished(1, 9000.0),
+            "手动禁用（非冷冻）不应被 thaw_if_replenished 提前解冻"
+        );
         assert!(
             manager.snapshot().entries.iter().any(|e| e.id == 1 && e.disabled),
             "手动禁用不得被余额恢复解除"

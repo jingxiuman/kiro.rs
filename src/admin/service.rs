@@ -953,10 +953,14 @@ impl AdminService {
         Ok(AvailableModelsResponse { id, models })
     }
 
-    /// 批量刷新所有非禁用凭据、以及因 QuotaExceeded 被禁用的凭据的余额（用于后台调度）
+    /// 批量刷新所有非禁用凭据的余额（用于后台调度）
     ///
-    /// 覆盖 QuotaExceeded 账号是为了让月度额度重置后账号能自动重新探测并回到
-    /// 调度池；其余禁用原因（手动停用、refresh token 失效等）与余额无关，跳过。
+    /// 冷冻中的凭据不是 disabled，会被这里正常刷到——这正是「冷冻中但
+    /// next_reset_at 未知（盲冻兜底）→ 尽快拿到真实重置时间」的实现载体：
+    /// 刷到余额后若该凭据仍处于冷冻中，`thaw_if_replenished` 会在额度已恢复时
+    /// 提前解冻；额度仍为 0 但拿到了新的 next_reset_at 时，
+    /// `refine_freeze_deadline` 会校正盲冻兜底截止时间。
+    /// disabled（手动停用、refresh token 失效等）与余额无关，统一跳过。
     ///
     /// 串行执行以避免对上游产生瞬时高并发，每次成功的查询都会更新内存缓存
     /// 与磁盘缓存。失败的条目不会清空旧缓存，调用方可在下次轮询时重试。
@@ -970,10 +974,9 @@ impl AdminService {
         let mut collected: HashMap<u64, CachedBalance> = self.balance_cache.snapshot().entries;
 
         for entry in snapshot.entries.into_iter() {
-            // 已禁用账号默认跳过；但 QuotaExceeded 是唯一可能因月度重置而自愈的
-            // 禁用原因，必须继续探测，否则被 402 禁用的账号永远回不到调度池。
-            // 其余禁用原因（手动停用、refresh token 失效等）与余额无关，跳过。
-            if entry.disabled && entry.disabled_reason.as_deref() != Some("QuotaExceeded") {
+            // disabled 与余额无关（手动停用 / refresh token 失效等不可自愈原因），跳过。
+            // 冷冻中的凭据不是 disabled，不在此处特判，正常参与刷新。
+            if entry.disabled {
                 continue;
             }
             match self.fetch_balance(entry.id).await {
@@ -990,8 +993,15 @@ impl AdminService {
                         usage_percentage: balance.usage_percentage,
                         next_reset_at: balance.next_reset_at.map(|v| v as i64),
                     });
-                    self.token_manager
-                        .clear_quota_disable_if_replenished(entry.id, balance.remaining);
+                    let thawed = self
+                        .token_manager
+                        .thaw_if_replenished(entry.id, balance.remaining);
+                    if !thawed {
+                        if let Some(next_reset_at) = balance.next_reset_at {
+                            self.token_manager
+                                .refine_freeze_deadline(entry.id, next_reset_at as i64);
+                        }
+                    }
                     collected.insert(
                         entry.id,
                         CachedBalance {
@@ -1026,9 +1036,9 @@ impl AdminService {
     /// - 调用方持有 `Arc<Self>` 即可，任务在后台 tokio runtime 上运行
     /// - 幂等：重复调用不会启动第二个循环任务
     /// - 无条件按模式刷新：priority/balanced 模式虽然选号不读余额，但面板余额列、
-    ///   余额趋势（/api/admin/stats/balance-history）与 quota 耗尽后的自愈探测
-    ///   （clear_quota_disable_if_replenished）都依赖这条链路持续运行，与选号
-    ///   算法是否读余额无关。
+    ///   余额趋势（/api/admin/stats/balance-history）与冷冻凭据的提前解冻/截止
+    ///   校正（`thaw_if_replenished` / `refine_freeze_deadline`，均为兜底优化，
+    ///   正路是冷冻到期惰性回池）都依赖这条链路持续运行，与选号算法是否读余额无关。
     pub fn start_balance_refresher(self: &Arc<Self>, interval: std::time::Duration) {
         use std::sync::atomic::Ordering;
         if self
@@ -5513,26 +5523,42 @@ mod tests {
             .is_err());
     }
 
-    /// 回归守卫（M1）：默认 `priority` 模式下余额刷新链路必须仍然可用。
-    ///
-    /// 之前的实现把 `refresh_all_balances` 的调用门控在
-    /// `mode == "weighted"` 后面（无论是进程启动时是否调用
-    /// `start_balance_refresher`，还是刷新循环每轮开头的检查），导致默认
-    /// 部署下余额永不刷新：面板余额列永久为空、余额趋势断更、quota 耗尽账号
-    /// 的自愈探测退化为盲试。`refresh_all_balances` 本身不应该也不需要按
-    /// 模式跳过任何条目——它必须处理快照里的每一条未禁用（或
-    /// QuotaExceeded 待自愈）凭据。
+    /// 语义继承自 `refresh_all_balances_runs_regardless_of_mode`：那条测试守的是
+    /// 「402 凭据必须能自愈」（当年门控刷新导致凭据永久回不了池的回归）。
+    /// 冷冻机制下自愈不再依赖任何刷新——本测试断言冷冻到期后凭据在
+    /// **零刷新**条件下自然回池（不调用 `refresh_all_balances`，也不需要
+    /// `thaw_if_replenished` / `refine_freeze_deadline` 介入）。
     #[tokio::test]
-    async fn refresh_all_balances_runs_regardless_of_mode() {
-        for mode in ["priority", "balanced", "weighted"] {
-            let service = service_with_balancing_mode(mode);
-            let (success, failure) = service.refresh_all_balances().await;
-            assert_eq!(
-                success + failure,
-                2,
-                "mode={mode}: refresh_all_balances 必须尝试全部 2 条未禁用凭据，\
-                 不能因为负载均衡模式而跳过（success={success}, failure={failure}）"
-            );
-        }
+    async fn frozen_credential_returns_to_pool_without_any_refresh() {
+        let service = service_with_balancing_mode("priority");
+        let tm = &service.token_manager;
+
+        // 402：凭据 1 进入冷冻，凭据 2 仍可用
+        let has_available = tm.report_quota_exhausted(1);
+        assert!(has_available, "另一张凭据仍可用");
+        let snap = tm.snapshot();
+        let e1 = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!e1.disabled, "402 不得置 disabled");
+        assert!(e1.frozen_until.is_some(), "402 必须写入 frozen_until");
+
+        // 到期：把冷冻截止改到过去（测试后门，不经任何刷新）
+        tm.set_frozen_until_for_test(1, Some(chrono::Utc::now().timestamp() - 10));
+
+        // 全程未调用 refresh_all_balances / thaw_if_replenished /
+        // refine_freeze_deadline —— 冷冻凭据仅凭到期即自然回池。
+        // 用 available_count 断言两条凭据都重新可调度（priority 模式下
+        // acquire_context 的 current_id 快路径会优先沿用 402 时已切走的
+        // 凭据 2，不适合直接拿它来判断凭据 1 是否回池）。
+        assert_eq!(
+            tm.available_count(),
+            2,
+            "冷冻到期后应在零刷新条件下自然回池，两条凭据都应可调度"
+        );
+        // 再显式排除凭据 2，验证凭据 1 本身也确实通过了冷冻过滤判定。
+        let mut excluded = std::collections::HashMap::new();
+        excluded.insert(2, crate::kiro::dispatch::ExclusionKind::Durable);
+        let ctx = tm.acquire_context_excluding(None, None, &excluded, None).await;
+        assert!(ctx.is_ok(), "排除凭据 2 后，过期冷冻的凭据 1 应能重新被选中");
+        assert_eq!(ctx.unwrap().id, 1, "过期冷冻的凭据 1 应重新参与调度");
     }
 }
