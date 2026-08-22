@@ -51,13 +51,20 @@ export function buildBaseline(
   return map
 }
 
-/** 是否可以播种：弹窗打开、代理池已返回、且尚未播种过。 */
+/**
+ * 是否可以播种：弹窗打开、代理池已返回**且不在刷新中**、且尚未播种过。
+ *
+ * `fetching` 不能省：二次打开时 query 缓存会立刻给出上次的代理池，照此播种会让
+ * 「上次打开之后才被禁用的代理」在基线里仍是数字 id，而下拉只列可选代理，
+ * 该行渲染成空白。等 refetch 落地一拍再播种。
+ */
 export function canSeed(
   open: boolean,
   proxyPool: { proxies: ProxyPoolEntry[] } | undefined,
   seeded: boolean,
+  fetching: boolean,
 ): boolean {
-  return open && proxyPool !== undefined && !seeded
+  return open && proxyPool !== undefined && !fetching && !seeded
 }
 
 /** 与基线同帧同源产生的初始选值（只读行不进 selection）。 */

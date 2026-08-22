@@ -37,11 +37,30 @@ const CREDS = Array.from({ length: 8 }, (_, i) =>
 
 describe('批量绑代理弹窗的基线', () => {
   test('代理池未返回前不得播种（C1 竞态的根因）', () => {
-    expect(canSeed(true, undefined, false)).toBe(false)
-    expect(canSeed(true, { proxies: POOL }, false)).toBe(true)
+    expect(canSeed(true, undefined, false, true)).toBe(false)
+    expect(canSeed(true, { proxies: POOL }, false, false)).toBe(true)
     // 已播种后不重播：弹窗开着时的 30s 轮询不得改动基线
-    expect(canSeed(true, { proxies: POOL }, true)).toBe(false)
-    expect(canSeed(false, { proxies: POOL }, false)).toBe(false)
+    expect(canSeed(true, { proxies: POOL }, true, false)).toBe(false)
+    expect(canSeed(false, { proxies: POOL }, false, false)).toBe(false)
+  })
+
+  test('二次打开时不得用缓存的旧代理池播种（N2）', () => {
+    // 缓存立刻给出上次的池，但 refetch 还在飞：此时播种会让「上次之后才被禁用的
+    // 代理」在基线里仍是数字 id，下拉找不到对应项而显示空白
+    expect(canSeed(true, { proxies: POOL }, false, true)).toBe(false)
+    // refetch 落地后才播种
+    expect(canSeed(true, { proxies: POOL }, false, false)).toBe(true)
+  })
+
+  test('旧池 vs 新池：同一凭据的基线形态会翻转（N2 为什么必须等 refetch）', () => {
+    const stale = [proxy(11, 'http://127.0.0.1:1080')]
+    const fresh = [proxy(11, 'http://127.0.0.1:1080', { autoDisabled: true })]
+    const c = [cred(1, 'http://127.0.0.1:1080')]
+    expect(buildBaseline(c, stale).get(1)).toBe(11) // 用旧池 → 数字 id → 下拉空白
+    expect(buildBaseline(c, fresh).get(1)).toEqual({
+      kind: 'disabled',
+      url: 'http://127.0.0.1:1080',
+    })
   })
 
   test('播种后不动任何一行，提交体为空（首开必现的批量误解绑）', () => {

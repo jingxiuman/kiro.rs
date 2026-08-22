@@ -5222,8 +5222,16 @@ mod tests {
     // multi_thread：persist_credentials 内部用 block_in_place，单线程运行时会 panic
     #[tokio::test(flavor = "multi_thread")]
     async fn assign_proxies_batch_empty_does_not_persist() {
+        // 路径带 pid + 单调计数：固定路径会被并发跑的测试/多次 cargo test 互踩
         let mut path = std::env::temp_dir();
-        path.push("kiro_test_batch_empty_no_persist.json");
+        path.push(format!(
+            "kiro_test_batch_empty_no_persist_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
         let cred = KiroCredentials {
             id: Some(1),
             refresh_token: Some("a".repeat(150)),

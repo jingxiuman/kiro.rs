@@ -45,10 +45,15 @@ export function BatchAssignProxyDialog({
 }: BatchAssignProxyDialogProps) {
   const queryClient = useQueryClient()
 
-  const { data: proxyPool } = useQuery({
+  // staleTime: 0 + 播种时等 isFetching 落下，两者缺一不可：
+  // 二次打开时 query 缓存会**立刻**给出上次的代理池，若照此播种，期间被禁用的
+  // 代理在基线里仍是数字 id，而下拉只列可选代理 → 该行显示空白（M6 在这条路径复现）。
+  // staleTime: 0 保证进入弹窗必发一次 refetch，isFetching 保证播种等它一拍。
+  const { data: proxyPool, isFetching: proxyPoolFetching } = useQuery({
     queryKey: ['proxy-pool'],
     queryFn: getProxyPool,
     enabled: open,
+    staleTime: 0,
   })
 
   const selectableProxies = useMemo(
@@ -81,14 +86,14 @@ export function BatchAssignProxyDialog({
       setSubmitting(false)
       return
     }
-    if (!canSeed(open, proxyPool, seeded)) return
+    if (!canSeed(open, proxyPool, seeded, proxyPoolFetching)) return
     const next = buildBaseline(credentials, proxyPool!.proxies)
     setBaseline(next)
     setSelection(seedSelection(next))
     setSeeded(true)
     // credentials 刻意不进依赖：播种是一次性的，之后的轮询不得改动基线。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, proxyPool, seeded])
+  }, [open, proxyPool, proxyPoolFetching, seeded])
 
   const handleChange = (credentialId: number, value: string) => {
     setSelection((prev) => ({
@@ -125,6 +130,14 @@ export function BatchAssignProxyDialog({
         const map: Record<number, string> = {}
         for (const f of respFailures) map[f.credentialId] = f.reason
         setFailures(map)
+        // 落不到任何一行上的失败（如该凭据已被外部删除）不能静默吞掉
+        const orphans = respFailures.filter((f) => !baseline.has(f.credentialId))
+        if (orphans.length > 0) {
+          toast.error(
+            `${orphans.length} 条失败无法定位到列表行：` +
+              orphans.map((f) => `#${f.credentialId} ${f.reason}`).join('；'),
+          )
+        }
       } else {
         toast.error(`批量重绑失败: ${extractErrorMessage(err)}`)
       }
@@ -140,7 +153,8 @@ export function BatchAssignProxyDialog({
     <Dialog open={open} onOpenChange={(o) => !submitting && onOpenChange(o)}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>批量绑代理（{credentials.length} 张凭据）</DialogTitle>
+          {/* 数量用 rows.length：播种后外部新增的凭据不在列表里，用 credentials.length 会与行数对不上 */}
+          <DialogTitle>批量绑代理{seeded ? `（${rows.length} 张凭据）` : ''}</DialogTitle>
           <DialogDescription>
             只提交被改动的行；查不到匹配代理的自定义 URL、以及绑在已禁用代理上的行保持只读，不会被覆盖。
           </DialogDescription>
