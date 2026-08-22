@@ -287,8 +287,13 @@ export function CredentialCard({
       onError: (err) => toast.error("解除失败: " + extractErrorMessage(err)),
     });
   }, [clearThrottle, credential.id]);
+  // 三态显示优先级：已禁用 > 冷冻 > 冷却（照 isThrottled 的写法加禁用守卫）。
+  // 禁用是人工/永久态，冷冻与冷却都是会自己到期的；被禁用的凭据同时挂着
+  // 冷冻徽标与「立即解冻」菜单项，会让人以为解冻就能恢复调度。
   const isFrozen =
-    !!credential.frozenUntil && credential.frozenUntil > Date.now() / 1000;
+    !credential.disabled &&
+    !!credential.frozenUntil &&
+    credential.frozenUntil > Date.now() / 1000;
   const handleClearFreeze = useCallback(() => {
     clearFreeze.mutate(credential.id, {
       onSuccess: (res) => toast.success(res.message),
@@ -402,7 +407,8 @@ export function CredentialCard({
   const disabledByQuota =
     credential.disabled && credential.disabledReason === "QuotaExceeded";
   const reasonStyle = getDisabledReasonStyle(credential.disabledReason);
-  const isThrottled = !credential.disabled && throttleRemaining > 0;
+  const isThrottled =
+    !credential.disabled && !isFrozen && throttleRemaining > 0;
 
   // 卡片与列表行共用的状态描边 / 灰化（活跃 · 超额 · 冷却 · 禁用）
   const stateClasses = [

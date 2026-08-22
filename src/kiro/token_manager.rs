@@ -1694,7 +1694,11 @@ impl MultiTokenManager {
     }
 
     /// 见 [`group_supported_models_from`]。entries 快照 + credential_support 缓存。
-
+    ///
+    /// 只跳过 `disabled`，**冷冻不影响组的能力声明**（刻意）：冷冻是「这张号
+    /// 眼下没额度」，不是「这张号不支持这个模型」。402 冷冻按天计，若让它影响
+    /// 组能力，同一个组会在冷冻期内对外少报模型、解冻后又冒出来，客户端侧表现
+    /// 为模型忽隐忽现。
     pub fn group_supported_models(
         &self,
         group: Option<&str>,
@@ -1955,20 +1959,23 @@ impl MultiTokenManager {
                     .map(|e| (e.id, e.credentials.clone()))
                     .collect();
 
-                // 硬过滤剔除（disabled/throttled/RPM/上游门禁排除）的账号按原因
-                // 分类，供 pick 内部的粘滞判定使用。优先沿用调用方已给出的分类
-                // （如并发门禁 queue_excluded 恒为 Transient——队满/超时是短暂
-                // 拥塞）；调用方未分类的（本函数内部因 disabled/throttled/RPM
-                // 过滤掉的）按 disabled 与否推断：只有 disabled（含 quota 耗尽）
-                // 才是长期不可用应触发会话迁移，throttled_until 冷却与 RPM
-                // 窗口超限都是几十秒到半小时自愈的临时状态，不应迁移会话丢掉
-                // prompt cache。
+                // 硬过滤剔除（disabled/frozen/throttled/RPM/上游门禁排除）的
+                // 账号按原因分类，供 pick 内部的粘滞判定使用。优先沿用调用方
+                // 已给出的分类（如并发门禁 queue_excluded 恒为 Transient——
+                // 队满/超时是短暂拥塞）；调用方未分类的按下面的规则推断：
+                // - Durable（应迁移粘滞会话）：`disabled`，以及 402 `frozen_until`。
+                //   冷冻按天计（截止取 next_reset_at，通常是下一个月度重置），
+                //   粘滞会话与其在这么长的窗口里反复抖动，不如一次性迁走。
+                // - Transient（保留粘滞）：`throttled_until` 冷却与 RPM 窗口
+                //   超限，都是几十秒到半小时自愈的临时状态，迁移只会白丢
+                //   prompt cache。
                 let excluded_kinds: std::collections::HashMap<u64, crate::kiro::dispatch::ExclusionKind> =
                     entries
                         .iter()
                         .filter(|e| !cands.iter().any(|c| c.id == e.id))
                         .map(|e| {
-                            let kind = excluded.get(&e.id).copied().unwrap_or(if e.disabled {
+                            let durable = e.disabled || entry_frozen(e, now_ts);
+                            let kind = excluded.get(&e.id).copied().unwrap_or(if durable {
                                 crate::kiro::dispatch::ExclusionKind::Durable
                             } else {
                                 crate::kiro::dispatch::ExclusionKind::Transient
