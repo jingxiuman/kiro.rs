@@ -537,15 +537,11 @@ async fn main() {
                 request_body_store.clone(),
             );
 
-            // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）。
-            // 无条件启动：priority/balanced 模式虽然选号不读余额，但面板的余额列、
-            // 余额趋势图（/api/admin/stats/balance-history）以及 quota 耗尽后的
-            // 自愈探测（clear_quota_disable_if_replenished）都依赖这条刷新链路，
-            // 与选号是否读余额无关。之前按 weighted 门控是回归：默认部署下余额
-            // 永久不刷新。
-            admin_state
-                .service
-                .start_balance_refresher(std::time::Duration::from_secs(300));
+            // 被动余额刷新（2026-08-22 起）：无流量零查询。选号侧发现快照过期
+            // 才 poke 刷新；402 自愈已改为冷冻到期惰性回池（见 passive-balance-
+            // freeze 设计），不再依赖周期刷新链路。面板余额列与趋势图在无流量
+            // 时段会停更——这是已接受的代价。
+            admin_state.service.start_passive_balance_refresher();
 
             // 启动代理池健康检查调度器（每 5 分钟一次）
             admin_state

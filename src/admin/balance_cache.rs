@@ -39,6 +39,9 @@ struct Inner {
 pub struct BalanceCache {
     inner: Mutex<Inner>,
     path: Option<PathBuf>,
+    /// 被动刷新触发器：选号侧发现快照过期时 poke，AdminService 侧的监听
+    /// 任务被唤醒后做防抖刷新。Notify 天然合并重复通知，poke 是零成本操作。
+    passive_refresh: tokio::sync::Notify,
 }
 
 pub type SharedBalanceCache = Arc<BalanceCache>;
@@ -49,7 +52,19 @@ impl BalanceCache {
         Self {
             inner: Mutex::new(Inner { generation: 0, entries }),
             path,
+            passive_refresh: tokio::sync::Notify::new(),
         }
+    }
+
+    /// 选号侧发现候选快照过期时调用：唤醒被动刷新监听任务。零成本、不阻塞，
+    /// Notify 天然合并重复 poke（监听侧还没醒来之前的多次 poke 只算一次）。
+    pub fn request_passive_refresh(&self) {
+        self.passive_refresh.notify_one();
+    }
+
+    /// 供被动刷新监听任务使用：`.notified().await` 等待下一次 poke。
+    pub fn passive_refresh_requested(&self) -> &tokio::sync::Notify {
+        &self.passive_refresh
     }
 
     /// 只读代次号。比 [`Self::snapshot`] 便宜——不 clone 整张 entries 表，
@@ -160,5 +175,32 @@ mod tests {
         let after = c.snapshot();
         assert_eq!(after.generation, before, "单点更新不得推进 generation");
         assert_eq!(after.entries[&1].data.remaining, 8500.0);
+    }
+
+    #[test]
+    fn poke_wakes_up_pending_notified_immediately() {
+        use futures::FutureExt;
+        let c = BalanceCache::new(None);
+        // poke 之前：notified() 立即 poll 应为 Pending（None）。
+        let pending = c.passive_refresh_requested().notified();
+        futures::pin_mut!(pending);
+        assert!(pending.as_mut().now_or_never().is_none(), "无 poke 时不应立即就绪");
+
+        c.request_passive_refresh();
+        assert!(
+            pending.now_or_never().is_some(),
+            "poke 后等待中的 notified() 应立即就绪"
+        );
+    }
+
+    #[test]
+    fn poke_before_wait_is_not_lost() {
+        use futures::FutureExt;
+        let c = BalanceCache::new(None);
+        // 先 poke，再 notified()：Notify 语义保证这次 poke 不会被丢弃。
+        c.request_passive_refresh();
+        let fut = c.passive_refresh_requested().notified();
+        futures::pin_mut!(fut);
+        assert!(fut.now_or_never().is_some(), "poke 早于等待时不应丢失通知");
     }
 }

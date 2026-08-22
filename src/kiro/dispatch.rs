@@ -161,6 +161,13 @@ impl GroupDispatcher {
         let candidate_count = available.len();
         let generation = st.generation;
 
+        // 被动刷新：任一候选余额快照过期即 poke（weighted 才会走到本函数，
+        // priority 模式天然零触发，因为它不调 pick）。poke 只是 Notify，
+        // 不阻塞、不重复排队——监听侧还没醒来之前的多次 poke 只算一次。
+        if candidates_stale(&available, &snap.entries, now_ts) {
+            self.balance.request_passive_refresh();
+        }
+
         // 1. 查粘滞
         if let Some(k) = &skey {
             let hit = st.sticky.get(k).and_then(|e| {
@@ -353,6 +360,19 @@ fn balance_age_secs(
     entries.get(&id).map(|e| now_ts - e.cached_at).unwrap_or(f64::INFINITY)
 }
 
+/// 任一候选的余额快照过期（含缺失，视为过期）即返回 true——用于触发被动刷新
+/// 的 poke。与 `balance_age_secs` 共用「缺失 = INFINITY」的口径，缺失天然
+/// 大于 TTL，不需要单独分支。
+fn candidates_stale(
+    candidates: &[Candidate],
+    entries: &HashMap<u64, crate::admin::balance_cache::CachedBalance>,
+    now_ts: f64,
+) -> bool {
+    candidates
+        .iter()
+        .any(|c| balance_age_secs(entries, c.id, now_ts) > crate::admin::balance_cache::BALANCE_CACHE_TTL_SECS as f64)
+}
+
 /// 到量时先清全部过期条目，仍满则 O(n) 淘汰 last_seen 最早的一条。
 /// 不引入 lru 依赖：正常负载下 30min 过期会让表远小于上限，O(n) 基本不触发。
 fn evict_if_full(sticky: &mut HashMap<String, StickyEntry>, now: Instant) {
@@ -493,6 +513,38 @@ mod tests {
 
     fn pick(d: &GroupDispatcher, c: &[Candidate]) -> u64 {
         d.pick(None, c, &HashMap::new(), None, Instant::now()).cred_id
+    }
+
+    /// poke 之后 `notified()` 是否立即就绪（用 `now_or_never` 探测，不阻塞测试）。
+    fn was_poked(d: &GroupDispatcher) -> bool {
+        use futures::FutureExt;
+        let fut = d.balance.passive_refresh_requested().notified();
+        futures::pin_mut!(fut);
+        fut.now_or_never().is_some()
+    }
+
+    #[test]
+    fn pick_pokes_passive_refresh_when_candidate_balance_is_stale() {
+        // 候选 1 的余额快照已过期（超过 BALANCE_CACHE_TTL_SECS）。
+        let d = disp(&[(1, 7000.0)]);
+        {
+            let mut m = HashMap::new();
+            m.insert(1, CachedBalance {
+                cached_at: now_ts() - crate::admin::balance_cache::BALANCE_CACHE_TTL_SECS as f64 - 10.0,
+                data: BalanceResponse { remaining: 7000.0, ..Default::default() },
+            });
+            d.balance.publish(m);
+        }
+        assert!(!was_poked(&d), "pick 调用前不应有 poke 残留");
+        pick(&d, &cands(&[1]));
+        assert!(was_poked(&d), "候选余额过期应触发被动刷新 poke");
+    }
+
+    #[test]
+    fn pick_does_not_poke_when_candidate_balance_is_fresh() {
+        let d = disp(&[(1, 7000.0), (2, 3000.0)]);
+        pick(&d, &cands(&[1, 2]));
+        assert!(!was_poked(&d), "候选余额新鲜时不应触发被动刷新 poke");
     }
 
     #[test]

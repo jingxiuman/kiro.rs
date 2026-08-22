@@ -47,6 +47,12 @@ use super::types::{
 /// 看到红点提醒，又能避免短时间内重复请求被限流。
 const UPDATE_CHECK_TTL_SECS: i64 = 1800;
 
+/// 被动余额刷新的防抖下限（秒）：一轮刷新结束后至少歇这么久再接受下一次
+/// poke，避免突发流量下同一批候选反复触发刷新。也用作「缓存条目多久算
+/// 值得再刷一次」的下限（与 poke 触发的 300s TTL 判定分层：poke 判定用
+/// BALANCE_CACHE_TTL_SECS，这里判定「本轮该刷谁」用更短的 60s）。
+const PASSIVE_REFRESH_MIN_INTERVAL_SECS: u64 = 60;
+
 /// 单条凭据导入结果（服务端内部用，映射为 SSE 事件）
 pub(crate) enum ImportStatus {
     Verified,
@@ -1029,17 +1035,11 @@ impl AdminService {
         (success, failure)
     }
 
-    /// 启动余额后台刷新调度器
-    ///
-    /// - 启动后立刻执行一次刷新
-    /// - 之后按 `interval` 周期循环刷新
-    /// - 调用方持有 `Arc<Self>` 即可，任务在后台 tokio runtime 上运行
-    /// - 幂等：重复调用不会启动第二个循环任务
-    /// - 无条件按模式刷新：priority/balanced 模式虽然选号不读余额，但面板余额列、
-    ///   余额趋势（/api/admin/stats/balance-history）与冷冻凭据的提前解冻/截止
-    ///   校正（`thaw_if_replenished` / `refine_freeze_deadline`，均为兜底优化，
-    ///   正路是冷冻到期惰性回池）都依赖这条链路持续运行，与选号算法是否读余额无关。
-    pub fn start_balance_refresher(self: &Arc<Self>, interval: std::time::Duration) {
+    /// 被动余额刷新监听：等待选号侧 poke，single-flight + 逐凭据 60s 防抖。
+    /// 与旧的 300s 周期循环（`start_balance_refresher`，已删除）的区别：
+    /// 无流量 = 零上游查询——选号侧发现候选余额快照过期才 poke。
+    /// 幂等：重复调用不会启动第二个监听任务。
+    pub fn start_passive_balance_refresher(self: &Arc<Self>) {
         use std::sync::atomic::Ordering;
         if self
             .balance_refresher_running
@@ -1050,20 +1050,107 @@ impl AdminService {
         }
         let svc = Arc::clone(self);
         tokio::spawn(async move {
-            // 启动后稍等片刻，让上游/Token Manager 准备就绪
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             loop {
+                svc.balance_cache.passive_refresh_requested().notified().await;
                 let started = std::time::Instant::now();
-                let (ok, err) = svc.refresh_all_balances().await;
-                tracing::info!(
-                    "余额后台刷新完成：成功 {}，失败 {}，耗时 {:.1}s",
-                    ok,
-                    err,
-                    started.elapsed().as_secs_f32()
-                );
-                tokio::time::sleep(interval).await;
+                let (ok, err) = svc.refresh_stale_balances().await;
+                if ok + err > 0 {
+                    tracing::info!(
+                        "被动余额刷新：成功 {}，失败 {}，耗时 {:.1}s",
+                        ok,
+                        err,
+                        started.elapsed().as_secs_f32()
+                    );
+                }
+                // 防抖下限：一轮结束后至少歇 PASSIVE_REFRESH_MIN_INTERVAL_SECS
+                // 再接受下一轮，poke 在 Notify 里自动合并。
+                tokio::time::sleep(std::time::Duration::from_secs(PASSIVE_REFRESH_MIN_INTERVAL_SECS)).await;
             }
         });
+    }
+
+    /// `refresh_all_balances` 的被动刷新版本：只刷「未禁用且（缓存已过期
+    /// 或冷冻中且余额快照缺 next_reset_at）」的凭据，其余跳过不查上游。
+    /// 刷到余额后复用 Task 2 的 `thaw_if_replenished` / `refine_freeze_deadline`。
+    /// `refresh_all_balances` 本体保留给面板手动刷新用（无条件刷全部未禁用凭据）。
+    pub async fn refresh_stale_balances(&self) -> (usize, usize) {
+        let snapshot = self.token_manager.snapshot();
+        let now_ts = Utc::now().timestamp();
+        let cache_snapshot = self.balance_cache.snapshot();
+        let mut success = 0_usize;
+        let mut failure = 0_usize;
+        let mut history: Vec<crate::admin::balance_store::BalanceSnapshot> = Vec::new();
+        let mut collected: HashMap<u64, CachedBalance> = cache_snapshot.entries.clone();
+
+        for entry in snapshot.entries.into_iter() {
+            if entry.disabled {
+                continue;
+            }
+            let cache_age = cache_snapshot
+                .entries
+                .get(&entry.id)
+                .map(|c| now_ts as f64 - c.cached_at);
+            let cache_stale = cache_age
+                .map(|age| age > PASSIVE_REFRESH_MIN_INTERVAL_SECS as f64)
+                .unwrap_or(true);
+            // 冷冻中且拿不到 next_reset_at（盲冻兜底）：即使缓存本身还没过期，
+            // 也值得尽快刷一次去拿真实重置时间，好让 refine_freeze_deadline 校正。
+            let frozen_without_reset_at = entry.frozen_until.is_some()
+                && cache_snapshot
+                    .entries
+                    .get(&entry.id)
+                    .and_then(|c| c.data.next_reset_at)
+                    .is_none();
+            if !cache_stale && !frozen_without_reset_at {
+                continue;
+            }
+            match self.fetch_balance(entry.id).await {
+                Ok(balance) => {
+                    history.push(crate::admin::balance_store::BalanceSnapshot {
+                        credential_id: entry.id,
+                        subscription_title: balance
+                            .subscription_title
+                            .clone()
+                            .unwrap_or_default(),
+                        current_usage: balance.current_usage,
+                        usage_limit: balance.usage_limit,
+                        remaining: balance.remaining,
+                        usage_percentage: balance.usage_percentage,
+                        next_reset_at: balance.next_reset_at.map(|v| v as i64),
+                    });
+                    let thawed = self
+                        .token_manager
+                        .thaw_if_replenished(entry.id, balance.remaining);
+                    if !thawed {
+                        if let Some(next_reset_at) = balance.next_reset_at {
+                            self.token_manager
+                                .refine_freeze_deadline(entry.id, next_reset_at as i64);
+                        }
+                    }
+                    collected.insert(
+                        entry.id,
+                        CachedBalance {
+                            cached_at: Utc::now().timestamp() as f64,
+                            data: balance,
+                        },
+                    );
+                    success += 1;
+                }
+                Err(e) => {
+                    tracing::warn!("被动刷新凭据 #{} 余额失败: {}", entry.id, e);
+                    failure += 1;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+
+        if success > 0 {
+            self.balance_cache.publish(collected);
+            if let Some(store) = &self.balance_store {
+                store.record_batch(&history);
+            }
+        }
+        (success, failure)
     }
 
     /// 启动代理池后台健康检查调度器
@@ -5560,5 +5647,30 @@ mod tests {
         let ctx = tm.acquire_context_excluding(None, None, &excluded, None).await;
         assert!(ctx.is_ok(), "排除凭据 2 后，过期冷冻的凭据 1 应能重新被选中");
         assert_eq!(ctx.unwrap().id, 1, "过期冷冻的凭据 1 应重新参与调度");
+    }
+
+    /// `refresh_stale_balances` 只刷过期（或缺失）的凭据，缓存仍新鲜的跳过——
+    /// 与旧的 `refresh_all_balances_runs_regardless_of_mode` 不同，这里不是
+    /// 「必须尝试全部未禁用凭据」，而是「只尝试真正过期的那部分」。
+    /// 照该测试的构造方式（2 凭据 + 无上游导致 fetch_balance 必然失败）适配：
+    /// 用 success+failure 的总尝试数而非具体值来判断「跳过了新鲜的那条」。
+    #[tokio::test]
+    async fn refresh_stale_balances_skips_fresh_entries() {
+        let service = service_with_balancing_mode("priority");
+        // 凭据 1 的余额缓存刚写入（新鲜，未过期）；凭据 2 无缓存（视为过期）。
+        service.balance_cache.publish(HashMap::from([(
+            1,
+            CachedBalance {
+                cached_at: Utc::now().timestamp() as f64,
+                data: crate::admin::types::BalanceResponse::default(),
+            },
+        )]));
+
+        let (success, failure) = service.refresh_stale_balances().await;
+        assert_eq!(
+            success + failure,
+            1,
+            "只有缺失缓存（视为过期）的凭据 2 应被尝试刷新，凭据 1 的新鲜缓存应跳过"
+        );
     }
 }
