@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.18] - 2026-08-25
+
+主题：**用量类 REST 接口补发 profileArn**——修一条会让新登录的 IdC 凭据永久卡死的自锁。
+
+### 🐛 getUsageLimits / ListAvailableModels 缺 profileArn 导致 403
+
+- **根因**：`usage_limits_url` / `available_models_url` 此前刻意不发 `profileArn`，注释断言「带 ARN 会让这个 legacy 请求 malformed」。该断言经生产实测证伪：对照两个租户，带与不带 ARN 均返回 200 且响应体一致；而**部分 IdC 租户强制要求 ARN**，缺失时返回 `403 {"message":"User is not authorized to make this call."}`。该文案含义是「缺参数」而非「无权限」，极易被误判成账号没有订阅。改为有真实 ARN 就追加（占位符仍由 `effective_profile_arn` 过滤）。
+- **自锁**：新登录的 IdC 凭据只带 BuilderID 占位符 ARN，真实 ARN 依赖流式路径上的 `resolve_profile_arn_for` 惰性解析。于是形成闭环——没有真实 ARN → 余额查询 403 → 无余额快照 → weighted 权重为 0 → 永不被调度 → 永不触发解析 → 永远没有真实 ARN。新增 `prepare_rest_request_token`，在用量类 REST 调用前先解析一次 ARN，把环打断。解析失败不致命，降级为不带 ARN 发请求，不把原本能成功的租户拖挂。
+- **`setUserPreference` 一并修复**：它的 body 本就只发真实 ARN，同样受上述自锁影响——占位符凭据开关超额会静默不带 ARN。
+- **连带影响（数据面）**：受此自锁影响的凭据在流式路径上会带着占位符 ARN 调用 `generateAssistantResponse`，上游按 token 身份不匹配返回 `403 {"message":"The bearer token included in the request is invalid."}`。因为这类凭据权重恒为 0、从不被调度，该故障此前不会暴露。
+- **分诊记录**：上游这三句 403 指向三个不同方向——`User is not authorized to make this call.` = 缺 profileArn；`The bearer token included in the request is invalid.` = ARN 与 token 身份不匹配；`Your subscription does not support this application.` = UA/版本头不像 Kiro 客户端。
+- **测试**：`test_usage_rest_urls_omit_resolved_profile_arn` 固化的正是被证伪的假设，改为 `test_usage_rest_urls_carry_resolved_profile_arn`；另加 `test_usage_rest_urls_omit_placeholder_profile_arn` 钉住占位符必须被过滤。
+
 ## [0.9.17] - 2026-08-22
 
 主题：**余额被动化 + 402 冷冻自然恢复**——分界线：可自愈（额度会重置）的进冷冻，不可自愈（手动停用、refresh token 失效）的才 disabled。

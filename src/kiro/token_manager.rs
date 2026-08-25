@@ -505,17 +505,34 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
-fn usage_limits_url(host: &str, _credentials: &KiroCredentials) -> String {
-    // Kiro 0.9.2 accepts these REST calls without profileArn. A resolved ARN is
-    // only for the streaming endpoint and makes this legacy request malformed.
-    format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-        host
-    )
+/// 在用量类 REST URL 上追加真实 profileArn。
+///
+/// 部分 IdC 租户强制要求 profileArn，缺失时上游返回
+/// `403 {"message":"User is not authorized to make this call."}`——注意该文案是
+/// 「缺参数」而非「无权限」，容易被误判成账号没有订阅。
+///
+/// 对不要求 ARN 的租户带上它没有副作用（实测带与不带返回体一致），因此无条件追加。
+/// BuilderID 占位符由 [`KiroCredentials::effective_profile_arn`] 过滤，不会外发。
+fn append_profile_arn(url: &mut String, credentials: &KiroCredentials) {
+    if let Some(arn) = credentials.effective_profile_arn() {
+        url.push_str("&profileArn=");
+        url.push_str(&urlencoding::encode(arn));
+    }
 }
 
-fn available_models_url(host: &str, _credentials: &KiroCredentials) -> String {
-    format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
+fn usage_limits_url(host: &str, credentials: &KiroCredentials) -> String {
+    let mut url = format!(
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
+        host
+    );
+    append_profile_arn(&mut url, credentials);
+    url
+}
+
+fn available_models_url(host: &str, credentials: &KiroCredentials) -> String {
+    let mut url = format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host);
+    append_profile_arn(&mut url, credentials);
+    url
 }
 
 /// 获取使用额度信息
@@ -3487,7 +3504,7 @@ impl MultiTokenManager {
     }
 
     async fn get_usage_limits_for_inner(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
-        let (token, credentials) = self.prepare_request_token(id).await?;
+        let (token, credentials) = self.prepare_rest_request_token(id).await?;
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         let usage_limits =
@@ -3585,6 +3602,35 @@ impl MultiTokenManager {
         anyhow::bail!("凭据 #{} 从文件加载轮换 Token 后仍无法刷新", id)
     }
 
+    /// 为用量类 REST 调用准备 token 与**已解析真实 profileArn**的凭据快照。
+    ///
+    /// 在 [`Self::prepare_request_token`] 之上多做一步 [`Self::resolve_profile_arn_for`]：
+    /// getUsageLimits / ListAvailableModels 在部分 IdC 租户上强制要求 profileArn，
+    /// 而刚登录的 IdC 凭据只带 BuilderID 占位符，真实 ARN 要查一次
+    /// `ListAvailableProfiles` 才有。
+    ///
+    /// 不在这里解析就会形成自锁：没有真实 ARN → 余额查询 403 → weighted 权重为 0
+    /// → 永不被调度 → 永不触发流式路径上的 ARN 解析 → 永远没有真实 ARN。
+    ///
+    /// 解析失败不致命：退回「不带 ARN」的老行为发请求，不要因为这一步把原本能成功
+    /// 的租户也拖挂。
+    async fn prepare_rest_request_token(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<(String, KiroCredentials)> {
+        let (token, mut credentials) = self.prepare_request_token(id).await?;
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                "凭据 #{} 解析 profileArn 失败，本次按不带 ARN 发起请求: {}",
+                id,
+                e
+            ),
+        }
+        Ok((token, credentials))
+    }
+
     /// 构造**钉死在指定凭据**上的调用上下文（Admin 模型测试用）
     ///
     /// 与 [`Self::acquire_context`] 的区别：完全不参与调度选择——不看优先级、
@@ -3609,7 +3655,7 @@ impl MultiTokenManager {
         &self,
         id: u64,
     ) -> anyhow::Result<ListAvailableModelsResponse> {
-        let (token, credentials) = self.prepare_request_token(id).await?;
+        let (token, credentials) = self.prepare_rest_request_token(id).await?;
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref()).await
@@ -3629,7 +3675,7 @@ impl MultiTokenManager {
             anyhow::bail!("overageStatus 必须是 ENABLED 或 DISABLED");
         }
 
-        let (token, credentials) = self.prepare_request_token(id).await?;
+        let (token, credentials) = self.prepare_rest_request_token(id).await?;
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -5815,10 +5861,33 @@ mod tests {
     }
 
     #[test]
-    fn test_usage_rest_urls_omit_resolved_profile_arn() {
+    fn test_usage_rest_urls_carry_resolved_profile_arn() {
+        // 真实 ARN 必须进 query：部分 IdC 租户缺它就返回
+        // 403 "User is not authorized to make this call."
         let credentials = KiroCredentials {
             profile_arn: Some(
                 "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
+            ),
+            ..Default::default()
+        };
+        let host = "q.us-east-1.amazonaws.com";
+
+        assert_eq!(
+            usage_limits_url(host, &credentials),
+            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123"
+        );
+        assert_eq!(
+            available_models_url(host, &credentials),
+            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123"
+        );
+    }
+
+    #[test]
+    fn test_usage_rest_urls_omit_placeholder_profile_arn() {
+        // BuilderID 占位符不是真实 ARN，外发会让上游按身份不匹配拒绝，必须过滤掉
+        let credentials = KiroCredentials {
+            profile_arn: Some(
+                crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string(),
             ),
             ..Default::default()
         };
