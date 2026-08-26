@@ -1,0 +1,41 @@
+src/kiro/kiro_version.rs
+  s_dc22d921a8df53::t_ee487845a0f256 11
+  s_dc22d921a8df53::t_a9d515fd703b1f 30-36
+Cargo.toml
+  s_dc22d921a8df53::t_1f4a157fe0786f 3
+src/kiro/token_manager.rs
+  s_dc22d921a8df53::t_ad302ceb8bd929 508-515,517-520,523-538,540,543-548,551-556
+  s_dc22d921a8df53::t_72497ac68c4bbd 5888-5891,5894,5899-5916,5919-5920,5925-5926,5928,5932-5938,5940-5949,5951-5952
+  s_dc22d921a8df53::t_09879b18432f8d 624-625,627,629
+  s_dc22d921a8df53::t_13a3b0cd3f375d 588-589,591,593
+  s_dc22d921a8df53::t_ca122dd022a069 719-720,722,724
+  s_dc22d921a8df53::t_3a2b065a0bd8e2 683-684,686,688
+CHANGELOG.md
+  s_dc22d921a8df53::t_ba60ed36c57039 7-19
+Cargo.lock
+  s_9f748d1c1aa020::t_21f9dad739e1a7 1354
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "f06aa94861bfec8071c888079c4c7bf830a9a975",
+  "prompts": {},
+  "sessions": {
+    "s_9f748d1c1aa020": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "82081858-3c43-4a00-8f08-8333cb7f2936",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    },
+    "s_dc22d921a8df53": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7d07ff1c-bf85-4528-b32d-b91bee4930ee",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
