@@ -505,34 +505,55 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
-/// 在用量类 REST URL 上追加真实 profileArn。
-///
-/// 部分 IdC 租户强制要求 profileArn，缺失时上游返回
-/// `403 {"message":"User is not authorized to make this call."}`——注意该文案是
-/// 「缺参数」而非「无权限」，容易被误判成账号没有订阅。
-///
-/// 对不要求 ARN 的租户带上它没有副作用（实测带与不带返回体一致），因此无条件追加。
-/// BuilderID 占位符由 [`KiroCredentials::effective_profile_arn`] 过滤，不会外发。
-fn append_profile_arn(url: &mut String, credentials: &KiroCredentials) {
-    if let Some(arn) = credentials.effective_profile_arn() {
-        url.push_str("&profileArn=");
-        url.push_str(&urlencoding::encode(arn));
+fn profile_arn_query(profile_arn: Option<&str>) -> String {
+    match profile_arn {
+        Some(arn) => format!("&profileArn={}", urlencoding::encode(arn)),
+        None => String::new(),
     }
 }
 
-fn usage_limits_url(host: &str, credentials: &KiroCredentials) -> String {
-    let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-        host
-    );
-    append_profile_arn(&mut url, credentials);
-    url
+/// 用量类接口的 403 回退候选表：把「区域端点 × ARN 形态」摊平成一维。
+///
+/// 每个区域先带真实 profileArn 试，再退回不带。
+///
+/// 为什么要带：部分 IdC 租户强制要求 profileArn，缺失时上游返回
+/// `403 {"message":"User is not authorized to make this call."}`——该文案含义是
+/// 「缺参数」而非「无权限」，容易被误判成账号没有订阅。
+///
+/// 为什么还要留「不带」这一档：该要求是租户相关的，并非全量。实测同为 IdC 的两个
+/// 租户里，一个缺 ARN 即 403，另一个带与不带均返回 200 且响应体一致。既然上游行为
+/// 在灰度推开，就不假设「带上一定更好」，保留旧形态兜底。
+///
+/// BuilderID 占位符由 [`KiroCredentials::effective_profile_arn`] 过滤，这类凭据的
+/// 候选表只有「不带」一种形态，行为与加此参数前完全一致。
+fn usage_api_attempts<'a>(
+    credentials: &'a KiroCredentials,
+    candidates: &[&'static str],
+) -> Vec<(&'static str, Option<&'a str>)> {
+    let mut attempts = Vec::with_capacity(candidates.len() * 2);
+    for region in candidates {
+        if let Some(arn) = credentials.effective_profile_arn() {
+            attempts.push((*region, Some(arn)));
+        }
+        attempts.push((*region, None));
+    }
+    attempts
 }
 
-fn available_models_url(host: &str, credentials: &KiroCredentials) -> String {
-    let mut url = format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host);
-    append_profile_arn(&mut url, credentials);
-    url
+fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
+    format!(
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
+        host,
+        profile_arn_query(profile_arn)
+    )
+}
+
+fn available_models_url(host: &str, profile_arn: Option<&str>) -> String {
+    format!(
+        "https://{}/ListAvailableModels?origin=AI_EDITOR{}",
+        host,
+        profile_arn_query(profile_arn)
+    )
 }
 
 /// 获取使用额度信息
@@ -564,10 +585,12 @@ pub(crate) async fn get_usage_limits(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
+    let attempts = usage_api_attempts(credentials, &candidates);
+
     let mut last_error: Option<String> = None;
-    for (idx, region) in candidates.iter().enumerate() {
+    for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = usage_limits_url(&host, credentials);
+        let url = usage_limits_url(&host, *profile_arn);
 
         let mut request = client
             .get(&url)
@@ -598,12 +621,12 @@ pub(crate) async fn get_usage_limits(
             return Err(error.into());
         }
 
-        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
-        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+        // 403 时依次回退：带 profileArn → 不带 → 备用区域端点（Enterprise/IdC 跨区兼容）
+        if status.as_u16() == 403 && idx + 1 < attempts.len() {
             tracing::debug!(
-                "getUsageLimits 在 {} 返回 403，尝试备用端点 {}",
+                "getUsageLimits 在 {} 返回 403（profileArn={}），尝试下一候选",
                 region,
-                candidates[idx + 1]
+                profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
             continue;
@@ -657,10 +680,12 @@ pub(crate) async fn get_available_models(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
+    let attempts = usage_api_attempts(credentials, &candidates);
+
     let mut last_error: Option<String> = None;
-    for (idx, region) in candidates.iter().enumerate() {
+    for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = available_models_url(&host, credentials);
+        let url = available_models_url(&host, *profile_arn);
 
         let mut request = client
             .get(&url)
@@ -691,12 +716,12 @@ pub(crate) async fn get_available_models(
             return Err(error.into());
         }
 
-        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
-        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+        // 403 时依次回退：带 profileArn → 不带 → 备用区域端点（Enterprise/IdC 跨区兼容）
+        if status.as_u16() == 403 && idx + 1 < attempts.len() {
             tracing::debug!(
-                "ListAvailableModels 在 {} 返回 403，尝试备用端点 {}",
+                "ListAvailableModels 在 {} 返回 403（profileArn={}），尝试下一候选",
                 region,
-                candidates[idx + 1]
+                profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
             continue;
@@ -5860,46 +5885,71 @@ mod tests {
         );
     }
 
+    const TEST_REAL_ARN: &str = "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123";
+    const TEST_REAL_ARN_ENCODED: &str =
+        "arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123";
+
     #[test]
     fn test_usage_rest_urls_carry_resolved_profile_arn() {
-        // 真实 ARN 必须进 query：部分 IdC 租户缺它就返回
+        // 真实 ARN 必须能进 query：部分 IdC 租户缺它就返回
         // 403 "User is not authorized to make this call."
-        let credentials = KiroCredentials {
-            profile_arn: Some(
-                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
-            ),
-            ..Default::default()
-        };
         let host = "q.us-east-1.amazonaws.com";
 
         assert_eq!(
-            usage_limits_url(host, &credentials),
-            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123"
+            usage_limits_url(host, Some(TEST_REAL_ARN)),
+            format!(
+                "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true&profileArn={}",
+                TEST_REAL_ARN_ENCODED
+            )
         );
         assert_eq!(
-            available_models_url(host, &credentials),
-            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123"
+            available_models_url(host, Some(TEST_REAL_ARN)),
+            format!(
+                "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&profileArn={}",
+                TEST_REAL_ARN_ENCODED
+            )
+        );
+
+        // 不带时不能留下空的 profileArn= 残余
+        assert_eq!(
+            usage_limits_url(host, None),
+            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
+        );
+        assert_eq!(
+            available_models_url(host, None),
+            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
         );
     }
 
     #[test]
-    fn test_usage_rest_urls_omit_placeholder_profile_arn() {
-        // BuilderID 占位符不是真实 ARN，外发会让上游按身份不匹配拒绝，必须过滤掉
+    fn test_usage_api_attempts_tries_arn_first_then_without() {
+        // 有真实 ARN：每个区域两档，带 ARN 在前、不带兜底
         let credentials = KiroCredentials {
-            profile_arn: Some(
-                crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string(),
-            ),
+            profile_arn: Some(TEST_REAL_ARN.to_string()),
             ..Default::default()
         };
-        let host = "q.us-east-1.amazonaws.com";
-
         assert_eq!(
-            usage_limits_url(host, &credentials),
-            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
+            usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]),
+            vec![
+                ("us-east-1", Some(TEST_REAL_ARN)),
+                ("us-east-1", None),
+                ("eu-central-1", Some(TEST_REAL_ARN)),
+                ("eu-central-1", None),
+            ]
         );
+    }
+
+    #[test]
+    fn test_usage_api_attempts_omit_placeholder_profile_arn() {
+        // BuilderID 占位符不是真实 ARN，外发会让上游按身份不匹配拒绝。
+        // 这类凭据只剩「不带」一档，行为与引入该参数前完全一致。
+        let credentials = KiroCredentials {
+            profile_arn: Some(crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string()),
+            ..Default::default()
+        };
         assert_eq!(
-            available_models_url(host, &credentials),
-            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
+            usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]),
+            vec![("us-east-1", None), ("eu-central-1", None)]
         );
     }
 

@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.19] - 2026-08-25
+
+主题：0.9.18 的补强——用量类接口的 403 回退加上「不带 ARN」这一档。
+
+### 🐛 带 ARN 与不带 ARN 的双档回退
+
+- **背景**：0.9.18 上线后核对上游，发现同一根因已由上游 PR #74 独立定位并合入。对比两版实现，上游多了一层回退阶梯而本仓库没有，故吸收该部分。
+- **改动**：新增 `usage_api_attempts`，把「区域端点 × ARN 形态」摊平成一维候选表，每个区域先带真实 profileArn 试、再退回不带；`usage_limits_url` / `available_models_url` 改为按次接收 `Option<&str>`（同一次调用内要能表达「这一档不带」，无法再由凭据隐式推导）。请求循环仍是原来的单层结构，只是候选表从 `candidates` 换成 `attempts`。
+- **为什么需要这一档**：0.9.18 的注释把「带上没有副作用」当成了无条件成立的前提，据此无条件追加。但该要求是**租户相关**的：实测同为 IdC 的两个租户，一个缺 ARN 即 403，另一个带与不带均 200 且响应体一致。上游行为正在灰度推开，不宜假设「带上一定更好」，保留旧形态兜底。
+- **兼容性**：`effective_profile_arn` 本就过滤 BuilderID 占位符，这类凭据的候选表只有「不带」一种形态，行为与引入该参数前完全一致。
+- **顺带订正 `kiro_version.rs` 的失实注释**：原文写「该版本无需 profileArn 即可返回订阅与用量」，已被证伪。版本号只影响 User-Agent，不决定是否需要 ARN；缺 ARN 时不同版本报错形态也不同（`0.9.2` 报 403，新版报 400 `Invalid profileArn.`）。
+- **测试**：979 → 980。`test_usage_api_attempts_tries_arn_first_then_without` 钉住阶梯顺序，`test_usage_api_attempts_omit_placeholder_profile_arn` 钉住占位符凭据只剩一档，`test_usage_rest_urls_carry_resolved_profile_arn` 补上「不带时不留空 `profileArn=` 残余」的断言。
+
 ## [0.9.18] - 2026-08-25
 
 主题：**用量类 REST 接口补发 profileArn**——修一条会让新登录的 IdC 凭据永久卡死的自锁。
