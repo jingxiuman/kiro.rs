@@ -1202,6 +1202,18 @@ fn entry_frozen(e: &CredentialEntry, now_ts: i64) -> bool {
     e.credentials.frozen_until.is_some_and(|t| now_ts < t)
 }
 
+/// 额度护栏的**唯一**判据：有效剩余是否已跌破安全垫。
+///
+/// 冷冻与解冻两个方向必须共用这一个函数。若各写各的（例如冻按
+/// `remaining <= reserve`、解冻按 `remaining <= 0`），垫区间 `(0, reserve]`
+/// 内两边同时成立，每轮被动刷新都会冻一次又解一次并各写一次盘。
+///
+/// `reserve = 0` 退化为改造前的「remaining ≤ 0 才算超额」。NaN 视为**未**超额：
+/// 拿不准的余额不该成为断掉调度的理由，真超额了还有 402 冷冻兜底。
+fn quota_exhausted(remaining: f64, reserve: f64) -> bool {
+    remaining <= reserve
+}
+
 /// 统一可调度判据：未禁用 + 未风控冷却 + 未 402 冷冻。
 ///
 /// 存在的理由是「漏一处就静默退化」——这三个条件此前在十余处站点各自手写，
@@ -1243,8 +1255,9 @@ fn unschedulable_message(
     total: usize,
     now: Instant,
     now_ts: i64,
+    quota_blocked: &std::collections::HashSet<u64>,
 ) -> String {
-    let (mut disabled_n, mut frozen_n, mut throttled_n) = (0usize, 0usize, 0usize);
+    let (mut disabled_n, mut frozen_n, mut low_balance_n, mut throttled_n) = (0usize, 0usize, 0usize, 0usize);
     let mut earliest_thaw: Option<i64> = None;
     for e in entries
         .iter()
@@ -1257,6 +1270,11 @@ fn unschedulable_message(
             if let Some(t) = e.credentials.frozen_until {
                 earliest_thaw = Some(earliest_thaw.map_or(t, |cur: i64| cur.min(t)));
             }
+        } else if quota_blocked.contains(&e.id) {
+            // 额度护栏挡下但还没写上冷冻的：有效剩余（含本代次消耗）已跌破安全垫，
+            // 而持久冷冻要等下一次被动余额刷新才落。少了这一档，「全员被护栏挡下」
+            // 会打出三类全零却报全员不可用的自相矛盾文案。
+            low_balance_n += 1;
         } else if e.throttled_until.map(|t| t > now).unwrap_or(false) {
             throttled_n += 1;
         }
@@ -1265,8 +1283,8 @@ fn unschedulable_message(
         .map(|t| format!("，最早解冻 {}", format_local_ts(t)))
         .unwrap_or_default();
     format!(
-        "所有凭据不可调度（禁用 {} / 冷冻 {} / 冷却 {}，共 {}）{}",
-        disabled_n, frozen_n, throttled_n, total, thaw_hint
+        "所有凭据不可调度（禁用 {} / 冷冻 {} / 额度不足 {} / 冷却 {}，共 {}）{}",
+        disabled_n, frozen_n, low_balance_n, throttled_n, total, thaw_hint
     )
 }
 
@@ -1996,6 +2014,12 @@ impl MultiTokenManager {
                 if entry_frozen(e, now_ts) {
                     return false;
                 }
+                // 有效剩余已跌破安全垫：跳过。冷冻是持久态、要等被动刷新才写上，
+                // 这一条看的是「缓存余额 − 本代次消耗」，能在两次刷新之间就拦住
+                // 正在被打穿的凭据。
+                if self.quota_guard_blocks(e.id, group) {
+                    return false;
+                }
                 // 本窗口 RPM 额度已耗尽：跳过，让请求故障转移到下一个账号
                 if self.rpm_exceeded(e, now) {
                     return false;
@@ -2157,6 +2181,9 @@ impl MultiTokenManager {
                             e.id == current_id
                                 && entry_schedulable(e, now, now_ts)
                                 && !excluded.contains_key(&e.id)
+                                // 额度护栏：entry_schedulable 看不见余额，
+                                // 这条不加则 priority 模式下快路径就是护栏的旁路
+                                && !self.quota_guard_blocks(e.id, group)
                                 && !self.rpm_exceeded(e, now)
                                 && credential_matches_request(&e.credentials, e.id, model, group, &credential_support)
                         })
@@ -2225,7 +2252,8 @@ impl MultiTokenManager {
                                 group,
                                 total,
                                 Instant::now(),
-                                Utc::now().timestamp()
+                                Utc::now().timestamp(),
+                                &self.quota_blocked_ids(&entries, group)
                             )
                         );
                     }
@@ -2275,6 +2303,7 @@ impl MultiTokenManager {
                                         total,
                                         Instant::now(),
                                         Utc::now().timestamp(),
+                                        &self.quota_blocked_ids(&entries, group),
                                     )
                                 };
                                 anyhow::bail!("{}", msg);
@@ -2986,6 +3015,88 @@ impl MultiTokenManager {
         }
     }
 
+    /// 额度护栏的安全垫（credits）。见 `Config::quota_guard_reserve`。
+    pub fn quota_guard_reserve(&self) -> f64 {
+        self.config.quota_guard_reserve
+    }
+
+    /// 额度护栏是否拦下该凭据——**选号路径上唯一的余额门槛判据**。
+    ///
+    /// 必须由所有选号入口共用：候选过滤与 priority 模式的 current_id 快路径
+    /// 各判一次的话，快路径那条（走 [`entry_schedulable`]，看不见余额）就是
+    /// 护栏的旁路。冷冻改造时同类判据散在十余处、漏改八处的教训见
+    /// [`entry_schedulable`] 的文档。
+    ///
+    /// 未注入 dispatcher（单测老用例）或该凭据没有可用余额快照时返回 `false`
+    /// ——放行，理由见 [`crate::kiro::dispatch::GroupDispatcher::effective_remaining`]。
+    /// 组内被额度护栏挡下的凭据 id 集合，供 [`unschedulable_message`] 分类计数。
+    /// 就地计算而不在那个自由函数里查：它的两个调用点都已持有 `entries` 锁，
+    /// 而护栏判定要走 dispatcher（不碰 `entries`，故在锁内调用是安全的）。
+    fn quota_blocked_ids(
+        &self,
+        entries: &[CredentialEntry],
+        group: Option<&str>,
+    ) -> std::collections::HashSet<u64> {
+        entries
+            .iter()
+            .filter(|e| self.quota_guard_blocks(e.id, group))
+            .map(|e| e.id)
+            .collect()
+    }
+
+    fn quota_guard_blocks(&self, id: u64, group: Option<&str>) -> bool {
+        let Some(dispatcher) = self.dispatcher.read().clone() else {
+            return false;
+        };
+        dispatcher
+            .effective_remaining(group, id)
+            .is_some_and(|r| quota_exhausted(r, self.quota_guard_reserve()))
+    }
+
+    /// 把一次余额观测应用到冷冻状态上——**余额与冷冻之间唯一的接线口**。
+    ///
+    /// 收敛成一个方法而不是让调用方分别调冻/解冻，是为了让两个方向互斥**由
+    /// 构造保证**：分开写就要在两处各自判一次界，界不一致时垫区间内会反复
+    /// 抖动（见 [`quota_exhausted`]）。
+    ///
+    /// - 跌破安全垫 → 冷冻退出调度池；已在冷冻中则只用 `next_reset_at` 校正
+    ///   截止时间，不重复写盘。
+    /// - 高于安全垫 → 若在冷冻中则提前解冻回池。
+    ///
+    /// 这是 402 之外的**主动**护栏：上游 overage 开启时额度用尽不会回 402，
+    /// 而是直接计费，402 那条链路永远不触发。故不能只靠它。
+    pub fn apply_balance_observation(&self, id: u64, remaining: f64, next_reset_at: Option<i64>) {
+        if !quota_exhausted(remaining, self.quota_guard_reserve()) {
+            self.thaw_if_replenished(id, remaining);
+            return;
+        }
+
+        let already_frozen = {
+            let now_ts = Utc::now().timestamp();
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .is_some_and(|e| entry_frozen(e, now_ts))
+        };
+
+        if !already_frozen {
+            tracing::info!(
+                "凭据 #{} 有效剩余 {:.2} 已跌破安全垫 {:.2}",
+                id,
+                remaining,
+                self.quota_guard_reserve()
+            );
+            if let Err(e) = self.freeze_quota_exceeded(id, "额度护栏") {
+                tracing::warn!("额度护栏冷冻凭据 #{} 失败: {}", id, e);
+                return;
+            }
+        }
+        if let Some(t) = next_reset_at {
+            self.refine_freeze_deadline(id, t);
+        }
+    }
+
     /// 报告指定凭据刷新 Token 失败。
     ///
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
@@ -3354,7 +3465,9 @@ impl MultiTokenManager {
     /// 依赖「余额刷新探测到额度恢复就重新启用」的自愈链路，该链路已随冷冻
     /// 改造删除，于是它退化成了没有出口的死禁用；又因 `disabled_reason` 现在
     /// 会持久化，重启时会被加载迁移转成冷冻，同一动作在重启前后行为相反。
-    pub fn freeze_quota_exceeded(&self, id: u64) -> anyhow::Result<()> {
+    /// `source` 只进日志，用于区分冷冻的触发方（面板一键 / 额度护栏）——同一个
+    /// 写动作有多个调用方后，日志里写死单一来源会给排障递上假归因。
+    pub fn freeze_quota_exceeded(&self, id: u64, source: &str) -> anyhow::Result<()> {
         let now_ts = Utc::now().timestamp();
         let deadline = self.freeze_deadline_for(id, now_ts);
         {
@@ -3364,7 +3477,7 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.credentials.frozen_until = Some(deadline);
-            tracing::info!("凭据 #{} 被面板「一键超额」冷冻至 {}", id, deadline);
+            tracing::info!("凭据 #{} 被{}冷冻至 {}", id, source, deadline);
         }
         self.persist_credentials()?;
         Ok(())
@@ -5304,7 +5417,7 @@ mod tests {
         // 全员因刷新失败被禁用：分类计数全落在「禁用」一档，冷冻/冷却为 0，
         // 且不带「最早解冻」后缀。
         assert!(
-            err.contains("所有凭据不可调度（禁用 2 / 冷冻 0 / 冷却 0，共 2）"),
+            err.contains("所有凭据不可调度（禁用 2 / 冷冻 0 / 额度不足 0 / 冷却 0，共 2）"),
             "错误应分类计数并全部归入禁用，实际: {}",
             err
         );
@@ -5457,7 +5570,7 @@ mod tests {
             err
         );
         assert!(
-            err.contains("所有凭据不可调度（禁用 1 / 冷冻 1 / 冷却 0，共 2）"),
+            err.contains("所有凭据不可调度（禁用 1 / 冷冻 1 / 额度不足 0 / 冷却 0，共 2）"),
             "应与选号路径同源的分类计数，实际: {}",
             err
         );
@@ -5480,9 +5593,16 @@ mod tests {
         manager.set_frozen_until_for_test(2, Some(now_ts + 7200));
 
         let entries = manager.entries.lock();
-        let msg = unschedulable_message(&entries, None, 2, Instant::now(), now_ts);
+        let msg = unschedulable_message(
+            &entries,
+            None,
+            2,
+            Instant::now(),
+            now_ts,
+            &std::collections::HashSet::new(),
+        );
         assert!(
-            msg.contains("所有凭据不可调度（禁用 1 / 冷冻 1 / 冷却 0，共 2）"),
+            msg.contains("所有凭据不可调度（禁用 1 / 冷冻 1 / 额度不足 0 / 冷却 0，共 2）"),
             "禁用+冷冻的凭据不得被重复计数，实际: {}",
             msg
         );
@@ -5528,7 +5648,7 @@ mod tests {
     #[test]
     fn panel_quota_exceeded_action_freezes_instead_of_disabling() {
         let manager = test_manager_with_two_credentials();
-        manager.freeze_quota_exceeded(1).unwrap();
+        manager.freeze_quota_exceeded(1, "面板「一键超额」").unwrap();
 
         let snap = manager.snapshot();
         let e1 = snap.entries.iter().find(|e| e.id == 1).unwrap();
@@ -5658,7 +5778,7 @@ mod tests {
         // 既自相矛盾（available == total 却说全禁用），又与真·全禁用共用
         // 同一个 ops 指纹。
         assert!(
-            err.contains("所有凭据不可调度（禁用 0 / 冷冻 2 / 冷却 0，共 2）"),
+            err.contains("所有凭据不可调度（禁用 0 / 冷冻 2 / 额度不足 0 / 冷却 0，共 2）"),
             "错误应分类计数并全部归入冷冻，实际: {}",
             err
         );
@@ -5687,6 +5807,158 @@ mod tests {
             manager.snapshot().entries.iter().any(|e| e.id == 1 && e.frozen_until.is_none()),
             "提前解冻应清空 frozen_until"
         );
+    }
+
+    /// 余额落进安全垫区间 `(0, reserve]` 时必须自动冷冻——不能等 remaining 转负。
+    ///
+    /// 且同一余额被反复观测时状态必须稳定：冷冻与解冻两个方向若都以
+    /// `remaining <= 0` 为界，垫区间内两边同时成立，每轮被动刷新都会
+    /// 冻一次解一次，并各写一次盘。
+    #[test]
+    fn balance_observation_within_reserve_freezes_and_stays_frozen() {
+        let manager = test_manager_with_two_credentials();
+        // 默认安全垫 200：150 已经踩线，尽管 remaining 仍是正数
+        manager.apply_balance_observation(1, 150.0, None);
+        let first = frozen_until_of(&manager, 1);
+        assert!(first.is_some(), "余额低于安全垫应自动冷冻，实际未冷冻");
+
+        manager.apply_balance_observation(1, 150.0, None);
+        assert_eq!(
+            frozen_until_of(&manager, 1),
+            first,
+            "同一余额重复观测不得改变冷冻状态（冻/解冻抖动）"
+        );
+    }
+
+    /// 余额高于安全垫 → 提前解冻，回到调度池。
+    #[test]
+    fn balance_observation_above_reserve_thaws() {
+        let manager = test_manager_with_two_credentials();
+        manager.report_quota_exhausted(1);
+        assert!(frozen_until_of(&manager, 1).is_some(), "前置：应处于冷冻");
+
+        manager.apply_balance_observation(1, 9000.0, None);
+        assert!(
+            frozen_until_of(&manager, 1).is_none(),
+            "额度已恢复（远高于安全垫）应解冻"
+        );
+    }
+
+    /// `quota_guard_reserve = 0` 必须退化为改造前的「remaining ≤ 0 才算超额」。
+    /// 守的是「新配置项默认值一旦被调成 0，行为要可预期地回到旧语义」。
+    #[test]
+    fn zero_reserve_falls_back_to_remaining_le_zero() {
+        let mut config = Config::default();
+        config.quota_guard_reserve = 0.0;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.apply_balance_observation(1, 150.0, None);
+        assert!(
+            frozen_until_of(&manager, 1).is_none(),
+            "垫为 0 时正余额不得被冷冻"
+        );
+
+        manager.apply_balance_observation(1, 0.0, None);
+        assert!(
+            frozen_until_of(&manager, 1).is_some(),
+            "垫为 0 时 remaining 归零仍应冷冻"
+        );
+    }
+
+    /// 用给定余额建一个带 dispatcher 的两凭据管理器（id 1 是优先级赢家）。
+    fn manager_with_balances(r1: f64, r2: f64) -> MultiTokenManager {
+        let manager = test_manager_with_two_credentials();
+        let cache = std::sync::Arc::new(crate::admin::balance_cache::BalanceCache::new(None));
+        let now_ts = chrono::Utc::now().timestamp() as f64;
+        let mk = |r: f64| crate::admin::balance_cache::CachedBalance {
+            cached_at: now_ts,
+            data: crate::admin::types::BalanceResponse {
+                remaining: r,
+                next_reset_at: Some(now_ts + 86400.0),
+                ..Default::default()
+            },
+        };
+        cache.publish(std::collections::HashMap::from([(1, mk(r1)), (2, mk(r2))]));
+        manager.with_dispatcher(std::sync::Arc::new(
+            crate::kiro::dispatch::GroupDispatcher::new(cache),
+        ))
+    }
+
+    /// 额度护栏必须挡在**所有**模式前面，含 priority 模式的 current_id 快路径。
+    ///
+    /// 快路径（`acquire_context_excluding` 里的 `current_hit`）用
+    /// [`entry_schedulable`] 判定，而那个自由函数看不见余额。护栏若只加在
+    /// `select_next_credential_excluding` 的候选过滤里，priority 模式下
+    /// current_id 一旦指向低余额凭据就会被直接放行——护栏形同虚设，且负载
+    /// 均衡模式在面板上可随时切换，不能靠「生产跑的是 weighted」来兜。
+    #[tokio::test]
+    async fn quota_guard_blocks_current_id_fast_path_in_priority_mode() {
+        // id 1 既是优先级赢家、又是初始 current_id，但余额 50 已跌破默认垫 200
+        let manager = manager_with_balances(50.0, 5000.0);
+
+        let picked = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(
+            picked.id, 2,
+            "跌破安全垫的凭据不得被选中，即便它是 current_id / 优先级赢家"
+        );
+    }
+
+    /// 全组都跌破安全垫 → 直接报错。放行就是继续花钱，正是本次要堵的口子。
+    ///
+    /// 顺带钉住文案：不可调度的原因必须分类计数，否则会打出「禁用 0 / 冷冻 0 /
+    /// 冷却 0，共 2」这种三类全零却报全员不可用的自相矛盾消息（仓库里 "9/1"
+    /// 那次事故的同形态）。
+    #[tokio::test]
+    async fn all_credentials_below_reserve_fails_instead_of_dispatching() {
+        let manager = manager_with_balances(50.0, 10.0);
+
+        let err = manager
+            .acquire_context(None, None)
+            .await
+            .err()
+            .expect("全组跌破安全垫时必须报错，不得降级放行")
+            .to_string();
+        assert!(
+            err.contains("额度不足 2"),
+            "错误应把额度不足单列一类计数，实际: {}",
+            err
+        );
+    }
+
+    /// 没有余额快照 ≠ 已耗尽。新登录、刚导入或刷新失败的凭据拿不到快照，
+    /// 若被护栏当成超额挡下就永远出不了池——0.9.18 的 profileArn 自锁
+    /// （无 ARN → 查不到余额 → 权重 0 → 永不调度 → 永不解析 ARN）就是这个形状。
+    #[tokio::test]
+    async fn missing_balance_snapshot_is_not_treated_as_exhausted() {
+        let manager = test_manager_with_two_credentials();
+        let cache = std::sync::Arc::new(crate::admin::balance_cache::BalanceCache::new(None));
+        // 空缓存：两张凭据都没有余额快照
+        let manager = manager.with_dispatcher(std::sync::Arc::new(
+            crate::kiro::dispatch::GroupDispatcher::new(cache),
+        ));
+
+        let picked = manager
+            .acquire_context(None, None)
+            .await
+            .expect("无余额快照时不得被护栏挡死");
+        assert_eq!(picked.id, 1, "应照常按优先级选号");
+    }
+
+    fn frozen_until_of(manager: &MultiTokenManager, id: u64) -> Option<i64> {
+        manager
+            .snapshot()
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .expect("凭据应存在")
+            .frozen_until
     }
 
     #[test]
@@ -6711,7 +6983,7 @@ mod tests {
         // 关键断言：分类计数之和必须 ≤ total，且只统计组内凭据。
         // 修复前这里是「(3/1)」——available 统计了组外的 3 张。
         assert!(
-            msg.contains("禁用 1 / 冷冻 0 / 冷却 0，共 1"),
+            msg.contains("禁用 1 / 冷冻 0 / 额度不足 0 / 冷却 0，共 1"),
             "分类计数与 total 必须同为组内口径（期望 禁用 1，共 1），实际: {}",
             msg
         );

@@ -259,6 +259,36 @@ impl GroupDispatcher {
         }
     }
 
+    /// 单个凭据的有效剩余（缓存余额 − 本代次已消耗），供额度护栏做门槛判定。
+    ///
+    /// `None` = 当前拿不到可用的余额快照（从未采集 / 过陈旧 / 已跨重置）。
+    /// **「不知道」必须与「已耗尽」分开**：把缺快照当成耗尽，会把新登录或刚
+    /// 导入的凭据永久锁在池外——0.9.18 的 profileArn 自锁（无 ARN → 查不到
+    /// 余额 → 权重恒 0 → 永不被调度 → 永不解析 ARN）就是这个形状。故调用方
+    /// 拿到 `None` 时应放行，交给 402 兜底。
+    ///
+    /// 只读，不推进代次：`consumed` 仅在快照代次与本地代次一致时才计入，
+    /// 不一致说明其中一侧已换代，此时本地累计对这份快照无意义，按 0 算。
+    pub fn effective_remaining(&self, group: Option<&str>, cred_id: u64) -> Option<f64> {
+        let snap = self.balance.snapshot();
+        let now_ts = chrono::Utc::now().timestamp() as f64;
+        let base = snap
+            .entries
+            .get(&cred_id)
+            .and_then(|e| usable_remaining(e, now_ts))?;
+
+        let st = self.state.lock();
+        let consumed = if snap.generation == st.generation {
+            st.consumed
+                .get(&(group.unwrap_or("").to_string(), cred_id))
+                .copied()
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        Some(base - consumed)
+    }
+
     #[cfg(test)]
     pub(crate) fn sticky_len(&self) -> usize {
         self.state.lock().sticky.len()

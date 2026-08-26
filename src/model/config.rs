@@ -179,6 +179,16 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 额度护栏的安全垫（credits，默认 200；0 = 退化为「remaining ≤ 0 才算超额」）。
+    ///
+    /// 有效剩余低于该值的凭据即视为已超额：自动冷冻并退出调度池，不再打上游。
+    /// 为什么不是 0——余额快照最长可陈旧 [`crate::kiro::dispatch::MAX_STALE_SECS`]，
+    /// 且本地消耗计数只覆盖本进程，所以「余额显示归零」时实际早已透支。生产上
+    /// 曾观测到某凭据在开启上游 overage 的情况下透支到 remaining = -202，留垫
+    /// 就是对这段观测延迟的补偿。
+    #[serde(default = "default_quota_guard_reserve")]
+    pub quota_guard_reserve: f64,
+
     /// 单凭证并发上限（默认 2；0 = 禁用门禁）。
     ///
     /// 满载时新请求先排队等原凭证（见下两项），排队失败才切换凭证——
@@ -342,6 +352,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_quota_guard_reserve() -> f64 {
+    200.0
+}
+
 fn default_credential_max_concurrent() -> usize {
     2
 }
@@ -432,6 +446,7 @@ impl Default for Config {
             update_auto_apply: false,
             update_auto_apply_time: default_update_auto_apply_time(),
             load_balancing_mode: default_load_balancing_mode(),
+            quota_guard_reserve: default_quota_guard_reserve(),
             credential_max_concurrent: default_credential_max_concurrent(),
             credential_queue_depth: default_credential_queue_depth(),
             credential_queue_timeout_secs: default_credential_queue_timeout_secs(),

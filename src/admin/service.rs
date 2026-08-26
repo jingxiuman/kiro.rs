@@ -816,7 +816,7 @@ impl AdminService {
             if !exceeded {
                 continue;
             }
-            match self.token_manager.freeze_quota_exceeded(entry.id) {
+            match self.token_manager.freeze_quota_exceeded(entry.id, "面板「一键超额」") {
                 Ok(()) => {
                     disabled_ids.push(entry.id);
                     if entry.id == current_id {
@@ -1077,15 +1077,14 @@ impl AdminService {
                         usage_percentage: balance.usage_percentage,
                         next_reset_at: balance.next_reset_at.map(|v| v as i64),
                     });
-                    let thawed = self
-                        .token_manager
-                        .thaw_if_replenished(entry.id, balance.remaining);
-                    if !thawed {
-                        if let Some(next_reset_at) = balance.next_reset_at {
-                            self.token_manager
-                                .refine_freeze_deadline(entry.id, next_reset_at as i64);
-                        }
-                    }
+                    // 余额与冷冻状态之间唯一的接线口：跌破安全垫则冷冻退池，
+                    // 高于安全垫则提前解冻。冻与解冻必须同一判据、同一处决策，
+                    // 否则安全垫区间内两边同时成立，每轮刷新都冻一次解一次。
+                    self.token_manager.apply_balance_observation(
+                        entry.id,
+                        balance.remaining,
+                        balance.next_reset_at.map(|v| v as i64),
+                    );
                     collected.insert(
                         entry.id,
                         CachedBalance {
