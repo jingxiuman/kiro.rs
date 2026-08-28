@@ -420,6 +420,11 @@ impl KiroCredentials {
     pub fn effective_proxy(&self, global_proxy: Option<&ProxyConfig>) -> Option<ProxyConfig> {
         match self.proxy_url.as_deref() {
             Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
+            // 空字符串视为「未配置专属代理」，与 None 同义回落到全局代理。
+            // 面板清空输入框存的是 "" 而非 null，不拦住会走到下面的分支，
+            // 拿空 URL 去建 ProxyConfig 从而让该凭据的所有请求建连即失败。
+            // 注意与 PROXY_DIRECT 的区别：direct 是「显式不走代理」，空是「没填」。
+            Some(url) if url.trim().is_empty() => global_proxy.cloned(),
             Some(url) => {
                 let mut proxy = ProxyConfig::new(url);
                 if let (Some(username), Some(password)) =
@@ -1289,6 +1294,26 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_effective_proxy_blank_falls_back_to_global() {
+        // 面板清空专属代理输入框存的是 ""（而非 null），语义必须等同「未配置」。
+        // 若不拦住，空 URL 会被当成合法代理，该凭据的请求建连即失败。
+        let global = ProxyConfig::new("http://global:8080");
+        for blank in ["", "   ", "\t"] {
+            let mut creds = KiroCredentials::default();
+            creds.proxy_url = Some(blank.to_string());
+
+            assert_eq!(
+                creds.effective_proxy(Some(&global)),
+                Some(ProxyConfig::new("http://global:8080")),
+                "空白 proxyUrl {:?} 应回落到全局代理",
+                blank
+            );
+            // 无全局代理时等同于不走代理，而不是构造出一个空 URL 的代理
+            assert_eq!(creds.effective_proxy(None), None, "输入 {:?}", blank);
+        }
     }
 
     // ============ 企业 SSO (external_idp) 测试 ============
