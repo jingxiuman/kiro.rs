@@ -1,0 +1,23 @@
+src/main.rs
+  s_c4d095a8d098eb::t_38ba82817e58f3 95-109
+src/kiro/model/credentials.rs
+  s_c4d095a8d098eb::t_ab3062a1e6f5a4 427
+  s_c4d095a8d098eb::t_cb5b836276c0af 1299-1318
+  s_c4d095a8d098eb::t_c80a7967081689 423-426
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a5f235876ab4238933a0c63a44ef0dfca88659b5",
+  "prompts": {},
+  "sessions": {
+    "s_c4d095a8d098eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b0b97ab2-b600-4242-9c81-458a0a7d5534",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
