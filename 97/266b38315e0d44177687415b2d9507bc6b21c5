@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_c4d095a8d098eb::t_c2f3580260fb87 7-20
+Cargo.toml
+  s_c4d095a8d098eb::t_29395fe79daa7a 3
+Cargo.lock
+  s_c4d095a8d098eb::t_ab5171d63d5034 1354
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "97266b38315e0d44177687415b2d9507bc6b21c5",
+  "prompts": {},
+  "sessions": {
+    "s_c4d095a8d098eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b0b97ab2-b600-4242-9c81-458a0a7d5534",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
