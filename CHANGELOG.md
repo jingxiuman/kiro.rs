@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.21] - 2026-08-27
+
+主题：空白 `proxyUrl` 的语义修正——「没填」不等于「填了个空代理」。
+
+### 🐛 面板清空代理输入框会写坏两条路径
+
+- **根因**：admin 面板把代理输入框清空后存的是 `""` 而不是 `null`，而两处代理构造都只判 `None`：
+  - 全局代理（`main.rs`）：`Some("")` 会在启动期拿空 URL 建 reqwest client，进程直接起不来——面板上一次误操作即锁死服务。
+  - 凭据专属代理（`KiroCredentials::effective_proxy`）：空串落进通用的 `Some(url)` 分支被当成合法代理，该凭据此后所有请求建连即失败；失败形态看起来像上游问题，排障方向会被带偏。
+- **改动**：两处都把「空白（含纯空格/制表符）」并入「未配置」。`effective_proxy` 的语义收敛为三档——`"direct"` = 显式不走代理（返回 `None`），空白/未填 = 回落全局代理，其余 = 用它。
+- **空白不能并进 `PROXY_DIRECT` 那一档**：「没填」只在没有全局代理时才等于「不走代理」；有全局代理时必须继承，否则清空专属代理反而变成了绕过全局代理。
+- **来源**：上游 v0.8.0 的同类修复，是本次比对中唯一可直接采纳的一条。
+- **测试**：986 → 987。`test_effective_proxy_blank_falls_back_to_global` 覆盖 `""`/空格/制表符三种空白形态 × 有无全局代理两种情形；改动前该测试失败于 `left: Some(ProxyConfig { url: "" })`，缺陷是实测的不是推测的。
+
 ## [0.9.20] - 2026-08-25
 
 主题：**额度护栏**——超额即退出调度池，不再产生超额花费。
