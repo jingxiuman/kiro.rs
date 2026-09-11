@@ -228,6 +228,21 @@ async fn main() {
         tracing::info!("请求体全量保留已启用（request_bodies/，保留 {} 天）", config.trace_retention_days);
     }
 
+    // 上游侧字节全量保留（storeUpstreamBodies=true 时启用；保留期跟随 trace）。
+    // 与入站存档互补：入站只能证明代理入口干净，要区分「上游篡改」与「模型臆造」
+    // 必须同时留下发往 Kiro 的字节与上游原始响应字节。
+    let upstream_body_store = Some(std::sync::Arc::new(
+        admin::request_body_store::RequestBodyStore::new(
+            cache_dir.join("upstream_bodies"),
+            config.store_upstream_bodies,
+            config.trace_retention_days as u64,
+        ),
+    ))
+    .filter(|s| s.is_enabled());
+    if upstream_body_store.is_some() {
+        tracing::info!("上游请求/响应全量保留已启用（upstream_bodies/，保留 {} 天）", config.trace_retention_days);
+    }
+
     // omitted 思考正文存储（恢复键后端，常开：客户端发 display:omitted 才会写入）
     let thinking_text_store = Some(std::sync::Arc::new(
         admin::request_body_store::RequestBodyStore::new(
@@ -336,6 +351,7 @@ async fn main() {
         let balance_cleanup = balance_store.clone();
         let body_cleanup = request_body_store.clone();
         let thinking_cleanup = thinking_text_store.clone();
+        let upstream_cleanup = upstream_body_store.clone();
         tokio::spawn(async move {
             let day = std::time::Duration::from_secs(24 * 3600);
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -353,6 +369,9 @@ async fn main() {
                 }
                 if let Some(tt) = &thinking_cleanup {
                     tt.cleanup();
+                }
+                if let Some(ub) = &upstream_cleanup {
+                    ub.cleanup();
                 }
                 tokio::time::sleep(day).await;
             }
@@ -494,6 +513,7 @@ async fn main() {
         trace_store.clone(),
         request_body_store.clone(),
         thinking_text_store.clone(),
+        upstream_body_store.clone(),
         Some(dispatcher.clone()),
     );
 
@@ -542,6 +562,7 @@ async fn main() {
                 admin_trace_store,
                 group_manager.clone(),
                 request_body_store.clone(),
+                upstream_body_store.clone(),
             );
 
             // 被动余额刷新（2026-08-22 起）：无流量零查询。选号侧发现快照过期

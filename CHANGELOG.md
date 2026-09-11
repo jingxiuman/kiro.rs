@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.22] - 2026-09-11
+
+主题：**上游侧全量留档**——把「上游发来的原话」也存下来，事故复盘才有对照物。
+
+### 🔍 `storeUpstreamBodies`：发往 Kiro 的请求体 + 上游原始响应字节
+
+- **动机**：2026-09-11 一次事故里模型自称看到了注入指令。入站存档（`storeRequestBodies`）证明了代理入口干净，但链路上没有任何上游侧字节，「上游篡改」与「模型臆造」两条假设当时无法证伪——只有半边证据等于没有证据。
+- **存什么**：`transform_api_body` 之后**实际发出的字节**（每跳一份，重试与端点转换都会改它），以及上游原始响应字节（流式为 AWS event-stream 二进制原样、非流式为原始 body、失败跳为错误 body）。落 `upstream_bodies/<YYYY-MM-DD>/<trace_id>.upstream-{req,resp}-N.{json,bin}.gz`，保留期跟随 `traceRetentionDays`。
+- **默认关**：内容含用户源码与对话，且磁盘占用大约翻倍，显式开启才存。
+- **按跳分文件**：跳序进文件名而不是覆盖同一个——重试跳之间的差异恰恰是「代理这一侧改了什么」的唯一证据。
+- **断流也要留**：响应记录器的 `Drop` 兜底落盘（与 `StreamPhaseGuard` 同一个成因：客户端断开时 unfold 的正常收尾分支根本不执行）。只收到一半的上游字节是复盘最需要的那份，不能因为没走到收尾就丢。超上限时保留已捕获前缀并告警，而不是整份丢弃。
+- **读取**：`GET /api/admin/traces/{trace_id}/upstream-request?attempt=N`（application/json）与 `.../upstream-response?attempt=N`（application/octet-stream），`attempt` 缺省 0，非数字回 400。
+- **测试**：987 → 992。覆盖 `save_ext`/`load_ext` 往返与 ext 路径穿越防御、记录器截断只留前缀、未 `finish` 直接 Drop 仍落盘、sink 回调按跳序产出文件。
+
 ## [0.9.21] - 2026-08-27
 
 主题：空白 `proxyUrl` 的语义修正——「没填」不等于「填了个空代理」。

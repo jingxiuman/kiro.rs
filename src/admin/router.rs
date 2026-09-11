@@ -21,7 +21,8 @@ use super::{
         get_account_throttle_config,
         get_all_credentials, get_credential_balance, get_credential_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_update_config,
-        get_trace_request_body, list_client_keys, list_groups, list_traces, trace_failure_stats,
+        get_trace_request_body, get_trace_upstream_request, get_trace_upstream_response,
+        list_client_keys, list_groups, list_traces, trace_failure_stats,
         ops_error_crosstab, ops_error_fingerprints, ops_overview,
         ops_retry_effectiveness, ops_trend,
         ops_by_credential, ops_by_proxy, ops_events, ops_phase_baseline, poll_idc_login,
@@ -210,6 +211,14 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/traces", get(list_traces))
         .route("/traces/{trace_id}/request-body", get(get_trace_request_body))
+        .route(
+            "/traces/{trace_id}/upstream-request",
+            get(get_trace_upstream_request),
+        )
+        .route(
+            "/traces/{trace_id}/upstream-response",
+            get(get_trace_upstream_response),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

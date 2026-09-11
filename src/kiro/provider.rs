@@ -705,6 +705,10 @@ impl KiroProvider {
 
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(effective_body.as_ref(), &rctx);
+            // 上游侧全量保留：存的是**实际发出的字节**，每跳一份（转换/重试都会改它）
+            if let Some(s) = sink {
+                s.on_upstream_request(attempt as u32, body.as_bytes());
+            }
 
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
             tracing::debug!("实际发送请求体: {}", body);
@@ -780,6 +784,9 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+            if let Some(s) = sink {
+                s.on_upstream_error_body(attempt as u32, body.as_bytes());
+            }
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {

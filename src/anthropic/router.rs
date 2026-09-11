@@ -56,6 +56,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -71,6 +72,7 @@ pub fn create_router(
     trace_store: Option<SharedTraceStore>,
     request_body_store: Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
     thinking_text_store: Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
+    upstream_body_store: Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
     dispatcher: Option<std::sync::Arc<crate::kiro::dispatch::GroupDispatcher>>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
@@ -83,6 +85,7 @@ pub fn create_router(
     state = state.with_dispatcher(dispatcher);
     state.request_body_store = request_body_store;
     state.thinking_text_store = thinking_text_store;
+    state.upstream_body_store = upstream_body_store;
 
     // 需要认证的 /v1 路由
     // 请求体保留启用时才挂原始字节捕获层（层本身有缓冲成本，不白挂）

@@ -265,6 +265,14 @@ pub struct Config {
     #[serde(default)]
     pub store_request_bodies: bool,
 
+    /// 是否全量保留**上游侧**字节：发往 Kiro 的请求体（transform_api_body 之后、
+    /// 每跳一份）与上游原始响应字节（流式为 AWS event-stream 二进制，非流式为原始
+    /// body，失败跳为错误 body），gzip 落盘 upstream_bodies/，保留期跟随
+    /// traceRetentionDays。默认 false：磁盘占用大约翻倍，显式开启才存。
+    /// 用途：区分「上游篡改」与「模型臆造」——入站存档只能证明代理入口干净。
+    #[serde(default)]
+    pub store_upstream_bodies: bool,
+
     /// 请求用量日志（usage_log.*.jsonl + 聚合桶）保留天数（默认 31）。
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
@@ -460,6 +468,7 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             store_request_bodies: false,
+            store_upstream_bodies: false,
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
             model_sync_enabled: false,

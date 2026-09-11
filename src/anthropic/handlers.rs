@@ -150,6 +150,8 @@ pub(crate) struct RequestTracer {
     open_phase: parking_lot::Mutex<Option<(&'static str, Instant)>>,
     /// 流形态摘要：观察发给客户端的事件序列（类型/时刻/字节，不存内容）
     shape: parking_lot::Mutex<super::stream::StreamShape>,
+    /// 上游侧字节存储（storeUpstreamBodies=true 时为 Some）
+    upstream_store: Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -294,7 +296,40 @@ impl RequestTracer {
             phases: parking_lot::Mutex::new(Vec::new()),
             open_phase: parking_lot::Mutex::new(None),
             shape: parking_lot::Mutex::new(super::stream::StreamShape::default()),
+            upstream_store: state.upstream_body_store.clone(),
         }
+    }
+
+    /// 上游侧字节落盘（未启用时零开销）。
+    fn persist_upstream(&self, ext: String, body: &[u8]) {
+        let Some(store) = &self.upstream_store else {
+            return;
+        };
+        if !store.is_enabled() {
+            return;
+        }
+        crate::admin::request_body_store::save_ext_detached(
+            store.clone(),
+            self.trace_id.clone(),
+            ext,
+            body.to_vec(),
+        );
+    }
+
+    /// 为「当前这一跳」建一个上游响应记录器（未启用 storeUpstreamBodies 时 None）。
+    ///
+    /// 跳序取已上报 attempt 数 − 1：provider 在返回 2xx 前已 `on_attempt` 过本跳，
+    /// 于是这里拿到的就是产生该响应的那一跳，与 `upstream-req-N.json` 对得上。
+    pub(crate) fn upstream_recorder(
+        &self,
+    ) -> Option<crate::admin::request_body_store::UpstreamResponseRecorder> {
+        let store = self.upstream_store.as_ref().filter(|s| s.is_enabled())?;
+        let attempt = self.attempts.lock().len().saturating_sub(1);
+        Some(crate::admin::request_body_store::UpstreamResponseRecorder::new(
+            store.clone(),
+            self.trace_id.clone(),
+            format!("upstream-resp-{attempt}.bin"),
+        ))
     }
 
     /// 观察一批即将下发给客户端的 SSE 事件，累积流形态摘要。
@@ -503,6 +538,14 @@ impl TraceSink for RequestTracer {
         let elapsed = self.started_at.elapsed().as_millis() as u64;
         attempt.started_ms = Some(elapsed.saturating_sub(attempt.duration_ms));
         self.attempts.lock().push(attempt);
+    }
+
+    fn on_upstream_request(&self, attempt: u32, body: &[u8]) {
+        self.persist_upstream(format!("upstream-req-{attempt}.json"), body);
+    }
+
+    fn on_upstream_error_body(&self, attempt: u32, body: &[u8]) {
+        self.persist_upstream(format!("upstream-resp-{attempt}.bin"), body);
     }
 }
 
@@ -1363,10 +1406,13 @@ fn create_sse_stream(
     // 段埋点：first_token 段在此打开，guard 承载 streaming 段（详见 StreamPhaseGuard 文档）。
     tracer.open_phase(phase::FIRST_TOKEN);
     let guard = StreamPhaseGuard::new(tracer.clone(), 0);
+    // 上游原始响应字节留档（未启用时 None，零开销）。收尾靠 recorder 自身的 Drop：
+    // 客户端断开时 unfold 的正常收尾分支不会执行，只有 Drop 能保住已收到的半份证据。
+    let recorder = tracer.upstream_recorder();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, ops_feedback, true, Some(guard)),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, ops_feedback, mut first_chunk, mut guard)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, ops_feedback, true, Some(guard), recorder),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, ops_feedback, mut first_chunk, mut guard, mut recorder)| async move {
             if finished {
                 return None;
             }
@@ -1378,6 +1424,9 @@ fn create_sse_stream(
                     match chunk_result {
                         Some(Ok(chunk)) => {
                             tracer.mark_first_token();
+                            if let Some(r) = recorder.as_mut() {
+                                r.push(&chunk);
+                            }
                             sent_bytes += chunk.len() as u64;
                             if let Some(g) = guard.as_mut() {
                                 if first_chunk {
@@ -1413,7 +1462,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard, recorder)))
                         }
                         Some(Err(e)) => {
                             // reqwest 把 body 阶段所有失败压成同一句 Display，归因靠 source 链
@@ -1441,7 +1490,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard, recorder)))
                         }
                         None => {
                             // 流正常结束：先按值消费 guard 收尾 streaming 段，再打开 finish 段——
@@ -1500,7 +1549,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard, recorder)))
                         }
                     }
                 }
@@ -1508,7 +1557,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard, recorder)))
                 }
             }
         },
@@ -1574,6 +1623,8 @@ async fn read_non_stream_body(
     tracer: &RequestTracer,
 ) -> Result<Vec<u8>, NonStreamBodyError> {
     tracer.open_phase(phase::FIRST_TOKEN);
+    // 上游原始响应字节留档（未启用时 None）。错误早退路径由 recorder 的 Drop 兜底。
+    let mut recorder = tracer.upstream_recorder();
     let mut stream = response.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     let mut first_seen = false;
@@ -1588,6 +1639,9 @@ async fn read_non_stream_body(
                     tracer.mark_first_token();
                     tracer.close_phase(phase::FIRST_TOKEN, outcome::SUCCESS, None, None);
                     tracer.open_phase(phase::BODY_READ);
+                }
+                if let Some(r) = recorder.as_mut() {
+                    r.push(&bytes);
                 }
                 buf.extend_from_slice(&bytes);
             }
@@ -1613,6 +1667,9 @@ async fn read_non_stream_body(
                 });
             }
         }
+    }
+    if let Some(r) = recorder.take() {
+        r.finish();
     }
     let total = buf.len() as u64;
     if first_seen {
@@ -2433,6 +2490,9 @@ fn create_buffered_sse_stream(
     // 段埋点：first_token 段在此打开，guard 承载 streaming 段（详见 StreamPhaseGuard 文档）。
     tracer.open_phase(phase::FIRST_TOKEN);
     let guard = StreamPhaseGuard::new(tracer.clone(), 0);
+    // 上游原始响应字节留档（未启用时 None，零开销）。收尾靠 recorder 自身的 Drop：
+    // 客户端断开时 unfold 的正常收尾分支不会执行，只有 Drop 能保住已收到的半份证据。
+    let recorder = tracer.upstream_recorder();
 
     stream::unfold(
         (
@@ -2448,8 +2508,9 @@ fn create_buffered_sse_stream(
             ops_feedback,
             true,
             Some(guard),
+            recorder,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, ops_feedback, mut first_chunk, mut guard)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, ops_feedback, mut first_chunk, mut guard, mut recorder)| async move {
             if finished {
                 return None;
             }
@@ -2464,7 +2525,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard, recorder)));
                     }
 
                     // 然后处理数据流
@@ -2472,7 +2533,10 @@ fn create_buffered_sse_stream(
                         match chunk_result {
                             Some(Ok(chunk)) => {
                                 tracer.mark_first_token();
-                                sent_bytes += chunk.len() as u64;
+                                if let Some(r) = recorder.as_mut() {
+                                r.push(&chunk);
+                            }
+                            sent_bytes += chunk.len() as u64;
                                 if let Some(g) = guard.as_mut() {
                                     if first_chunk {
                                         g.mark_first_chunk();
@@ -2531,7 +2595,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard, recorder)));
                             }
                             None => {
                                 // 流正常结束：先按值消费 guard 收尾 streaming 段，再打开 finish 段——
@@ -2585,7 +2649,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, ops_feedback, first_chunk, guard, recorder)));
                             }
                         }
                     }
@@ -2824,6 +2888,7 @@ mod tests {
             phases: parking_lot::Mutex::new(Vec::new()),
             open_phase: parking_lot::Mutex::new(None),
             shape: parking_lot::Mutex::new(crate::anthropic::stream::StreamShape::default()),
+            upstream_store: None,
         };
 
         tracer.observe_events(&[
@@ -2880,6 +2945,7 @@ mod tests {
             phases: parking_lot::Mutex::new(Vec::new()),
             open_phase: parking_lot::Mutex::new(None),
             shape: parking_lot::Mutex::new(crate::anthropic::stream::StreamShape::default()),
+            upstream_store: None,
         }
     }
 
@@ -3723,7 +3789,47 @@ mod tracer_tests {
             phases: parking_lot::Mutex::new(Vec::new()),
             open_phase: parking_lot::Mutex::new(None),
             shape: parking_lot::Mutex::new(crate::anthropic::stream::StreamShape::default()),
+            upstream_store: None,
         }
+    }
+
+    /// 上游侧留档：sink 回调落盘的文件名必须带跳序，否则重试跳会互相覆盖。
+    /// 同步路径（非 tokio 运行时）下 save 已完成，可直接断言文件存在。
+    #[test]
+    fn on_upstream_request_persists_per_attempt_file() {
+        let root = std::env::temp_dir().join(format!(
+            "kiro-upstream-test-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let store = std::sync::Arc::new(
+            crate::admin::request_body_store::RequestBodyStore::new(root.clone(), true, 7),
+        );
+        let mut tracer = detached_tracer();
+        tracer.trace_id = "t-up".to_string();
+        tracer.upstream_store = Some(store.clone());
+
+        tracer.on_upstream_request(1, b"{}");
+        tracer.on_upstream_error_body(1, b"boom");
+
+        let day = Utc::now().format("%Y-%m-%d").to_string();
+        assert!(
+            root.join(&day).join("t-up.upstream-req-1.json.gz").exists(),
+            "上游请求体应按跳序落盘"
+        );
+        assert_eq!(
+            store.load_ext("t-up", "upstream-req-1.json").as_deref(),
+            Some(b"{}".as_slice())
+        );
+        assert_eq!(
+            store.load_ext("t-up", "upstream-resp-1.bin").as_deref(),
+            Some(b"boom".as_slice())
+        );
+        // 未启用时不产生记录器，避免白跑一遍拷贝
+        assert!(tracer.upstream_recorder().is_some());
+        tracer.upstream_store = None;
+        assert!(tracer.upstream_recorder().is_none());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// 用给定 chunk 序列拼一个真 `reqwest::Response`（走 http::Response 转换，
@@ -4190,6 +4296,7 @@ mod tracer_tests {
             phases: parking_lot::Mutex::new(Vec::new()),
             open_phase: parking_lot::Mutex::new(None),
             shape: parking_lot::Mutex::new(crate::anthropic::stream::StreamShape::default()),
+            upstream_store: None,
         });
         // 与真实调用点保持一致：guard 构造前先手动打开 FIRST_TOKEN，
         // 首个 chunk 到达时再由 guard.mark_first_chunk() 切到 STREAMING

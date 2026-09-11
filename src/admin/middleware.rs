@@ -37,6 +37,8 @@ pub struct AdminState {
     pub groups: SharedGroupManager,
     /// 请求体全量保留存储（storeRequestBodies=true 时启用）
     pub request_body_store: Option<std::sync::Arc<super::request_body_store::RequestBodyStore>>,
+    /// 上游侧字节存储（storeUpstreamBodies=true 时启用）
+    pub upstream_body_store: Option<std::sync::Arc<super::request_body_store::RequestBodyStore>>,
 }
 
 impl AdminState {
@@ -48,6 +50,7 @@ impl AdminState {
         trace_store: SharedTraceStore,
         groups: SharedGroupManager,
         request_body_store: Option<std::sync::Arc<super::request_body_store::RequestBodyStore>>,
+        upstream_body_store: Option<std::sync::Arc<super::request_body_store::RequestBodyStore>>,
     ) -> Self {
         Self {
             admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
@@ -57,6 +60,7 @@ impl AdminState {
             trace_store,
             groups,
             request_body_store,
+            upstream_body_store,
         }
     }
 }

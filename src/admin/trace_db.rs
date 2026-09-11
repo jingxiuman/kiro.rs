@@ -275,6 +275,16 @@ pub trait TraceSink: Send + Sync {
     fn on_queue_wait(&self, credential_id: u64, waited_ms: u64, outcome: &str) {
         let _ = (credential_id, waited_ms, outcome);
     }
+
+    /// 上游请求体（transform_api_body 之后、实际发送的字节），每跳一次。默认 no-op。
+    fn on_upstream_request(&self, attempt: u32, body: &[u8]) {
+        let _ = (attempt, body);
+    }
+
+    /// 非 2xx 跳的上游响应体。默认 no-op。（2xx 的响应流由 handlers 侧的记录器负责）
+    fn on_upstream_error_body(&self, attempt: u32, body: &[u8]) {
+        let _ = (attempt, body);
+    }
 }
 
 /// 查询过滤条件

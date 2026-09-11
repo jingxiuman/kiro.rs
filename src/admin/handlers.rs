@@ -1604,6 +1604,82 @@ pub async fn get_trace_request_body(
     }
 }
 
+/// GET /api/admin/traces/{trace_id}/upstream-request?attempt=0
+/// 读回**发往上游的**请求体（transform_api_body 之后的实际字节，按跳区分）。
+/// 需 storeUpstreamBodies=true。
+pub async fn get_trace_upstream_request(
+    State(state): State<AdminState>,
+    axum::extract::Path(trace_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<UpstreamBodyQuery>,
+) -> impl IntoResponse {
+    upstream_body_response(&state, &trace_id, &q, "upstream-req", "application/json")
+}
+
+/// GET /api/admin/traces/{trace_id}/upstream-response?attempt=0
+/// 读回上游原始响应字节（流式为 AWS event-stream 二进制，故按 octet-stream 下发）。
+pub async fn get_trace_upstream_response(
+    State(state): State<AdminState>,
+    axum::extract::Path(trace_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<UpstreamBodyQuery>,
+) -> impl IntoResponse {
+    upstream_body_response(&state, &trace_id, &q, "upstream-resp", "application/octet-stream")
+}
+
+/// 上游侧读取端点的查询参数：跳序，缺省第 0 跳。
+/// `String` 而非 `u32`：非数字要回 400 自定义错误，而不是 axum 的反序列化错误页。
+#[derive(serde::Deserialize)]
+pub struct UpstreamBodyQuery {
+    #[serde(default)]
+    attempt: Option<String>,
+}
+
+fn upstream_body_response(
+    state: &AdminState,
+    trace_id: &str,
+    q: &UpstreamBodyQuery,
+    prefix: &str,
+    content_type: &'static str,
+) -> axum::response::Response {
+    let attempt = match q.attempt.as_deref() {
+        None | Some("") => 0u32,
+        Some(v) => match v.parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "attempt must be a non-negative integer"})),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let Some(store) = &state.upstream_body_store else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "upstream body retention not enabled (storeUpstreamBodies)"})),
+        )
+            .into_response();
+    };
+    let ext = if content_type == "application/json" {
+        format!("{prefix}-{attempt}.json")
+    } else {
+        format!("{prefix}-{attempt}.bin")
+    };
+    match store.load_ext(trace_id, &ext) {
+        Some(body) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, content_type)],
+            body,
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "upstream body not found (expired, unknown trace_id or attempt)"})),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /api/admin/traces/failure-stats
 /// 按凭据聚合失败次数（鉴权 / 账号风控 / 其他三类），用于卡片分色展示。
 /// 返回 { "<credentialId>": { auth, throttle, other }, ... }

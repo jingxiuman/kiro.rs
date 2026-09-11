@@ -52,6 +52,9 @@ pub struct AppState {
     pub request_body_store: Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
     /// omitted 思考正文存储（恢复键 kiro-thinking-v1 的后端，常开）
     pub thinking_text_store: Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
+    /// 上游侧字节存储（可选，storeUpstreamBodies=true 时启用）：
+    /// 发往 Kiro 的请求体与上游原始响应字节
+    pub upstream_body_store: Option<std::sync::Arc<crate::admin::request_body_store::RequestBodyStore>>,
     /// weighted 模式的组内选号 dispatcher（可选，未启用 weighted 时为 None）。
     /// 供消耗回写等下游任务从 `state.dispatcher` 取句柄，与 `token_manager`
     /// 内部持有的是同一个 `Arc`（由 main.rs 双向注入）。
@@ -103,6 +106,7 @@ impl AppState {
             trace_store: None,
             request_body_store: None,
             thinking_text_store: None,
+            upstream_body_store: None,
             dispatcher: None,
         }
     }
