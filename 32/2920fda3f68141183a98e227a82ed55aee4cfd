@@ -1,0 +1,59 @@
+src/admin/handlers.rs
+  s_4d45b3228f805a::t_6ab57949ba3b49 950-963
+  s_4d45b3228f805a::t_2ecec23450be76 2342-2368
+  s_4d45b3228f805a::t_a14bde33b74cdf 906-907
+  s_4d45b3228f805a::t_f137680bda6236 1019-1032
+src/admin/types.rs
+  s_4d45b3228f805a::t_ecc858d8f494fd 1068-1071
+  s_4d45b3228f805a::t_f8a282f993289a 1045-1047
+  s_4d45b3228f805a::t_5902c9823ab358 1016-1020
+Cargo.toml
+  s_4d45b3228f805a::t_a17885501a6d9d 54-58
+  s_4d45b3228f805a::t_e91bae817804a1 3
+src/anthropic/middleware.rs
+  s_4d45b3228f805a::t_21203ba0125d06 154-161
+  s_4d45b3228f805a::t_4043af6ffadbe8 179,216
+  s_4d45b3228f805a::t_b3d0ab2f4e947d 180-214
+  s_4d45b3228f805a::t_531fa0cf0362c2 13
+  s_4d45b3228f805a::t_9e430c9e35f27b 239-331
+admin-ui/src/types/api.ts
+  s_4d45b3228f805a::t_53d3daf15e2301 397-398
+  s_4d45b3228f805a::t_f7a5c2eb7fe3c2 378-381
+  s_4d45b3228f805a::t_f5ae16c77ce85b 413-414
+src/admin/client_keys.rs
+  s_4d45b3228f805a::t_02929c09af6e0c 630-694
+  s_4d45b3228f805a::t_d4be55a7030dc0 459,471-473,490-520
+  s_4d45b3228f805a::t_adedf85ec71950 48-55
+  s_4d45b3228f805a::t_b036b6d34ff54c 602-603,611,613,717-718,733,749,762-763
+  s_4d45b3228f805a::t_c8cda14a03be14 68-82
+  s_4d45b3228f805a::t_49893cf4875a98 203
+  s_4d45b3228f805a::t_e73f374287aa00 247
+  s_4d45b3228f805a::t_7c4a1088702e94 474-484
+admin-ui/src/components/client-keys-page.tsx
+  s_4d45b3228f805a::t_72dbdfcdd69a7c 412-427,522-537
+  s_4d45b3228f805a::t_9e430c9e35f27b 538
+  s_4d45b3228f805a::t_d0288eb124d808 33-42,319-327
+  s_4d45b3228f805a::t_c113a2647da7ce 69,78,92,99,181,191-198
+  s_4d45b3228f805a::t_db738410fb15a5 257
+CHANGELOG.md
+  s_4d45b3228f805a::t_a2f8babee56ddf 23
+  s_4d45b3228f805a::t_2d2505ab89e4a4 7-22,24
+Cargo.lock
+  s_4d45b3228f805a::t_002d001f370b6f 1354,1382
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "322920fda3f68141183a98e227a82ed55aee4cfd",
+  "prompts": {},
+  "sessions": {
+    "s_4d45b3228f805a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59468e09-0703-4335-ba04-fbd3293f8b20",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
