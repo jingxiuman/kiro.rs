@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.23] - 2026-09-20
+
+主题：额度护栏的排除语义修正——护栏与冷冻是同一件事的两个阶段，粘滞判定只认后者。
+
+### 🐛 跌破安全垫被误判成「短暂拥塞」，粘滞会话在窗口内反复换号
+
+- **根因**：`select_next_credential_excluding` 把落选凭据分类成 `Durable`/`Transient` 时，`durable` 是从凭据状态**重新推断**的（`disabled || entry_frozen`），而不是从过滤原因继承。0.9.20 给候选过滤加额度护栏（`quota_guard_blocks`）时只改了过滤器、没改分类器，于是「只因跌破安全垫被踢出候选、但 402 冷冻尚未落盘」的凭据被算作 `Transient`。
+- **后果**：`GroupDispatcher::pick` 对 `Transient` 的处理是「本次换号但**保留**粘滞记录」。绑定始终钉在用不了的号上不迁移，会话每次请求都重新按有效剩余挑一个替补——每换一次白丢一次 prompt cache，且面板上报的选号原因是 `TransientFallback` 而非 `StickyMigrated`，看不出是护栏在迁移会话。
+- **窗口**：护栏看「缓存余额 − 本代次消耗」当场生效，冷冻要等被动刷新才落盘；冷冻一旦写上，`entry_frozen` 自然让分类恢复正确。故缺陷只活在两者之间，**最长一个余额刷新周期**。
+- **改动**：`durable` 判据独立补判一次护栏 `|| self.quota_guard_blocks(e.id, group)`。修在生产者侧而非 `pick` 的消费侧——`ExclusionKind` 就是 `pick` 的输入契约，在消费侧补判等于让每个消费者各记一遍规则，下一个加过滤条件的人还会漏。
+- **触发条件当前不成立**：现网 5 张凭据最低余额约 885，远高于默认垫 200，本版上线不会产生可观测的行为变化。修的是将来余额下行时的正确性。
+- **测试**：992 → 993。新增 `quota_guard_exclusion_migrates_sticky_binding`：三步差分（建立绑定 → 压到垫下换号 → 余额恢复且重新领先仍须停在新号），只看对外选号结果、不读内部状态；旧行为下第三步会因绑定回弹而失败。
+
 ## [0.9.22] - 2026-09-11
 
 主题：**上游侧全量留档**——把「上游发来的原话」也存下来，事故复盘才有对照物。

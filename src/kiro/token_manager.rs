@@ -2077,9 +2077,15 @@ impl MultiTokenManager {
                 // 账号按原因分类，供 pick 内部的粘滞判定使用。优先沿用调用方
                 // 已给出的分类（如并发门禁 queue_excluded 恒为 Transient——
                 // 队满/超时是短暂拥塞）；调用方未分类的按下面的规则推断：
-                // - Durable（应迁移粘滞会话）：`disabled`，以及 402 `frozen_until`。
-                //   冷冻按天计（截止取 next_reset_at，通常是下一个月度重置），
-                //   粘滞会话与其在这么长的窗口里反复抖动，不如一次性迁走。
+                // - Durable（应迁移粘滞会话）：`disabled`，402 `frozen_until`，
+                //   以及额度护栏跌破安全垫。冷冻按天计（截止取 next_reset_at，
+                //   通常是下一个月度重置），粘滞会话与其在这么长的窗口里反复
+                //   抖动，不如一次性迁走。护栏与冷冻是同一件事的两个阶段——
+                //   护栏看「缓存余额 − 本代次消耗」当场生效，冷冻要等被动刷新
+                //   才落盘——所以这里必须**独立**判一次护栏：只看 frozen_until
+                //   会让两者之间的窗口（最长一个余额刷新周期）里的护栏排除被
+                //   误判成 Transient，粘滞钉在用不了的号上不迁移，会话在剩余
+                //   候选间按有效剩余轮转，每换一次白丢一次 prompt cache。
                 // - Transient（保留粘滞）：`throttled_until` 冷却与 RPM 窗口
                 //   超限，都是几十秒到半小时自愈的临时状态，迁移只会白丢
                 //   prompt cache。
@@ -2088,7 +2094,9 @@ impl MultiTokenManager {
                         .iter()
                         .filter(|e| !cands.iter().any(|c| c.id == e.id))
                         .map(|e| {
-                            let durable = e.disabled || entry_frozen(e, now_ts);
+                            let durable = e.disabled
+                                || entry_frozen(e, now_ts)
+                                || self.quota_guard_blocks(e.id, group);
                             let kind = excluded.get(&e.id).copied().unwrap_or(if durable {
                                 crate::kiro::dispatch::ExclusionKind::Durable
                             } else {
@@ -5929,6 +5937,67 @@ mod tests {
             err.contains("额度不足 2"),
             "错误应把额度不足单列一类计数，实际: {}",
             err
+        );
+    }
+
+    /// 护栏排除的语义必须是 **Durable**：跌破安全垫要等额度刷新，是小时级状态，
+    /// 不是并发门禁那种秒级拥塞。归类错成 `Transient` 时，`GroupDispatcher::pick`
+    /// 走「本次换号但保留粘滞记录」的分支，绑定始终钉在用不了的号上，会话在剩余
+    /// 候选间按有效剩余轮转——每换一次毁一次 prompt cache，直到 402 冷冻落盘才
+    /// 自愈（最长一个余额刷新周期）。
+    ///
+    /// 差分设计（三步，不读内部状态，只看对外选号结果）：
+    /// 1. id1 有效剩余领先 → 选中 id1，建立粘滞绑定
+    /// 2. id1 跌破默认垫 200 → 本次必须换到 id2（Transient / Durable 都满足，非判别点）
+    /// 3. id1 余额恢复且重新领先 → **仍须停在 id2**。只有绑定已迁移才会如此；
+    ///    保留旧绑定则粘滞命中 id1 回弹，断言在此失败。
+    #[tokio::test]
+    async fn quota_guard_exclusion_migrates_sticky_binding() {
+        let cache = std::sync::Arc::new(crate::admin::balance_cache::BalanceCache::new(None));
+        let publish = |r1: f64, r2: f64| {
+            let now_ts = chrono::Utc::now().timestamp() as f64;
+            let mk = |r: f64| crate::admin::balance_cache::CachedBalance {
+                cached_at: now_ts,
+                data: crate::admin::types::BalanceResponse {
+                    remaining: r,
+                    next_reset_at: Some(now_ts + 86400.0),
+                    ..Default::default()
+                },
+            };
+            cache.publish(std::collections::HashMap::from([(1, mk(r1)), (2, mk(r2))]));
+        };
+
+        let manager = test_manager_with_two_credentials().with_dispatcher(std::sync::Arc::new(
+            crate::kiro::dispatch::GroupDispatcher::new(cache.clone()),
+        ));
+        manager
+            .set_load_balancing_mode("weighted".to_string())
+            .unwrap();
+        let sticky = Some("session-quota-guard-migration");
+        let none = std::collections::HashMap::new();
+
+        publish(5000.0, 4000.0);
+        let first = manager
+            .acquire_context_excluding(None, None, &none, sticky)
+            .await
+            .expect("前置条件：应能取到号");
+        assert_eq!(first.id, 1, "前置条件：有效剩余领先者应被选中并建立粘滞绑定");
+
+        publish(50.0, 4000.0);
+        let second = manager
+            .acquire_context_excluding(None, None, &none, sticky)
+            .await
+            .expect("还有一张健康凭据，不应取号失败");
+        assert_eq!(second.id, 2, "跌破安全垫的凭据不得被选中");
+
+        publish(9000.0, 4000.0);
+        let third = manager
+            .acquire_context_excluding(None, None, &none, sticky)
+            .await
+            .expect("应能取到号");
+        assert_eq!(
+            third.id, 2,
+            "护栏排除属 Durable 语义：绑定应已迁移到 id2，不得因 id1 余额恢复而回弹"
         );
     }
 
