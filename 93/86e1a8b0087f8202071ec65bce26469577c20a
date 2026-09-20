@@ -1,0 +1,46 @@
+admin-ui/src/types/api.ts
+  s_4d45b3228f805a::t_7717eba2e7afd9 492-505
+src/admin/usage_store.rs
+  s_4d45b3228f805a::t_fa3936f8ba0133 21-23
+  s_4d45b3228f805a::t_543a350b688291 276-337
+  s_4d45b3228f805a::t_a3f60aca9dec1b 948-991
+admin-ui/src/components/charts/key-bar-chart.tsx
+  s_4d45b3228f805a::t_f414cfbf354dd5 1-180
+Cargo.toml
+  s_4d45b3228f805a::t_81d3813a5a08b6 3
+admin-ui/src/api/stats.ts
+  s_4d45b3228f805a::t_7717eba2e7afd9 12,61-62
+  s_4d45b3228f805a::t_7ef3eefc3142f5 63-67
+admin-ui/src/components/overview-page.tsx
+  s_4d45b3228f805a::t_227d40c7db7411 669-671
+  s_4d45b3228f805a::t_c9fd2b3ee8a2e2 8,26,31,97,102,146,626,632,639,642,647-668
+src/admin/router.rs
+  s_4d45b3228f805a::t_ecc516d6a6bbe9 39-40,188
+CHANGELOG.md
+  s_4d45b3228f805a::t_61f28d5b25b2f7 7-21
+src/admin/usage_stats.rs
+  s_4d45b3228f805a::t_731647b885b62b 134-152
+admin-ui/src/hooks/use-stats.ts
+  s_4d45b3228f805a::t_63044970c82757 73-76
+  s_4d45b3228f805a::t_7717eba2e7afd9 5,69-72
+src/admin/handlers.rs
+  s_4d45b3228f805a::t_feff2dd5194aa8 1283-1334
+Cargo.lock
+  s_4d45b3228f805a::t_088e51f64333a7 1354
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9386e1a8b0087f8202071ec65bce26469577c20a",
+  "prompts": {},
+  "sessions": {
+    "s_4d45b3228f805a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59468e09-0703-4335-ba04-fbd3293f8b20",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
