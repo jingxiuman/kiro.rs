@@ -45,6 +45,14 @@ pub struct ClientKey {
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
+    /// 累计 credit 上限（可选）。`total_credits` 达到该值后本 Key 的计费请求
+    /// 一律 429。None = 不限。老数据无此字段，默认 None。
+    ///
+    /// 这是**软上限**：判定在请求进入时、扣费在请求结束时，并发在途请求会同时
+    /// 通过检查，实际超出量约为「在途请求数 × 单次最大 credits」（流式与
+    /// WebSearch 多轮会放大）。硬上限需要预扣—结算—归还，代价大一个量级。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_credits: Option<f64>,
     /// 绑定的账号分组名（可选）
     ///
     /// 设置后，用该 Key 发起的请求只会调度到 groups 包含此分组名的上游账号（严格隔离）。
@@ -55,6 +63,21 @@ pub struct ClientKey {
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_system: bool,
+}
+
+/// 入口 Key 的鉴权结论。
+///
+/// 三态而非 `Option<u64>`：超限与「Key 不存在」必须区分——前者是 429、
+/// 后者是 401，且前者要带回 id 让不计费的辅助端点（models / count_tokens）
+/// 仍能正常服务。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAuth {
+    /// 明文不匹配任何启用中的 Key
+    Rejected,
+    /// 命中，但累计 credit 已达上限。**未**计入调用次数。
+    Exhausted(u64),
+    /// 命中且放行，已计次
+    Granted(u64),
 }
 
 /// `by_key` 仅用于判重；鉴权扫描 `entries` 并做常量时间比较。
@@ -177,6 +200,7 @@ impl ClientKeyManager {
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
             total_credits: 0.0,
+            max_credits: None,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
         };
@@ -220,6 +244,7 @@ impl ClientKeyManager {
                     total_cache_creation_tokens: 0,
                     total_cache_read_tokens: 0,
                     total_credits: 0.0,
+                    max_credits: None,
                     group: None,
                     is_system: true,
                 },
@@ -431,7 +456,7 @@ impl ClientKeyManager {
     }
 
     /// 不校验前缀，常量时间匹配所有启用 Key；命中后更新使用记录。
-    pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
+    pub fn verify_and_touch(&self, presented: &str) -> KeyAuth {
         let mut inner = self.inner.write();
         let mut hit_id: Option<u64> = None;
         for (id, ck) in inner.entries.iter() {
@@ -443,13 +468,56 @@ impl ClientKeyManager {
                 // 不 break，继续完整扫描以保持常量时间
             }
         }
-        let id = hit_id?;
+        let Some(id) = hit_id else {
+            return KeyAuth::Rejected;
+        };
+        // 超限判定必须在自增之前、且与之处在同一把写锁内：两段式（先 read 判、
+        // 再 write 自增）会让「判定通过 → 别的线程扣费 → 本线程仍计次」成立，
+        // 面板上表现为「被拒的请求也在涨调用数」。
+        // 位置也不能上移到扫描循环内——循环刻意不 break 以保持常量时间，提前
+        // return 会按命中位置泄露时序。
+        if let Some(entry) = inner.entries.get(&id)
+            && let Some(max) = entry.max_credits
+            && entry.total_credits >= max
+        {
+            return KeyAuth::Exhausted(id);
+        }
         if let Some(entry) = inner.entries.get_mut(&id) {
             entry.total_calls += 1;
             entry.last_used_at = Some(Utc::now().to_rfc3339());
         }
         // 不在每次请求都落盘（高频写入），由 record_usage / 定期 flush 持久化
-        Some(id)
+        KeyAuth::Granted(id)
+    }
+
+    /// 设置 / 清除累计 credit 上限。返回 false 表示未改动（Key 不存在、
+    /// 系统 Key、或值非法）。
+    pub fn set_max_credits(&self, id: u64, max: Option<f64>) -> bool {
+        if let Some(v) = max
+            && (!v.is_finite() || v <= 0.0)
+        {
+            return false;
+        }
+        let mut inner = self.inner.write();
+        let Some(entry) = inner.entries.get_mut(&id) else {
+            return false;
+        };
+        if entry.is_system {
+            return false;
+        }
+        entry.max_credits = max;
+        self.save_locked(&inner);
+        true
+    }
+
+    /// 读某 Key 的累计调用次数；Key 不存在返回 0。
+    pub fn total_calls_of(&self, id: u64) -> u64 {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .map(|e| e.total_calls)
+            .unwrap_or(0)
     }
 
     /// 在请求结束时累计 Token 用量并落盘
@@ -531,8 +599,8 @@ mod tests {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("test".to_string(), None, None);
         assert!(entry.key.starts_with("sk-"));
-        assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
-        assert_eq!(mgr.verify_and_touch("nope"), None);
+        assert_eq!(mgr.verify_and_touch(&entry.key), KeyAuth::Granted(entry.id));
+        assert_eq!(mgr.verify_and_touch("nope"), KeyAuth::Rejected);
     }
 
     #[test]
@@ -540,9 +608,9 @@ mod tests {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("test".to_string(), None, None);
         mgr.set_disabled(entry.id, true);
-        assert_eq!(mgr.verify_and_touch(&entry.key), None);
+        assert_eq!(mgr.verify_and_touch(&entry.key), KeyAuth::Rejected);
         mgr.set_disabled(entry.id, false);
-        assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
+        assert_eq!(mgr.verify_and_touch(&entry.key), KeyAuth::Granted(entry.id));
     }
 
     #[test]
@@ -557,6 +625,71 @@ mod tests {
         assert_eq!(e.total_output_tokens, 80);
         assert_eq!(e.total_cache_creation_tokens, 5);
         assert_eq!(e.total_cache_read_tokens, 10);
+    }
+
+    /// 超限必须「不放行且不计次」。计次发生在 `verify_and_touch` 内部，
+    /// 所以判定必须与自增在同一把写锁里完成——两段式（先 read 判、再 write 自增）
+    /// 会让超限请求仍然把 total_calls 顶上去，面板上看到「被拒绝的请求也在涨调用数」。
+    #[test]
+    fn exhausted_key_is_rejected_without_counting_the_call() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("capped".to_string(), None, None);
+        assert!(mgr.set_max_credits(entry.id, Some(10.0)));
+        mgr.record_usage(entry.id, 0, 0, 0, 0, 10.0);
+
+        let before = mgr.total_calls_of(entry.id);
+        assert!(
+            matches!(mgr.verify_and_touch(&entry.key), KeyAuth::Exhausted(id) if id == entry.id),
+            "用满上限的 Key 必须判为超限，且要带回 id 供豁免路径继续使用"
+        );
+        assert_eq!(
+            mgr.total_calls_of(entry.id),
+            before,
+            "超限请求不得计入调用次数"
+        );
+    }
+
+    /// 上限之下照常放行并计次。没有这条，上面那条可以靠「永远返回 Exhausted」通过。
+    #[test]
+    fn key_below_max_credits_is_granted_and_counted() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("capped".to_string(), None, None);
+        assert!(mgr.set_max_credits(entry.id, Some(10.0)));
+        mgr.record_usage(entry.id, 0, 0, 0, 0, 9.5);
+
+        let before = mgr.total_calls_of(entry.id);
+        assert!(matches!(mgr.verify_and_touch(&entry.key), KeyAuth::Granted(id) if id == entry.id));
+        assert_eq!(mgr.total_calls_of(entry.id), before + 1);
+    }
+
+    /// 未设上限的 Key 不受影响——绝大多数存量 Key 是这种。
+    #[test]
+    fn key_without_max_credits_is_never_exhausted() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("uncapped".to_string(), None, None);
+        mgr.record_usage(entry.id, 0, 0, 0, 0, 1_000_000.0);
+        assert!(matches!(mgr.verify_and_touch(&entry.key), KeyAuth::Granted(_)));
+    }
+
+    /// 系统 Key（id=0）的 total_credits 恒为 0（`UsageRecordHook::record` 只对
+    /// key_id != 0 回写），给它配上限等于配了个永不生效的值。宁可在唯一的写入口
+    /// 拒绝，也不要让面板上存在一个静默失效的设置。
+    #[test]
+    fn system_key_rejects_max_credits() {
+        let mgr = ClientKeyManager::new();
+        mgr.sync_system_key("system".to_string(), None, "sk-system".to_string());
+        assert!(
+            !mgr.set_max_credits(0, Some(100.0)),
+            "系统 Key 不得设置累计上限"
+        );
+    }
+
+    /// 存量 client_api_keys.json 没有 maxCredits 字段，必须照常反序列化。
+    #[test]
+    fn legacy_json_without_max_credits_deserializes() {
+        let json = r#"[{"id":7,"key":"sk-legacy","name":"old","createdAt":"2026-01-01T00:00:00Z"}]"#;
+        let keys: Vec<ClientKey> = serde_json::from_str(json).expect("存量文件必须能读");
+        assert_eq!(keys[0].max_credits, None);
     }
 
     #[test]
@@ -581,8 +714,8 @@ mod tests {
         assert_eq!(rotated.group.as_deref(), Some("groupA"));
         assert_eq!(rotated.total_input_tokens, 100);
         assert_eq!(rotated.total_output_tokens, 50);
-        assert_eq!(mgr.verify_and_touch(&old_key), None);
-        assert_eq!(mgr.verify_and_touch(&rotated.key), Some(entry.id));
+        assert_eq!(mgr.verify_and_touch(&old_key), KeyAuth::Rejected);
+        assert_eq!(mgr.verify_and_touch(&rotated.key), KeyAuth::Granted(entry.id));
     }
 
     #[test]
@@ -597,7 +730,7 @@ mod tests {
         mgr.sync_system_key("默认密钥".into(), None, "custom-api-key".into());
         assert!(mgr.is_system(0));
         assert_eq!(mgr.list().first().map(|k| k.id), Some(0));
-        assert_eq!(mgr.verify_and_touch("custom-api-key"), Some(0));
+        assert_eq!(mgr.verify_and_touch("custom-api-key"), KeyAuth::Granted(0));
         mgr.sync_system_key("默认密钥".into(), None, "custom-api-key".into());
         assert_eq!(mgr.list().iter().filter(|k| k.is_system).count(), 1);
     }
@@ -613,7 +746,7 @@ mod tests {
             Some(Some("group-a".into())),
         );
         mgr.record_usage(0, 100, 50, 5, 10, 1.5);
-        assert_eq!(mgr.verify_and_touch("custom-a"), Some(0));
+        assert_eq!(mgr.verify_and_touch("custom-a"), KeyAuth::Granted(0));
         mgr.set_disabled(0, true);
 
         let conflicting = mgr.create_with_key(
@@ -626,8 +759,8 @@ mod tests {
 
         mgr.sync_system_key("默认密钥".into(), None, "custom-b".into());
 
-        assert_eq!(mgr.verify_and_touch("custom-a"), None);
-        assert_eq!(mgr.verify_and_touch("custom-b"), Some(0));
+        assert_eq!(mgr.verify_and_touch("custom-a"), KeyAuth::Rejected);
+        assert_eq!(mgr.verify_and_touch("custom-b"), KeyAuth::Granted(0));
         let entries = mgr.list();
         assert_eq!(entries.len(), 1);
         let system = &entries[0];

@@ -1351,7 +1351,7 @@ dependencies = [
 
 [[package]]
 name = "kiro-rs"
-version = "0.9.23"
+version = "0.9.24"
 dependencies = [
  "anyhow",
  "axum",
@@ -1379,6 +1379,7 @@ dependencies = [
  "tar",
  "thiserror 1.0.69",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

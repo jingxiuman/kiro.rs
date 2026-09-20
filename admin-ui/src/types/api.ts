@@ -375,6 +375,10 @@ export interface ClientKeyItem {
   totalOutputTokens: number
   totalCacheCreationTokens: number
   totalCacheReadTokens: number
+  /** 累计 credit 计费量 */
+  totalCredits: number
+  /** 累计 credit 上限；未设上限时后端不下发该键 */
+  maxCredits?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
@@ -390,6 +394,8 @@ export interface CreateClientKeyRequest {
   name: string
   description?: string
   group?: string
+  /** 累计 credit 上限；缺省或 <= 0 表示不限 */
+  maxCredits?: number
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -404,6 +410,8 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
+  /** 累计 credit 上限。字段缺省 = 不改动；传 0（或负数）= 清除上限 */
+  maxCredits?: number
 }
 
 // ============ 用量统计 ============

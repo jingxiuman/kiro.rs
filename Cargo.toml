@@ -1,6 +1,6 @@
 [package]
 name = "kiro-rs"
-version = "0.9.23"
+version = "0.9.24"
 edition = "2024"
 
 [features]
@@ -51,3 +51,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }  # zip
 # crates.io 不发布的 cmake 源码。因此本地时区切桶在 Rust 侧预计算（hour_ts/day_ts
 # 列），历史 JSONL 导入走 serde 逐行解析。
 duckdb = { version = "1", features = ["bundled"] }  # usage/trace/ops 统一存储（kiro.duckdb，自带源码）
+
+[dev-dependencies]
+# 仅测试用：给中间件做 HTTP 层断言（ServiceExt::oneshot）。tower 0.5 已随 axum
+# 进依赖树（Cargo.lock 既有条目），这里只是显式启用 util feature，不引入新 crate。
+tower = { version = "0.5", features = ["util"] }

@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 
-use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::client_keys::{KeyAuth, SharedClientKeyManager};
 use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
 use crate::admin::usage_store::SharedUsageStore;
 use crate::common::auth;
@@ -151,6 +151,14 @@ impl AppState {
     }
 }
 
+/// 累计 credit 上限的豁免端点：模型列表与 token 计数不产生 credit。
+///
+/// 挡住它们不会省下任何额度，只会让客户端表现成「连不上」而不是「额度用完」，
+/// 把排查方向带偏。`ends_with` 同时覆盖 `/v1` 与 `/cc/v1` 两套前缀。
+fn credit_limit_exempt(path: &str) -> bool {
+    path.ends_with("/models") || path.ends_with("/messages/count_tokens")
+}
+
 /// API Key 认证中间件
 ///
 /// 所有入口 Key 统一按已存储的完整值精确匹配，不限制前缀。命中后向请求扩展注入
@@ -168,16 +176,44 @@ pub async fn auth_middleware(
         }
     };
 
-    if let Some(mgr) = &state.client_keys
-        && let Some(id) = mgr.verify_and_touch(&presented) {
-            let group = mgr.group_of(id);
-            request.extensions_mut().insert(KeyContext {
-                key_id: id,
-                group,
-                key_source: TraceKeySource::ClientKey,
-            });
-            return next.run(request).await;
+    if let Some(mgr) = &state.client_keys {
+        let exempt = credit_limit_exempt(request.uri().path());
+        match mgr.verify_and_touch(&presented) {
+            KeyAuth::Granted(id) => {
+                let group = mgr.group_of(id);
+                request.extensions_mut().insert(KeyContext {
+                    key_id: id,
+                    group,
+                    key_source: TraceKeySource::ClientKey,
+                });
+                return next.run(request).await;
+            }
+            // 超限：在 `next.run` 之前返回，用量记录、链路追踪、调度器消耗回写
+            // 全部在 handler 内构造，因此天然一个都不会执行——这正是把闸设在
+            // 中间件而不是 handler 的原因。计次则由 `verify_and_touch` 保证不发生。
+            KeyAuth::Exhausted(id) if !exempt => {
+                tracing::info!(key_id = id, "客户端 Key 累计 credit 已达上限，拒绝计费请求");
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(ErrorResponse::new(
+                        "rate_limit_error",
+                        "Client key credit limit reached. Raise or clear maxCredits, or reset the key's stats.",
+                    )),
+                )
+                    .into_response();
+            }
+            KeyAuth::Exhausted(id) => {
+                let group = mgr.group_of(id);
+                request.extensions_mut().insert(KeyContext {
+                    key_id: id,
+                    group,
+                    key_source: TraceKeySource::ClientKey,
+                });
+                return next.run(request).await;
+            }
+            KeyAuth::Rejected => {}
         }
+    }
 
     let error = ErrorResponse::authentication_error();
     (StatusCode::UNAUTHORIZED, Json(error)).into_response()
@@ -199,4 +235,97 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::client_keys::ClientKeyManager;
+    use crate::model::config::ToolCompatibilityMode;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
+    /// 造一个只挂了客户端 Key 管理器的最小路由（无上游 provider / usage / trace）。
+    fn router_with(mgr: Arc<ClientKeyManager>) -> axum::Router {
+        super::super::router::create_router(
+            None,
+            false,
+            ToolCompatibilityMode::default(),
+            Some(mgr),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn exhausted_manager() -> (Arc<ClientKeyManager>, String) {
+        let mgr = Arc::new(ClientKeyManager::new());
+        let entry = mgr.create("capped".to_string(), None, None);
+        assert!(mgr.set_max_credits(entry.id, Some(5.0)));
+        mgr.record_usage(entry.id, 0, 0, 0, 0, 5.0);
+        (mgr, entry.key)
+    }
+
+    /// 超限的 Key 打计费端点必须拿到 429（而不是 401——那会把「额度用完」
+    /// 误导成「密钥无效」，排查方向直接跑偏）。
+    #[tokio::test]
+    async fn exhausted_key_gets_429_on_messages() {
+        let (mgr, key) = exhausted_manager();
+        let resp = router_with(mgr)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", &key)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"auto","max_tokens":16,"messages":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// 不计费的辅助端点在超限时仍须服务：挡住它们只会让客户端表现成「连不上」，
+    /// 而不是「额度用完」。
+    #[tokio::test]
+    async fn exhausted_key_still_serves_models() {
+        let (mgr, key) = exhausted_manager();
+        let resp = router_with(mgr)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/v1/models")
+                    .header("x-api-key", &key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// 未超限的 Key 不受影响：没有这条，上面两条可以靠「永远 429 / 永远放行」通过。
+    #[tokio::test]
+    async fn key_under_limit_is_not_rate_limited() {
+        let mgr = Arc::new(ClientKeyManager::new());
+        let entry = mgr.create("normal".to_string(), None, None);
+        let resp = router_with(mgr)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/v1/models")
+                    .header("x-api-key", &entry.key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }

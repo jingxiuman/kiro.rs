@@ -1013,6 +1013,11 @@ pub struct ClientKeyItem {
     pub total_output_tokens: u64,
     pub total_cache_creation_tokens: u64,
     pub total_cache_read_tokens: u64,
+    /// 累计 credit 计费量
+    pub total_credits: f64,
+    /// 累计 credit 上限；未设上限时不下发该键（"不限" 与 "上限为 0" 不能混淆）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_credits: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换）
@@ -1037,6 +1042,9 @@ pub struct CreateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// 累计 credit 上限；缺省或 <= 0 表示不限
+    #[serde(default)]
+    pub max_credits: Option<f64>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -1057,6 +1065,10 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// 累计 credit 上限。沿用本结构体既有约定：字段缺省 = 不改动；
+    /// 传 <= 0 = 清除上限（数字版的"空字符串"）。
+    #[serde(default)]
+    pub max_credits: Option<f64>,
 }
 
 // ============ IdC 设备授权登录 ============

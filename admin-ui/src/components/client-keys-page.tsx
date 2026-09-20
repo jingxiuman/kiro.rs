@@ -30,6 +30,16 @@ function formatTokens(n: number): string {
   return n.toString()
 }
 
+/// 输入框文本 → 后端的 maxCredits。留空 / 非数字 / <= 0 一律视为「不限」，
+/// 返回 undefined 交由调用方决定是省略（不改动）还是显式传 0（清除）。
+function parseMaxCredits(raw: string): number | undefined {
+  const t = raw.trim()
+  if (!t) return undefined
+  const v = Number(t)
+  if (!Number.isFinite(v) || v <= 0) return undefined
+  return v
+}
+
 function formatRelative(ts?: string): string {
   if (!ts) return '从未使用'
   const t = new Date(ts).getTime()
@@ -56,6 +66,7 @@ export function ClientKeysPage() {
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
+  const [createMaxCredits, setCreateMaxCredits] = useState('')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -64,6 +75,7 @@ export function ClientKeysPage() {
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
+  const [editMaxCredits, setEditMaxCredits] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -77,12 +89,14 @@ export function ClientKeysPage() {
         name,
         description: createDesc.trim() || undefined,
         group: createGroup.trim() || undefined,
+        maxCredits: parseMaxCredits(createMaxCredits),
       })
       setCreatedKey(res)
       setCreateOpen(false)
       setCreateName('')
       setCreateDesc('')
       setCreateGroup('')
+      setCreateMaxCredits('')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -164,6 +178,7 @@ export function ClientKeysPage() {
     setEditName(item.name)
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
+    setEditMaxCredits(item.maxCredits != null ? String(item.maxCredits) : '')
     setEditOpen(true)
   }
 
@@ -173,7 +188,14 @@ export function ClientKeysPage() {
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
-        req: { name: editName.trim(), description: editDesc.trim(), group: editGroup.trim() },
+        req: {
+          name: editName.trim(),
+          description: editDesc.trim(),
+          group: editGroup.trim(),
+          // 清空输入框 = 清除上限。后端约定「传 0 表示清除」，
+          // 不能传 undefined——那是「不改动」，会让清除操作静默失效。
+          maxCredits: parseMaxCredits(editMaxCredits) ?? 0,
+        },
       })
       toast.success('已更新')
       setEditOpen(false)
@@ -232,6 +254,7 @@ export function ClientKeysPage() {
                   <th className="text-left font-medium px-4 py-3">分组</th>
                   <th className="text-left font-medium px-4 py-3">状态</th>
                   <th className="text-right font-medium px-4 py-3">总调用</th>
+                  <th className="text-right font-medium px-4 py-3">credit 已用/上限</th>
                   <th className="text-right font-medium px-4 py-3">输入</th>
                   <th className="text-right font-medium px-4 py-3">输出</th>
                   <th className="text-left font-medium px-4 py-3">最后使用</th>
@@ -293,6 +316,15 @@ export function ClientKeysPage() {
                       )}
                     </td>
                     <td className="px-4 py-3 text-right tabular-nums">{k.totalCalls}</td>
+                    <td className="px-4 py-3 text-right tabular-nums">
+                      {k.maxCredits != null ? (
+                        <span className={k.totalCredits >= k.maxCredits ? 'text-destructive font-medium' : undefined}>
+                          {k.totalCredits.toFixed(2)} / {k.maxCredits.toFixed(2)}
+                        </span>
+                      ) : (
+                        <span className="text-muted-foreground">{k.totalCredits.toFixed(2)}</span>
+                      )}
+                    </td>
                     <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalInputTokens)}</td>
                     <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalOutputTokens)}</td>
                     <td className="px-4 py-3 text-[12px] text-muted-foreground">
@@ -376,6 +408,22 @@ export function ClientKeysPage() {
                 onChange={(e) => setCreateDesc(e.target.value)}
                 disabled={createKey.isPending}
               />
+            </div>
+            <div>
+              <label className="text-[12px] text-muted-foreground">累计 credit 上限（可选）</label>
+              <Input
+                type="number"
+                min="0"
+                step="any"
+                placeholder="留空表示不限"
+                value={createMaxCredits}
+                onChange={(e) => setCreateMaxCredits(e.target.value)}
+                disabled={createKey.isPending}
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                累计 credit 达到上限后，该 Key 的计费请求返回 429（模型列表与 token 计数不受影响）。
+                这是软上限：判定在请求进入时、扣费在请求结束时，并发在途请求可能略微超出。重置统计即解除。
+              </p>
             </div>
             <div>
               <label className="text-[12px] text-muted-foreground">绑定分组（可选）</label>
@@ -470,6 +518,23 @@ export function ClientKeysPage() {
             <div>
               <label className="text-[12px] text-muted-foreground">描述</label>
               <Input value={editDesc} onChange={(e) => setEditDesc(e.target.value)} />
+            </div>
+            <div>
+              <label className="text-[12px] text-muted-foreground">累计 credit 上限</label>
+              <Input
+                type="number"
+                min="0"
+                step="any"
+                placeholder="留空表示不限"
+                value={editMaxCredits}
+                onChange={(e) => setEditMaxCredits(e.target.value)}
+                disabled={updateKey.isPending || editTarget?.isSystem}
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                {editTarget?.isSystem
+                  ? '系统 Key 不统计 credit，因此不支持累计上限。'
+                  : '留空并保存即清除上限。重置统计会把已用量清零，等同于解除限制。'}
+              </p>
             </div>
             <div>
               <label className="text-[12px] text-muted-foreground">绑定分组</label>

@@ -903,6 +903,8 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_output_tokens: k.total_output_tokens,
         total_cache_creation_tokens: k.total_cache_creation_tokens,
         total_cache_read_tokens: k.total_cache_read_tokens,
+        total_credits: k.total_credits,
+        max_credits: k.max_credits,
         group: k.group.clone(),
         is_system: k.is_system,
     }
@@ -945,6 +947,20 @@ pub async fn create_client_key(
             .map(|g| g.trim().to_string())
             .filter(|g| !g.is_empty()),
     );
+    if let Some(v) = payload.max_credits
+        && v > 0.0
+    {
+        // 新建的 Key 必非系统 Key，失败只可能是值非法（NaN/inf）。
+        if !state.client_keys.set_max_credits(entry.id, Some(v)) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(
+                    "maxCredits 必须是大于 0 的有限数",
+                )),
+            )
+                .into_response();
+        }
+    }
     Json(CreateClientKeyResponse {
         id: entry.id,
         key: entry.key,
@@ -1000,6 +1016,20 @@ pub async fn update_client_key(
             if t.is_empty() { None } else { Some(t.to_string()) }
         });
     if state.client_keys.update_meta(id, payload.name, description, group) {
+        // 上限单独走 set_max_credits：它是唯一持有「系统 Key 不得设上限」
+        // 这条规则的地方（系统 Key 的 total_credits 恒为 0，配了也永不生效）。
+        if let Some(v) = payload.max_credits {
+            let target = if v > 0.0 { Some(v) } else { None };
+            if !state.client_keys.set_max_credits(id, target) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(super::types::AdminErrorResponse::invalid_request(
+                        "maxCredits 无效：必须是大于 0 的有限数（传 0 表示清除），且系统 Key 不支持累计上限",
+                    )),
+                )
+                    .into_response();
+            }
+        }
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
         (
@@ -2307,6 +2337,33 @@ mod tests {
             batch_assign_error_response(BatchAssignError::Internal("凭据落盘失败: x".to_string()));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.0["error"], "凭据落盘失败: x");
+    }
+
+    /// 面板要显示「已用 / 上限」，两个字段都得出现在列表响应里，且必须是 camelCase
+    /// ——前端类型按字面量对齐，拼错不会编译失败，只会静默显示 undefined。
+    #[test]
+    fn client_key_item_exposes_credits_and_limit_in_camel_case() {
+        let mgr = crate::admin::client_keys::ClientKeyManager::new();
+        let entry = mgr.create("capped".to_string(), None, None);
+        assert!(mgr.set_max_credits(entry.id, Some(250.0)));
+        mgr.record_usage(entry.id, 0, 0, 0, 0, 12.5);
+
+        let key = mgr.list().into_iter().find(|k| k.id == entry.id).unwrap();
+        let v = serde_json::to_value(super::key_to_item(&key)).unwrap();
+        assert_eq!(v["totalCredits"], serde_json::json!(12.5));
+        assert_eq!(v["maxCredits"], serde_json::json!(250.0));
+    }
+
+    /// 未设上限时不应下发 maxCredits 键——前端据「有没有这个键」判断是否显示上限列，
+    /// 下发一个 null 会让「不限」和「上限为 0」在弱类型侧糊成一团。
+    #[test]
+    fn client_key_item_omits_max_credits_when_unset() {
+        let mgr = crate::admin::client_keys::ClientKeyManager::new();
+        let entry = mgr.create("uncapped".to_string(), None, None);
+        let key = mgr.list().into_iter().find(|k| k.id == entry.id).unwrap();
+        let v = serde_json::to_value(super::key_to_item(&key)).unwrap();
+        assert!(v.get("maxCredits").is_none());
+        assert_eq!(v["totalCredits"], serde_json::json!(0.0));
     }
 
     /// 契约测试：快照结构是 `#[serde(rename_all = "camelCase")]`

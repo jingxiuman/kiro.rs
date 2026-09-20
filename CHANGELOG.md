@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.24] - 2026-09-20
+
+主题：入口侧的累计额度闸——`maxCredits`。原型取自上游 v0.8.0 PR #70，按本仓库现状重写。
+
+### ✨ 客户端 Key 支持累计 credit 上限
+
+- **动机**：既有的额度护栏在**上游凭据**侧（防单号被打穿），下游入口侧没有任何闸门，单个 Key 可以无限消耗整池额度。两者正交。
+- **语义**：`ClientKey.maxCredits`（可选）。`totalCredits` 达到该值后，该 Key 的计费请求返回 `429 rate_limit_error`，且**不计入调用次数、不写用量日志、不写 trace、不回写调度器消耗**。重置统计即解除。
+- **闸设在鉴权中间件**：用量记录、链路追踪、消耗回写全部在 handler 内构造，因此在 `next.run` 之前返回天然一个都不会执行。设在 handler 里则要逐个绕开 20 多个 `hook.record` 调用点。
+- **不计次靠锁内判定**：计次发生在 `verify_and_touch` 内部，判定与自增必须在同一把写锁里完成。两段式（先 read 判、再 write 自增）会让「被拒的请求也在涨调用数」。判定位置在常量时间扫描循环**之后**，不引入时序侧信道。
+- **`verify_and_touch` 返回三态** `KeyAuth::{Rejected, Exhausted, Granted}`：超限是 429、Key 不存在是 401，混成 `Option` 会把「额度用完」误导成「密钥无效」。
+- **不计费端点豁免**：`/v1/models` 与 `/v1/messages/count_tokens`（含 `/cc/v1` 前缀）超限时照常服务。挡住它们省不下额度，只会让客户端表现成「连不上」。
+- **软上限**：判定在请求进入时、扣费在请求结束时，并发在途请求会同时通过检查，实际超出量约为「在途请求数 × 单次最大 credits」，流式与 WebSearch 多轮会放大。硬上限需要预扣—结算—归还，代价大一个量级，本版不做。面板已标注该语义。
+- **系统 Key（id=0）拒绝设上限**：它的 `total_credits` 恒为 0（`UsageRecordHook::record` 只对 `key_id != 0` 回写），配了也永不生效，故在唯一写入口返回 400 而不是留一个静默失效的设置。
+- **Admin / 面板**：`ClientKeyItem` 新增 `totalCredits` 与 `maxCredits`（未设上限时不下发该键，避免「不限」与「上限为 0」混淆）；新建与编辑对话框增加输入框，列表新增「credit 已用/上限」列，超限标红。编辑框留空保存即清除上限。
+- **存量兼容**：`client_api_keys.json` 无 `maxCredits` 字段照常读取（`serde(default)`），未设上限的 Key 不写出该字段。
+- **测试**：993 → 1003。manager 层覆盖「超限不放行且不计次」「上限之下放行并计次」「未设上限永不超限」「系统 Key 拒绝设上限」「存量 JSON 反序列化」；中间件层用 `ServiceExt::oneshot` 做 HTTP 断言，覆盖 429、豁免端点仍 200、未超限不受影响；另有响应字段 camelCase 契约测试。新增 dev-dependency `tower`（已随 axum 在依赖树内，仅启用 util feature）。
+
 ## [0.9.23] - 2026-09-20
 
 主题：额度护栏的排除语义修正——护栏与冷冻是同一件事的两个阶段，粘滞判定只认后者。
