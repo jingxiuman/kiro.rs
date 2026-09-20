@@ -131,6 +131,25 @@ pub struct ModelDistribution {
     pub cache_read_tokens: u64,
 }
 
+/// 按入口客户端 Key 的用量分布。
+///
+/// 与 [`CredentialDistribution`] 的两处**刻意不同**：
+/// 1. 多一个 `credits`——面板要回答「哪个 Key 吃掉了额度」，这正是 by-credential
+///    当初没有、事后才发现缺的那一列。
+/// 2. `key_id` 允许为 0：入口侧 0 是系统 Key，不是哨兵值。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyDistribution {
+    pub key_id: u64,
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub errors: u64,
+    pub credits: f64,
+}
+
 /// 上游凭据分布
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

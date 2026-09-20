@@ -1280,6 +1280,58 @@ pub async fn stats_by_model(
     Json(data).into_response()
 }
 
+/// GET /api/admin/stats/by-key?range=24h|7d|30d
+///
+/// 按**入口客户端 Key** 横向汇总。与 by-credential 的两处语义差异：
+/// - `group` 过滤的是 **Key 自己的分组**（`ClientKey.group`），不是上游凭据分组。
+///   本面板的主语是入口 Key，按凭据分组过滤会得到一张语义拧着的交叉表。
+/// - 结果包含 `keyId = 0`（系统 Key），它是真实入口而非哨兵值。
+pub async fn stats_by_key(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let (window, key_id) = match stats_query_parts(&params) {
+        Ok(parts) => parts,
+        Err(message) => return stats_bad_request(message),
+    };
+    let group = parse_group_filter(&params);
+    // 一份 Key 快照同时供「分组白名单」与「id → 名称」使用，不查两次。
+    let keys = state.client_keys.list();
+    let key_allow: Option<std::collections::HashSet<u64>> = group.as_deref().map(|g| {
+        keys.iter()
+            .filter(|k| k.group.as_deref() == Some(g))
+            .map(|k| k.id)
+            .collect()
+    });
+    let name_map: std::collections::HashMap<u64, String> =
+        keys.iter().map(|k| (k.id, k.name.clone())).collect();
+
+    let data = state.usage_store.query_by_key(window, key_id, key_allow.as_ref());
+    let enriched: Vec<serde_json::Value> = data
+        .into_iter()
+        .map(|d| {
+            // 已删除的 Key 在 usage_records 里仍有历史行，查不到名字时回退 #id，
+            // 不能整行丢弃——那等于把历史用量抹掉。
+            let key_name = name_map
+                .get(&d.key_id)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", d.key_id));
+            serde_json::json!({
+                "keyId": d.key_id,
+                "keyName": key_name,
+                "calls": d.calls,
+                "inputTokens": d.input_tokens,
+                "outputTokens": d.output_tokens,
+                "cacheCreationTokens": d.cache_creation_tokens,
+                "cacheReadTokens": d.cache_read_tokens,
+                "errors": d.errors,
+                "credits": d.credits,
+            })
+        })
+        .collect();
+    Json(enriched).into_response()
+}
+
 /// GET /api/admin/stats/by-credential?range=24h|7d|30d
 pub async fn stats_by_credential(
     State(state): State<AdminState>,

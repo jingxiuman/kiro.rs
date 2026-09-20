@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.25] - 2026-09-20
+
+主题：按入口 Key 的用量分布——回答「哪个 Key 吃掉了额度」。原型取自上游 v0.8.0 PR #70。
+
+### ✨ `GET /api/admin/stats/by-key` 与「按入口 Key 分布」面板
+
+- **动机**：既有分布面板只有「按模型」和「按上游凭据」，能看出额度花在哪个号上，看不出是**谁**花的。配合本版之前的 `maxCredits`，这两块合起来才构成「发现超支 → 定位来源 → 设闸」的闭环。
+- **端点**：复用 `stats_query_parts`（`range` / `startDate`+`endDate` / `granularity` / `keyId`）与 `parse_group_filter`，形状与 `by-credential` 一致；返回 `keyId / keyName / calls / inputTokens / outputTokens / cacheCreationTokens / cacheReadTokens / errors / credits`。
+- **`group` 过滤的是 Key 自己的分组**（`ClientKey.group`），不是上游凭据分组。本面板主语是入口 Key，按凭据分组过滤会得到一张语义拧着的交叉表。
+- **不排除 `key_id = 0`**：`by_credential` 有 `credential_id <> 0`（凭据侧 0 是「无账号」哨兵），但入口侧 0 是**系统 Key**（`config.apiKey` 同步而来）。照抄那一条会让系统键流量整块静默消失。图表里系统键标注为「（系统）」。
+- **比 `by-credential` 多一列 `credits`**：这正是凭据侧当初没有、事后才发现缺的那一列。
+- **已删除的 Key**：`usage_records` 里仍有历史行，查不到名字时回退 `#id`，不丢行——丢行等于把历史用量抹掉。
+- **面板**：分布区从两栏改为 `xl:grid-cols-3`，新增「按入口 Key 分布」堆叠柱图（recharts，与凭据图同构），Tooltip 额外显示 credits。
+- **测试**：1003 → 1005。`by_key_keeps_system_key_zero` 钉住系统键不被过滤且 credits 按 key 汇总；`by_key_respects_key_allow_list` 钉住分组白名单与空集合早退语义。均真跑 DuckDB，不 mock。
+
 ## [0.9.24] - 2026-09-20
 
 主题：入口侧的累计额度闸——`maxCredits`。原型取自上游 v0.8.0 PR #70，按本仓库现状重写。

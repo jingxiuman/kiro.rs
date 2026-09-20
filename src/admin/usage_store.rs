@@ -18,8 +18,9 @@ use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc};
 use parking_lot::Mutex;
 
 use super::usage_stats::{
-    CreditPoint, CreditSeriesMeta, CreditsByCredential, CredentialDistribution, ModelDistribution,
-    OverviewStats, StatsGranularity, StatsQueryWindow, TimeSeriesPoint, UsageRecord,
+    CreditPoint, CreditSeriesMeta, CreditsByCredential, CredentialDistribution, KeyDistribution,
+    ModelDistribution, OverviewStats, StatsGranularity, StatsQueryWindow, TimeSeriesPoint,
+    UsageRecord,
 };
 
 /// DuckDB 承载的用量存储。写入与查询共用一条连接（Mutex 串行化——
@@ -272,6 +273,68 @@ impl UsageStore {
     }
 
     /// 上游凭据分布。credential_id = 0（未达上游）不计入——旧桶实现同语义。
+    /// 按入口客户端 Key 汇总窗口内用量。
+    ///
+    /// 与 [`Self::query_by_credential`] 同形，但有两处**必须不同**：
+    /// - **不过滤 `key_id <> 0`**：入口侧 0 是系统 Key（`config.apiKey` 同步而来），
+    ///   不是「无归属」的哨兵。照抄凭据侧那条会让系统键流量整块静默消失。
+    /// - 多汇总 `credits`：本端点存在的理由就是回答「哪个 Key 吃掉了额度」。
+    ///
+    /// `key_allow` 是**入口 Key id** 白名单（分组过滤用），不是凭据 id。
+    pub fn query_by_key(
+        &self,
+        window: StatsQueryWindow,
+        key_id: Option<u64>,
+        key_allow: Option<&std::collections::HashSet<u64>>,
+    ) -> Vec<KeyDistribution> {
+        if let Some(allow) = key_allow
+            && allow.is_empty()
+        {
+            return Vec::new();
+        }
+        let b = bucket_expr(window.granularity);
+        let mut sql = format!(
+            "SELECT key_id, count(*)::BIGINT, \
+                    sum(input_tokens)::BIGINT, sum(output_tokens)::BIGINT, \
+                    sum(cache_creation_tokens)::BIGINT, sum(cache_read_tokens)::BIGINT, \
+                    (count(*) FILTER (WHERE status <> 'success'))::BIGINT, \
+                    COALESCE(sum(credits), 0.0) \
+             FROM usage_records \
+             WHERE {b} >= ? AND {b} < ?"
+        );
+        let mut params: Vec<i64> = vec![window.start_ts, window.end_ts];
+        if let Some(id) = key_id {
+            sql.push_str(" AND key_id = ?");
+            params.push(id as i64);
+        }
+        if let Some(allow) = key_allow {
+            sql.push_str(&format!(" AND key_id IN ({})", cred_in_list(allow)));
+        }
+        sql.push_str(" GROUP BY key_id ORDER BY count(*) DESC, key_id");
+
+        let conn = self.conn.lock();
+        let run = || -> duckdb::Result<Vec<KeyDistribution>> {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(duckdb::params_from_iter(params.iter()), |r| {
+                Ok(KeyDistribution {
+                    key_id: r.get::<_, i64>(0)? as u64,
+                    calls: r.get::<_, i64>(1)? as u64,
+                    input_tokens: r.get::<_, i64>(2)? as u64,
+                    output_tokens: r.get::<_, i64>(3)? as u64,
+                    cache_creation_tokens: r.get::<_, i64>(4)? as u64,
+                    cache_read_tokens: r.get::<_, i64>(5)? as u64,
+                    errors: r.get::<_, i64>(6)? as u64,
+                    credits: r.get::<_, f64>(7)?,
+                })
+            })?;
+            rows.collect()
+        };
+        run().unwrap_or_else(|e| {
+            tracing::warn!("by_key 查询失败: {}", e);
+            Vec::new()
+        })
+    }
+
     pub fn query_by_credential(
         &self,
         window: StatsQueryWindow,
@@ -880,6 +943,50 @@ mod tests {
         assert_eq!(rows[0].credential_id, 7);
         assert_eq!(rows[0].calls, 2);
         assert_eq!(rows[0].errors, 1);
+    }
+
+    /// by-key 汇总**不得**照抄 by_credential 的 `credential_id <> 0`。
+    /// 两个 id 空间里 0 的含义相反：凭据侧 0 是「无账号」的哨兵，入口 Key 侧
+    /// 0 是**系统 Key**（config.apiKey 同步而来）。抄错这一条，系统键的流量
+    /// 会整块从面板上消失，而且是静默消失。
+    #[test]
+    fn by_key_keeps_system_key_zero() {
+        let s = mk_store();
+        let now = Utc::now().to_rfc3339();
+        s.record(&rec(&now, 0, 7, "m", 10, 1, 0.5, "success"));
+        s.record(&rec(&now, 3, 7, "m", 20, 2, 1.5, "success"));
+        s.record(&rec(&now, 3, 7, "m", 20, 2, 1.0, "error"));
+        let w = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let rows = s.query_by_key(w, None, None);
+
+        assert_eq!(rows.len(), 2, "系统键(key_id=0)必须自成一行，不得被过滤");
+        let sys = rows.iter().find(|r| r.key_id == 0).expect("系统键行应存在");
+        assert_eq!(sys.calls, 1);
+        assert!((sys.credits - 0.5).abs() < 1e-9);
+
+        let k3 = rows.iter().find(|r| r.key_id == 3).unwrap();
+        assert_eq!(k3.calls, 2);
+        assert_eq!(k3.errors, 1);
+        assert!((k3.credits - 2.5).abs() < 1e-9, "credits 应按 key 汇总，实际 {}", k3.credits);
+    }
+
+    /// 分组白名单按**入口 Key 的 id 集合**过滤；空集合直接早退返回空，
+    /// 与 by_credential 的既有语义一致（「该分组下没有任何 Key」≠「不过滤」）。
+    #[test]
+    fn by_key_respects_key_allow_list() {
+        let s = mk_store();
+        let now = Utc::now().to_rfc3339();
+        s.record(&rec(&now, 1, 7, "m", 10, 1, 0.5, "success"));
+        s.record(&rec(&now, 2, 7, "m", 10, 1, 0.5, "success"));
+        let w = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+
+        let only_two: std::collections::HashSet<u64> = [2u64].into_iter().collect();
+        let rows = s.query_by_key(w, None, Some(&only_two));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key_id, 2);
+
+        let empty: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        assert!(s.query_by_key(w, None, Some(&empty)).is_empty());
     }
 
     #[test]

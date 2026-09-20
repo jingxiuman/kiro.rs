@@ -489,6 +489,20 @@ export interface CreditsByCredential {
   totalCredentials: number
 }
 
+/** 按入口客户端 Key 的用量分布。keyId 为 0 是系统 Key（真实入口，不是哨兵值） */
+export interface KeyDistribution {
+  keyId: number
+  /** Key 名称；已删除的 Key 回退为 #id */
+  keyName: string
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  errors: number
+  credits: number
+}
+
 export interface CredentialDistribution {
   credentialId: number
   email?: string

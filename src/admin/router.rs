@@ -36,7 +36,8 @@ use super::{
         start_idc_login, start_idc_relogin, start_social_login,
         start_social_relogin, stats_balance_history, stats_by_credential, stats_by_model,
         stats_credits_by_credential, stats_overview,
-        stats_timeseries, update_admin_key, update_client_key, update_credential, update_group,
+        stats_by_key, stats_timeseries, update_admin_key, update_client_key, update_credential,
+        update_group,
         update_refresh_token,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -184,6 +185,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/overview", get(stats_overview))
         .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/by-model", get(stats_by_model))
+        .route("/stats/by-key", get(stats_by_key))
         .route("/stats/by-credential", get(stats_by_credential))
         .route(
             "/stats/credits-by-credential",

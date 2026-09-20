@@ -2,6 +2,7 @@ import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import {
   getBalanceHistory,
   getByCredential,
+  getByKey,
   getByModel,
   getCreditsByCredential,
   getOverview,
@@ -61,6 +62,14 @@ export function useByCredential(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
     queryKey: ['stats', 'by-credential', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all'],
     queryFn: () => getByCredential(time, filter),
+    ...COMMON,
+  })
+}
+
+export function useByKey(time: StatsTimeFilter, filter?: StatsFilter) {
+  return useQuery({
+    queryKey: ['stats', 'by-key', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all'],
+    queryFn: () => getByKey(time, filter),
     ...COMMON,
   })
 }

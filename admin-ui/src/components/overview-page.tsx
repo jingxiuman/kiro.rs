@@ -5,6 +5,7 @@ import { Badge } from '@/components/ui/badge'
 import { Activity, Calendar, Coins, Cpu, KeyRound, Server, Sigma } from 'lucide-react'
 import {
   useByCredential,
+  useByKey,
   useByModel,
   useCreditsByCredential,
   useOverview,
@@ -22,10 +23,12 @@ import type {
   StatsRange,
   StatsTimeFilter,
   TimeSeriesPoint,
+  KeyDistribution,
 } from '@/types/api'
 import { TimeSeriesChart } from '@/components/charts/time-series-chart'
 import { ModelPieChart } from '@/components/charts/model-pie-chart'
 import { CredentialBarChart } from '@/components/charts/credential-bar-chart'
+import { KeyBarChart } from '@/components/charts/key-bar-chart'
 import { CreditLineChart } from '@/components/charts/credit-line-chart'
 import { cn, formatCredits, formatNumber } from '@/lib/utils'
 import { Input } from '@/components/ui/input'
@@ -91,10 +94,12 @@ export function OverviewPage() {
   const { data: series } = useTimeSeries(filters.timeFilter, filters.statsFilter)
   const { data: byModel } = useByModel(filters.timeFilter, filters.statsFilter)
   const { data: byCred } = useByCredential(filters.timeFilter, filters.statsFilter)
+  const { data: byKey } = useByKey(filters.timeFilter, filters.statsFilter)
   const { data: creditSeries } = useCreditsByCredential(filters.timeFilter, filters.statsFilter)
   const seriesData = useMemo(() => series ?? [], [series])
   const modelData = useMemo(() => byModel ?? [], [byModel])
   const credData = useMemo(() => byCred ?? [], [byCred])
+  const keyData = useMemo(() => byKey ?? [], [byKey])
   const rangeStats = useMemo(() => aggregateSeries(seriesData), [seriesData])
   const selectedKeyLabel = selectedStatsKeyLabel(filters.keyFilter, keysData?.keys ?? [])
   const groupFilterActive = filters.groupFilter !== 'all'
@@ -138,6 +143,7 @@ export function OverviewPage() {
         timeText={timeLabel(filters.timeFilter)}
       />
       <DistributionPanels
+        byKey={keyData}
         byCred={credData}
         byModel={modelData}
         timeText={timeLabel(filters.timeFilter)}
@@ -617,21 +623,49 @@ function CreditTrendCard({
 }
 
 function DistributionPanels({
+  byKey,
   byCred,
   byModel,
   timeText,
   groupFilterActive,
 }: {
+  byKey: KeyDistribution[]
   byCred: CredentialDistribution[]
   byModel: ModelDistribution[]
   timeText: string
   groupFilterActive: boolean
 }) {
   return (
-    <div className="mb-6 grid gap-4 lg:grid-cols-2">
+    <div className="mb-6 grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
       <ModelPanel data={byModel} timeText={timeText} groupFilterActive={groupFilterActive} />
       <CredentialPanel data={byCred} />
+      <KeyPanel data={byKey} />
     </div>
+  )
+}
+
+/// 按入口 Key 分布。与「按上游凭据分布」并列：一个回答「谁在用」，
+/// 一个回答「用了谁的号」。credit 列只在这里有——它是本面板存在的理由。
+function KeyPanel({ data }: { data: KeyDistribution[] }) {
+  const top = data.slice(0, 12)
+  const totalCredits = top.reduce((sum, d) => sum + d.credits, 0)
+  return (
+    <Card>
+      <CardContent className="p-4 sm:p-5">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <h2 className="text-base font-semibold tracking-tight">按入口 Key 分布</h2>
+          <span className="text-[11px] text-muted-foreground inline-flex items-center gap-1">
+            <KeyRound className="h-3 w-3" />Top {top.length}
+          </span>
+        </div>
+        {top.length > 0 && (
+          <p className="mb-3 text-[11px] text-muted-foreground">
+            图中合计 <span className="tabular-nums font-medium text-foreground">{totalCredits.toFixed(2)}</span> credits
+          </p>
+        )}
+        <KeyBarChart data={top} />
+      </CardContent>
+    </Card>
   )
 }
 
