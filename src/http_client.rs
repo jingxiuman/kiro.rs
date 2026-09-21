@@ -619,11 +619,18 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        // 走**显式**的黑洞代理，而不是 `build_client(None, ..)` + 裸连目标地址：
+        // proxy 为 None 时 reqwest 会回落到环境变量代理（HTTP_PROXY/ALL_PROXY），
+        // 于是在带代理的机器上，请求会被代理接走并秒回 502——根本不超时，断言
+        // 挂在 `expect_err` 上。显式代理压过环境变量，把这条测试与宿主环境解耦。
+        //
+        // 192.0.2.0/24 是 TEST-NET-1（RFC 5737），保证无人应答：连它必然卡住，
+        // 1 秒总超时先于 10 秒 connect_timeout 触发 → 稳定得到 timeout 错误。
+        let blackhole = ProxyConfig::new("http://192.0.2.1:9");
         // Client 的构造要在 runtime 上下文内（连接池需要 reactor）
         let err = rt.block_on(async {
-            let client = build_client(None, 1, TlsBackend::Rustls).unwrap();
-            // 192.0.2.0/24 是 TEST-NET-1，保证无响应 → 触发超时
-            client.get("http://192.0.2.1/").send().await
+            let client = build_client(Some(&blackhole), 1, TlsBackend::Rustls).unwrap();
+            client.get("http://example.invalid/").send().await
         });
         let err = err.expect_err("应超时");
 
