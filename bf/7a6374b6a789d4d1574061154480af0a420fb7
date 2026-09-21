@@ -1,0 +1,19 @@
+src/http_client.rs
+  s_4d45b3228f805a::t_b16ca77e168adf 622-629,632-633
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bf7a6374b6a789d4d1574061154480af0a420fb7",
+  "prompts": {},
+  "sessions": {
+    "s_4d45b3228f805a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59468e09-0703-4335-ba04-fbd3293f8b20",
+        "model": "claude-opus-5"
+      },
+      "human_author": "knowthis <admin@xbpig.cn>"
+    }
+  }
+}
